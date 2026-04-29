@@ -43,9 +43,12 @@ class Config:
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "anonymize")
     llm_timeout_s: int = _env_int("LLM_TIMEOUT_S", 30)
-    # Texts longer than this get truncated before going to the LLM (not the
-    # upstream user model — only the detection call). Keeps costs predictable.
-    llm_max_chars: int = _env_int("LLM_MAX_CHARS", 8000)
+    # Hard cap on input size sent to the LLM in one call. Inputs above this
+    # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
+    # silently truncated — truncating in a guardrail would let everything past
+    # this length through unscanned. Default is generous (~50K tokens), well
+    # within typical small-model context windows; tune to your model.
+    llm_max_chars: int = _env_int("LLM_MAX_CHARS", 200_000)
 
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     vault_ttl_s: int = _env_int("VAULT_TTL_S", 600)

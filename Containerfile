@@ -50,7 +50,7 @@ ENV HOST=0.0.0.0 \
     LLM_API_BASE=http://litellm:4000/v1 \
     LLM_MODEL=anonymize \
     LLM_TIMEOUT_S=30 \
-    LLM_MAX_CHARS=8000 \
+    LLM_MAX_CHARS=200000 \
     VAULT_TTL_S=600 \
     FAIL_CLOSED=true
 

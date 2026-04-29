@@ -114,14 +114,16 @@ class LLMDetector:
         if not text or not text.strip():
             return []
 
-        # Truncate over-long inputs for the detection call only — the user's
-        # actual prompt going to the upstream model is unaffected.
-        snippet = text[: config.llm_max_chars]
+        # Refuse oversized inputs rather than truncating. Truncation would
+        # silently let everything past the cap through unscanned — the
+        # opposite of what a guardrail should do. Raised as
+        # LLMUnavailableError so the FAIL_CLOSED policy in the pipeline
+        # decides: block the request, or fall back to regex-only.
         if len(text) > config.llm_max_chars:
-            log.info(
-                "Truncating LLM detection input: %d → %d chars",
-                len(text),
-                config.llm_max_chars,
+            raise LLMUnavailableError(
+                f"Input too large for LLM detection: {len(text)} chars > "
+                f"LLM_MAX_CHARS ({config.llm_max_chars}). Raise the cap or "
+                f"point at a model with a larger context window."
             )
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -132,7 +134,7 @@ class LLMDetector:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": snippet},
+                {"role": "user", "content": text},
             ],
             "temperature": 0,
             "stream": False,
@@ -162,7 +164,7 @@ class LLMDetector:
             log.warning("Unexpected LLM response shape: %s | body=%r", exc, resp.text[:300])
             return []
 
-        return _parse_entities(content, snippet)
+        return _parse_entities(content, text)
 
 
 __all__ = ["LLMDetector", "LLMUnavailableError"]
