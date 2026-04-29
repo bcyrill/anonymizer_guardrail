@@ -45,7 +45,7 @@ RUN chown -R app:app /app
 # ── Defaults ─────────────────────────────────────────────────────────────────
 ENV HOST=0.0.0.0 \
     PORT=8000 \
-    LOG_LEVEL=INFO \
+    LOG_LEVEL=info \
     DETECTOR_MODE=both \
     LLM_API_BASE=http://litellm:4000/v1 \
     LLM_MODEL=anonymize \
@@ -63,4 +63,4 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
 
 # Exec form so SIGTERM from `podman stop` reaches uvicorn cleanly. `sh -c` is
 # needed so ${HOST}/${PORT} expand at container start, not at build time.
-CMD ["sh", "-c", "exec uvicorn anonymizer_guardrail.main:app --host ${HOST} --port ${PORT} --log-level ${LOG_LEVEL,,} --proxy-headers"]
+CMD ["sh", "-c", "exec uvicorn anonymizer_guardrail.main:app --host ${HOST} --port ${PORT} --log-level ${LOG_LEVEL} --proxy-headers"]
