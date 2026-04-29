@@ -95,7 +95,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
-| `LLM_MAX_CHARS`   | `8000`                        | Truncates detection input only           |
+| `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
 | `FAIL_CLOSED`     | `true`                        | Block requests if LLM detector errors    |
 
