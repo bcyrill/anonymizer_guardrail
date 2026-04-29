@@ -36,7 +36,7 @@ app = FastAPI(
 _pipeline = Pipeline()
 
 
-def _forwarded_bearer(headers: Mapping[str, object]) -> str | None:
+def _forwarded_bearer(headers: Mapping[str, object] | None) -> str | None:
     """Extract the user's bearer token from a forwarded Authorization header.
 
     LiteLLM only forwards the actual header value when the guardrail is
@@ -94,7 +94,7 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             # key" message, so the operator deserves a pointer to the actual
             # misconfiguration rather than having to dig through the LLM logs.
             auth_value = next(
-                (str(v) for k, v in req.request_headers.items()
+                (str(v) for k, v in (req.request_headers or {}).items()
                  if isinstance(k, str) and k.lower() == "authorization"),
                 None,
             )
