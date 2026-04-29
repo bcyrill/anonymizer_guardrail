@@ -26,7 +26,7 @@ class GuardrailRequest(BaseModel):
     structured_messages: list[dict[str, Any]] | None = None
 
     request_data: dict[str, Any] = Field(default_factory=dict)
-    request_headers: dict[str, Any] = Field(default_factory=dict)
+    request_headers: dict[str, Any] | None = None
     input_type: Literal["request", "response"] = "request"
     litellm_call_id: str | None = None
     litellm_trace_id: str | None = None
