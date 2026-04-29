@@ -45,6 +45,12 @@ async def health() -> dict[str, object]:
 
 @app.post("/beta/litellm_basic_guardrail_api", response_model=GuardrailResponse)
 async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
+    # Full request body contains the very text we're meant to anonymize, so
+    # only emit it at DEBUG. Guard with isEnabledFor so we don't pay the
+    # JSON-serialization cost on every call in production.
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("Guardrail request: %s", req.model_dump_json())
+
     if not req.texts:
         # Nothing for us to do — let the request through unchanged.
         return GuardrailResponse(action="NONE")
@@ -55,12 +61,12 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             if not mapping:
                 return GuardrailResponse(action="NONE")
             return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=modified)
-
-        # input_type == "response"
-        restored = await _pipeline.deanonymize(req.texts, req.litellm_call_id)
-        if restored == req.texts:
-            return GuardrailResponse(action="NONE")
-        return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=restored)
+        else:
+            # input_type == "response"
+            restored = await _pipeline.deanonymize(req.texts, req.litellm_call_id)
+            if restored == req.texts:
+                return GuardrailResponse(action="NONE")
+            return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=restored)
 
     except LLMUnavailableError as exc:
         # Reached only when fail_closed=True; otherwise the pipeline swallows it.
