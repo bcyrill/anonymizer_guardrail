@@ -12,6 +12,8 @@ import logging
 
 from fastapi import FastAPI
 
+from typing import Mapping
+
 from .api import GuardrailRequest, GuardrailResponse
 from .config import config
 from .detector.llm import LLMUnavailableError
@@ -32,6 +34,34 @@ app = FastAPI(
 # Single Pipeline instance — its surrogate cache and vault are intentionally
 # process-wide so we get cross-call surrogate consistency for free.
 _pipeline = Pipeline()
+
+
+def _forwarded_bearer(headers: Mapping[str, object]) -> str | None:
+    """Extract the user's bearer token from a forwarded Authorization header.
+
+    LiteLLM only forwards the actual header value when the guardrail is
+    configured with `extra_headers: [authorization]`; otherwise the value
+    arrives as the literal string "[present]" (a redaction marker), which we
+    must NOT use as a bearer token. Returns None for missing/redacted/non-
+    Bearer values so the caller can fall back to LLM_API_KEY cleanly.
+
+    Header lookup is case-insensitive — HTTP doesn't constrain casing and
+    LiteLLM's forwarded dict preserves whatever the client sent.
+    """
+    if not headers:
+        return None
+    value: str | None = None
+    for k, v in headers.items():
+        if isinstance(k, str) and k.lower() == "authorization":
+            value = str(v) if v is not None else None
+            break
+    if not value or value == "[present]":
+        return None
+    parts = value.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        token = parts[1].strip()
+        return token or None
+    return None
 
 
 @app.get("/health")
@@ -55,9 +85,21 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
         # Nothing for us to do — let the request through unchanged.
         return GuardrailResponse(action="NONE")
 
+    forwarded_key: str | None = None
+    if config.llm_use_forwarded_key and req.input_type == "request":
+        forwarded_key = _forwarded_bearer(req.request_headers)
+        if forwarded_key is None:
+            log.debug(
+                "LLM_USE_FORWARDED_KEY is set but no Authorization bearer was "
+                "forwarded — falling back to LLM_API_KEY. Ensure LiteLLM's "
+                "guardrail config includes `extra_headers: [authorization]`."
+            )
+
     try:
         if req.input_type == "request":
-            modified, mapping = await _pipeline.anonymize(req.texts, req.litellm_call_id)
+            modified, mapping = await _pipeline.anonymize(
+                req.texts, req.litellm_call_id, api_key=forwarded_key
+            )
             if not mapping:
                 return GuardrailResponse(action="NONE")
             return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=modified)

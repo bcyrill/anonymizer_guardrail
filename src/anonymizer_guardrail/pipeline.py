@@ -77,12 +77,14 @@ class Pipeline:
     def vault(self) -> Vault:
         return self._vault
 
-    async def _detect_one(self, text: str) -> list[Match]:
+    async def _detect_one(
+        self, text: str, *, api_key: str | None = None
+    ) -> list[Match]:
         """Run all configured detectors against one text and dedup."""
         results: list[list[Match]] = []
         for det in self._detectors:
             try:
-                results.append(await det.detect(text))
+                results.append(await det.detect(text, api_key=api_key))
             except LLMUnavailableError as exc:
                 if config.fail_closed:
                     raise
@@ -95,17 +97,26 @@ class Pipeline:
         return _dedup(flat)
 
     async def anonymize(
-        self, texts: list[str], call_id: str | None
+        self,
+        texts: list[str],
+        call_id: str | None,
+        *,
+        api_key: str | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Anonymize a batch of texts, persist the reverse mapping, return modified texts.
 
         Returns (modified_texts, mapping) so the API layer can include the
         mapping size in logs/responses without re-reading the vault.
+
+        `api_key`, if given, overrides config.llm_api_key for the LLM detector
+        on this call only — used to forward the caller's own key per-request.
         """
         if not texts:
             return [], {}
 
-        per_text_matches = await asyncio.gather(*[self._detect_one(t) for t in texts])
+        per_text_matches = await asyncio.gather(
+            *[self._detect_one(t, api_key=api_key) for t in texts]
+        )
 
         # Build one process-wide mapping (original → surrogate) so the same
         # entity gets the same surrogate across all texts in this request.

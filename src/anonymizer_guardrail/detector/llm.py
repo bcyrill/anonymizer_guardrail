@@ -110,9 +110,15 @@ class LLMDetector:
         self.model = model or config.llm_model
         self.timeout_s = timeout_s or config.llm_timeout_s
 
-    async def detect(self, text: str) -> list[Match]:
+    async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]:
         if not text or not text.strip():
             return []
+
+        # Per-call override (e.g. forwarded user key from LiteLLM) takes
+        # precedence; otherwise use the configured key. Empty string after
+        # strip is treated as "no key" so we don't send an empty Bearer.
+        effective_key = (api_key if api_key is not None else self.api_key) or ""
+        effective_key = effective_key.strip()
 
         # Refuse oversized inputs rather than truncating. Truncation would
         # silently let everything past the cap through unscanned — the
@@ -127,8 +133,8 @@ class LLMDetector:
             )
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        if effective_key:
+            headers["Authorization"] = f"Bearer {effective_key}"
 
         payload: dict[str, Any] = {
             "model": self.model,

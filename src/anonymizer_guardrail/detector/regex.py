@@ -64,9 +64,10 @@ class RegexDetector:
             (etype, re.compile(pat)) for etype, pat in _PATTERNS
         ]
 
-    async def detect(self, text: str) -> list[Match]:
+    async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]:
         if not text:
             return []
+        del api_key  # Regex detection doesn't talk to any backend.
 
         # Span-based dedup: if two patterns hit overlapping ranges, keep the one
         # whose pattern appears earlier in _PATTERNS (i.e. the more specific).

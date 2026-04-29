@@ -43,6 +43,12 @@ class Config:
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "anonymize")
     llm_timeout_s: int = _env_int("LLM_TIMEOUT_S", 30)
+    # When true, prefer the Authorization bearer token forwarded by LiteLLM
+    # (via `extra_headers: [authorization]` on the guardrail) over LLM_API_KEY.
+    # Lets the detection LLM be called with the same virtual key the user
+    # authenticated to LiteLLM with, so detection cost/quota land on that key.
+    # Falls back to LLM_API_KEY if the header is absent.
+    llm_use_forwarded_key: bool = _env_bool("LLM_USE_FORWARDED_KEY", False)
     # Hard cap on input size sent to the LLM in one call. Inputs above this
     # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
     # silently truncated — truncating in a guardrail would let everything past

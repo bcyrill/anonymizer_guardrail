@@ -93,11 +93,41 @@ All knobs are environment variables; sensible defaults baked into
 | `DETECTOR_MODE`   | `both`                        | `regex` / `llm` / `both`                 |
 | `LLM_API_BASE`    | `http://litellm:4000/v1`      | OpenAI-compatible endpoint               |
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
+| `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
 | `FAIL_CLOSED`     | `true`                        | Block requests if LLM detector errors    |
+
+### Forwarding the caller's API key
+
+Set `LLM_USE_FORWARDED_KEY=true` to authenticate to the detection LLM with
+the same key the user authenticated to LiteLLM with, instead of a shared
+`LLM_API_KEY`. Detection cost and rate limits then attribute back to the
+caller's virtual key.
+
+This requires opting into header forwarding on the LiteLLM side as well —
+LiteLLM redacts non-allowlisted headers to `"[present]"` by default, so
+without `extra_headers`, this guardrail will silently fall back to
+`LLM_API_KEY`:
+
+```yaml
+litellm_settings:
+  guardrails:
+    - guardrail_name: anonymizer
+      litellm_params:
+        guardrail: generic_guardrail_api
+        mode: [pre_call, post_call]
+        api_base: http://anonymizer:8000
+        unreachable_fallback: fail_closed
+        extra_headers: [authorization]   # ← forwards Bearer <user-key> to us
+```
+
+If the header is missing or arrives as `[present]`, we fall back to
+`LLM_API_KEY`. If both are empty, the LLM call goes out without an
+`Authorization` header (fine for local/dev backends; everything else will
+likely return 401, which routes through `FAIL_CLOSED`).
 
 ## Run it
 

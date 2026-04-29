@@ -155,3 +155,50 @@ async def test_non_200_response_becomes_llm_unavailable(
 
     with pytest.raises(LLMUnavailableError, match="503"):
         await detector.detect("hello")
+
+
+async def test_per_call_api_key_overrides_configured_key(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """A per-call api_key (forwarded user key) wins over the configured one."""
+    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    detector = LLMDetector(
+        api_base="http://test", api_key="configured-key", model="test", timeout_s=5
+    )
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", api_key="forwarded-key")
+
+    sent_headers = mock_post.call_args.kwargs["headers"]
+    assert sent_headers["Authorization"] == "Bearer forwarded-key"
+
+
+async def test_per_call_api_key_none_falls_back_to_configured(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """No forwarded key → configured key is still used."""
+    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    detector = LLMDetector(
+        api_base="http://test", api_key="configured-key", model="test", timeout_s=5
+    )
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello")  # api_key omitted
+
+    sent_headers = mock_post.call_args.kwargs["headers"]
+    assert sent_headers["Authorization"] == "Bearer configured-key"
+
+
+async def test_no_key_anywhere_omits_authorization_header(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """Both keys empty → no Authorization header sent (some local backends need this)."""
+    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    detector = LLMDetector(
+        api_base="http://test", api_key="", model="test", timeout_s=5
+    )
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello")
+
+    assert "Authorization" not in mock_post.call_args.kwargs["headers"]

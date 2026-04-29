@@ -47,6 +47,11 @@ litellm_settings:
         # if you'd rather degrade gracefully (no anonymization) than block.
         unreachable_fallback: fail_closed
         # default_on: false  ← keep this false; clients opt in per request
+        # Forward the caller's Authorization header so the anonymizer can
+        # reuse their virtual key for the detection LLM call (set
+        # LLM_USE_FORWARDED_KEY=true on the anonymizer side too). LiteLLM
+        # redacts headers to "[present]" unless they're on this allowlist.
+        # extra_headers: [authorization]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
