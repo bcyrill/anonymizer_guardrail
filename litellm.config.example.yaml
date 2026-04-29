@@ -1,0 +1,62 @@
+# Example LiteLLM proxy config that wires in anonymizer-guardrail.
+#
+# Critical pattern: the model used INTERNALLY by the anonymizer for LLM
+# detection (named "anonymize" below) MUST NOT be guarded — otherwise every
+# detection call would re-enter the guardrail and recurse forever.
+#
+# We achieve this by setting `default_on: false` on the guardrail and having
+# user-facing models opt in via the `guardrails` field in client requests.
+
+model_list:
+
+  # ── User-facing models (these get anonymized) ──────────────────────────────
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: gemini-pro
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # ── Internal model used by the anonymizer's LLM detector ──────────────────
+  # Pick something cheap and fast — this is called once per anonymized
+  # request. Same physical backend as a user-facing model is fine; what
+  # matters is that this alias is NOT in any client's `guardrails: [...]`
+  # field, so it bypasses the guardrail.
+  - model_name: anonymize
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  guardrails:
+    - guardrail_name: anonymizer
+      litellm_params:
+        guardrail: generic_guardrail_api
+        # Both modes are required for the round-trip to work.
+        mode: [pre_call, post_call]
+        api_base: http://anonymizer:8000
+        # Block the request if our service is unreachable. Set to fail_open
+        # if you'd rather degrade gracefully (no anonymization) than block.
+        unreachable_fallback: fail_closed
+        # default_on: false  ← keep this false; clients opt in per request
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# Client usage:
+#
+#   from openai import OpenAI
+#   client = OpenAI(base_url="http://litellm:4000", api_key="<master_key>")
+#   client.chat.completions.create(
+#       model="gpt-4o-mini",
+#       messages=[{"role": "user", "content": "..."}],
+#       guardrails=["anonymizer"],   # ← opts into anonymization
+#   )
