@@ -88,11 +88,37 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
     forwarded_key: str | None = None
     if config.llm_use_forwarded_key and req.input_type == "request":
         forwarded_key = _forwarded_bearer(req.request_headers)
-        if forwarded_key is None:
-            log.debug(
-                "LLM_USE_FORWARDED_KEY is set but no Authorization bearer was "
-                "forwarded — falling back to LLM_API_KEY. Ensure LiteLLM's "
-                "guardrail config includes `extra_headers: [authorization]`."
+        if forwarded_key is None and not config.llm_api_key:
+            # Bump to WARNING (not DEBUG) when there's no fallback — this path
+            # produces a 401 from the detection LLM with a confusing "no api
+            # key" message, so the operator deserves a pointer to the actual
+            # misconfiguration rather than having to dig through the LLM logs.
+            auth_value = next(
+                (str(v) for k, v in req.request_headers.items()
+                 if isinstance(k, str) and k.lower() == "authorization"),
+                None,
+            )
+            if auth_value is None:
+                hint = (
+                    "no Authorization header was forwarded. Add "
+                    "`extra_headers: [authorization]` to the guardrail's "
+                    "litellm_params, or set LLM_API_KEY as a fallback."
+                )
+            elif auth_value == "[present]":
+                hint = (
+                    "Authorization header arrived as the redaction marker "
+                    "'[present]'. Add `authorization` to the guardrail's "
+                    "`extra_headers` allowlist in your LiteLLM config."
+                )
+            else:
+                hint = (
+                    "Authorization header is present but not in `Bearer <token>` "
+                    "form, which is the only scheme we know how to forward."
+                )
+            log.warning(
+                "LLM_USE_FORWARDED_KEY is set with no LLM_API_KEY fallback, "
+                "but %s",
+                hint,
             )
 
     try:
