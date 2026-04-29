@@ -187,6 +187,14 @@ uvicorn anonymizer_guardrail.main:app --reload
   are deanonymized after assembly. If you need to anonymize partial chunks,
   this isn't the right tool.
 
+## Acknowledgements
+
+The dual-layer (regex + LLM) round-trip anonymization approach is borrowed from
+[DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI), a self-contained
+reverse proxy aimed at protecting client data during AI-assisted pentesting.
+This project re-shapes the same idea as a LiteLLM Generic Guardrail so it can
+sit in front of any model LiteLLM supports rather than a single provider.
+
 ## License
 
 MIT.
