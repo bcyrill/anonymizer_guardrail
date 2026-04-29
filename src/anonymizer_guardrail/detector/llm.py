@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from importlib import resources
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -28,34 +30,37 @@ class LLMUnavailableError(RuntimeError):
     """Raised when the LLM detection backend is unreachable or unresponsive."""
 
 
-_SYSTEM_PROMPT = """\
-You are a privacy guardian. Given a piece of text, identify every substring \
-that could plausibly identify a real person, organization, or piece of \
-infrastructure, OR that constitutes a secret.
+_DEFAULT_PROMPT_RELPATH = "prompts/llm_detector.md"
 
-When in doubt, flag it. False positives are safer than false negatives.
 
-Flag, at minimum:
-- People: full names, usernames embedded in `first.last` form, national IDs.
-- Organizations: company names, project codenames, internal product names, \
-WiFi SSIDs, NetBIOS / AD domain names, custom CA / certificate template names.
-- Network identifiers: IPs (incl. private RFC1918), CIDRs, FQDNs, internal \
-hostnames, subdomains.
-- Credentials & secrets: passwords, API keys, tokens, hashes, JWTs, private \
-keys, connection strings.
-- Other identifiers: email addresses, phone numbers, mailing addresses.
+def _load_system_prompt() -> str:
+    """Load the detector's system prompt.
 
-Do NOT flag generic technical vocabulary (function names, well-known protocols, \
-public software product names, OS versions, generic role titles like "admin" \
-or "CEO" with no name attached).
+    LLM_SYSTEM_PROMPT_PATH wins if set; otherwise we fall back to the
+    bundled default. Loaded once at import-time — restart to pick up edits,
+    same as every other config knob.
+    """
+    override = config.llm_system_prompt_path.strip()
+    if override:
+        path = Path(override)
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # Fail loud rather than silently fall back: an operator who set
+            # this path expects their prompt to be used. Crashing at import
+            # surfaces the typo immediately instead of after the first call.
+            raise RuntimeError(
+                f"LLM_SYSTEM_PROMPT_PATH={override!r} could not be read: {exc}"
+            ) from exc
+    # Anchor at the parent package so `prompts/` doesn't need __init__.py.
+    return (
+        resources.files("anonymizer_guardrail")
+        .joinpath(_DEFAULT_PROMPT_RELPATH)
+        .read_text(encoding="utf-8")
+    )
 
-Return ONLY valid JSON, no prose, no markdown:
-{"entities": [{"text": "<exact substring from input>", \
-"type": "PERSON|ORGANIZATION|EMAIL_ADDRESS|IP_ADDRESS|CIDR|HOSTNAME|DOMAIN|\
-USERNAME|CREDENTIAL|TOKEN|HASH|UUID|AWS_ACCESS_KEY|JWT|PHONE|OTHER"}]}
 
-Nothing found: {"entities": []}
-"""
+_SYSTEM_PROMPT = _load_system_prompt()
 
 
 def _strip_thinking(raw: str) -> str:

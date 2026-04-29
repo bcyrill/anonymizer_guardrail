@@ -94,6 +94,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_API_BASE`    | `http://litellm:4000/v1`      | OpenAI-compatible endpoint               |
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
+| `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
@@ -128,6 +129,26 @@ If the header is missing or arrives as `[present]`, we fall back to
 `LLM_API_KEY`. If both are empty, the LLM call goes out without an
 `Authorization` header (fine for local/dev backends; everything else will
 likely return 401, which routes through `FAIL_CLOSED`).
+
+### Customising the detection prompt
+
+The system prompt sent to the LLM detector lives at
+`src/anonymizer_guardrail/prompts/llm_detector.md` and is bundled into the
+package. To swap in your own (extra entity types, domain-specific guidance,
+a different language), point `LLM_SYSTEM_PROMPT_PATH` at any readable file
+— typically a mounted volume in the container:
+
+```bash
+podman run --rm -p 8000:8000 \
+  -v $PWD/my_prompt.md:/etc/anonymizer/prompt.md:ro \
+  -e LLM_SYSTEM_PROMPT_PATH=/etc/anonymizer/prompt.md \
+  anonymizer-guardrail:latest
+```
+
+The prompt is loaded once at startup; restart the container to pick up
+edits. A missing/unreadable override path is a hard error rather than a
+silent fall-back to the bundled prompt — if you set the variable, we
+assume you mean it.
 
 ## Run it
 

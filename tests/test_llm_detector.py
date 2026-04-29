@@ -28,6 +28,7 @@ def _fake_config(**overrides: object) -> SimpleNamespace:
         llm_model="test",
         llm_timeout_s=5,
         llm_max_chars=100,
+        llm_system_prompt_path="",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -155,6 +156,42 @@ async def test_non_200_response_becomes_llm_unavailable(
 
     with pytest.raises(LLMUnavailableError, match="503"):
         await detector.detect("hello")
+
+
+def test_default_system_prompt_loads_from_bundled_file() -> None:
+    """The bundled prompt must be readable at import-time — if hatchling
+    stops packaging the prompts/ directory, this fails loudly."""
+    from anonymizer_guardrail.detector.llm import _SYSTEM_PROMPT
+
+    # A few stable phrases from the prompt; if anyone rewrites it heavily,
+    # update this assertion rather than removing it — the point is to prove
+    # we loaded a real prompt, not an empty file.
+    assert "privacy guardian" in _SYSTEM_PROMPT
+    assert "entities" in _SYSTEM_PROMPT
+
+
+def test_override_path_loads_custom_prompt(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = tmp_path / "custom.md"
+    custom.write_text("CUSTOM PROMPT CONTENTS", encoding="utf-8")
+    monkeypatch.setattr(
+        llm_mod, "config", _fake_config(llm_system_prompt_path=str(custom))
+    )
+
+    assert llm_mod._load_system_prompt() == "CUSTOM PROMPT CONTENTS"
+
+
+def test_override_path_missing_file_raises_at_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Typos in LLM_SYSTEM_PROMPT_PATH should crash loudly, not fall back
+    silently to the bundled prompt — operator intent is unambiguous."""
+    monkeypatch.setattr(
+        llm_mod, "config", _fake_config(llm_system_prompt_path="/no/such/file.md")
+    )
+    with pytest.raises(RuntimeError, match="could not be read"):
+        llm_mod._load_system_prompt()
 
 
 async def test_per_call_api_key_overrides_configured_key(
