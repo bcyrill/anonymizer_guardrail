@@ -179,6 +179,24 @@ if [[ "$USE_VOLUME" == "true" ]]; then
   RUN_VOLUME_ARGS=(-v "${HF_VOLUME}:/app/.cache/huggingface")
 fi
 
+# ── HuggingFace Hub offline toggle (pf only, volume reused) ─────────────────
+# When the cache volume already had the model in it, transformers will
+# still hit HuggingFace Hub on every start to revalidate the cache —
+# that's 5+ seconds of HEAD requests plus a "set HF_TOKEN" warning even
+# when the local copy is fine. Offer to short-circuit that for users
+# who don't want to refresh the model right now. We only ask in the
+# already-existed case; first-run obviously needs network access.
+RUN_OFFLINE_ARGS=()
+if [[ "$USE_VOLUME" == "true" && "$JUST_CREATED_VOLUME" == "false" ]]; then
+  say ""
+  say "Volume \"${HF_VOLUME}\" already has the model cached."
+  read -r -p "Check HuggingFace Hub for an updated model? [y/N] " reply || true
+  reply="${reply:-n}"
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    RUN_OFFLINE_ARGS=(-e "HF_HUB_OFFLINE=1")
+  fi
+fi
+
 # ── Pre-existing container with the same name? ──────────────────────────────
 # We use --rm so a clean exit leaves nothing behind; this catches the
 # crashed/Ctrl-Z/-d-but-stopped cases where a stub still hangs around.
@@ -268,6 +286,9 @@ fi
 if [[ ${#RUN_VOLUME_ARGS[@]} -gt 0 ]]; then
   say "Volume:     ${c_grn}${HF_VOLUME}${c_rst} → /app/.cache/huggingface"
 fi
+if [[ ${#RUN_OFFLINE_ARGS[@]} -gt 0 ]]; then
+  say "HF Hub:     ${c_grn}offline${c_rst} ${c_dim}(reusing cached model, no revalidation)${c_rst}"
+fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   say "Passthrough: ${c_dim}${EXTRA_ARGS[*]}${c_rst}"
 fi
@@ -308,5 +329,6 @@ say ""
 exec "$ENGINE" run --rm --name "$NAME" -p "${PORT}:8000" \
   -e "DETECTOR_MODE=${DETECTOR_MODE}" \
   "${RUN_FAKER_ARGS[@]}" \
+  "${RUN_OFFLINE_ARGS[@]}" \
   "${RUN_VOLUME_ARGS[@]}" "${EXTRA_ARGS[@]}" \
   "$IMAGE"

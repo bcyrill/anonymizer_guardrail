@@ -106,8 +106,21 @@ ENV HF_HOME=/app/.cache/huggingface
 
 # Optional: pre-download the model into the image. Skipped unless BOTH
 # args are true — baking only makes sense when the deps are present.
+#
+# When the model is baked in, also default HF_HUB_OFFLINE=1 so that
+# transformers doesn't ping HuggingFace Hub on every container start to
+# revalidate the cache (visible as 5+ seconds of HEAD requests and a
+# misleading "set HF_TOKEN" warning). The setting is written to
+# /app/_runtime-env, which the CMD sources before exec'ing uvicorn; the
+# `${HF_HUB_OFFLINE:-1}` form lets operators force online mode at run
+# time with `-e HF_HUB_OFFLINE=0` if they need to refresh weights from
+# inside a baked image. Slim and runtime-download flavours get an empty
+# file so the source statement in CMD is a no-op for them.
 RUN if [ "$WITH_PRIVACY_FILTER" = "true" ] && [ "$BAKE_PRIVACY_FILTER_MODEL" = "true" ]; then \
-        python -c "from transformers import pipeline; pipeline('token-classification', model='openai/privacy-filter', aggregation_strategy='first')"; \
+        python -c "from transformers import pipeline; pipeline('token-classification', model='openai/privacy-filter', aggregation_strategy='first')" \
+     && echo 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' > /app/_runtime-env; \
+    else \
+        : > /app/_runtime-env; \
     fi
 
 RUN chown -R app:app /app
@@ -139,4 +152,7 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=300s --retries=3 \
 
 # Exec form so SIGTERM from `podman stop` reaches uvicorn cleanly. `sh -c` is
 # needed so ${HOST}/${PORT} expand at container start, not at build time.
-CMD ["sh", "-c", "exec uvicorn anonymizer_guardrail.main:app --host ${HOST} --port ${PORT} --log-level ${LOG_LEVEL} --proxy-headers"]
+# Sourcing /app/_runtime-env applies any flavour-specific defaults (e.g.
+# HF_HUB_OFFLINE=1 for the baked image). The file is empty for flavours
+# that don't need it, so the source is a cheap no-op.
+CMD ["sh", "-c", ". /app/_runtime-env && exec uvicorn anonymizer_guardrail.main:app --host ${HOST} --port ${PORT} --log-level ${LOG_LEVEL} --proxy-headers"]
