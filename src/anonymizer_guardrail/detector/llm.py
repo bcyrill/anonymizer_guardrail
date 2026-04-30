@@ -30,7 +30,7 @@ class LLMUnavailableError(RuntimeError):
     """Raised when the LLM detection backend is unreachable or unresponsive."""
 
 
-_DEFAULT_PROMPT_RELPATH = "prompts/llm_detector.md"
+_DEFAULT_PROMPT_RELPATH = "prompts/llm_default.md"
 
 
 def _load_system_prompt() -> str:

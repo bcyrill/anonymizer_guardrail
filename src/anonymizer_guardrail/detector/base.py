@@ -26,6 +26,10 @@ ENTITY_TYPES = frozenset(
         "AWS_ACCESS_KEY",
         "JWT",
         "PHONE",
+        "MAC_ADDRESS",
+        "URL",
+        "PATH",
+        "IDENTIFIER",
         "OTHER",
     }
 )

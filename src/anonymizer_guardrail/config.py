@@ -50,10 +50,15 @@ class Config:
     # Falls back to LLM_API_KEY if the header is absent.
     llm_use_forwarded_key: bool = _env_bool("LLM_USE_FORWARDED_KEY", False)
     # Path to the system prompt for the LLM detector. If unset, the prompt
-    # bundled inside the package (prompts/llm_detector.md) is used. Operators
+    # bundled inside the package (prompts/llm_default.md) is used. Operators
     # can override to tweak detection behaviour for their domain without
     # rebuilding the image.
     llm_system_prompt_path: str = os.getenv("LLM_SYSTEM_PROMPT_PATH", "")
+    # Path to the YAML file defining the regex detector's patterns. If unset,
+    # the bundled default (patterns/regex_default.yaml) is used. Pre-built
+    # alternatives also ship with the package (e.g. patterns/regex_pentest.yaml)
+    # — point this at any of them or at your own file.
+    regex_patterns_path: str = os.getenv("REGEX_PATTERNS_PATH", "")
     # Hard cap on input size sent to the LLM in one call. Inputs above this
     # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
     # silently truncated — truncating in a guardrail would let everything past

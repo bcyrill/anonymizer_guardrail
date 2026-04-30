@@ -5,53 +5,241 @@ Catches things with recognizable shapes: IPs, emails, hashes, tokens, well-known
 secret prefixes. Patterns are intentionally conservative — high precision over
 high recall, since the LLM layer covers contextual cases regex cannot.
 
-Add patterns by editing _PATTERNS below. Each entry is (entity_type, regex).
+Patterns are loaded from a YAML file at startup. The bundled default lives
+at `patterns/regex_default.yaml`; override with REGEX_PATTERNS_PATH. See the
+schema documentation in the YAML files themselves.
 """
 
 from __future__ import annotations
 
 import re
+from importlib import resources
+from pathlib import Path
+from typing import Any
 
-from .base import Detector, Match
+import yaml
 
-# Order matters where patterns might overlap on the same span: the *first*
-# matching pattern wins for a given (start, end). Put more specific patterns
-# above more general ones (e.g. CIDR before bare IP, AWS key before generic
-# token shapes).
-_PATTERNS: list[tuple[str, str]] = [
-    # ── Cloud / SaaS secrets (very high precision) ─────────────────────────────
-    ("AWS_ACCESS_KEY", r"\bAKIA[0-9A-Z]{16}\b"),
-    ("TOKEN", r"\bgh[pousr]_[A-Za-z0-9_]{36,}\b"),                       # GitHub PAT
-    ("TOKEN", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),                      # Slack
-    ("TOKEN", r"\bsk-[A-Za-z0-9_-]{20,}\b"),                             # OpenAI-style
-    ("JWT", r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+from ..config import config
+from .base import Match
 
-    # ── Identifiers ────────────────────────────────────────────────────────────
-    ("EMAIL_ADDRESS", r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"),
-    (
-        "UUID",
-        r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-"
-        r"[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b",
-    ),
+# Map YAML flag names → re module flags. Restricted to the subset that's
+# meaningful for detection (Python's UNICODE/LOCALE etc. are intentionally
+# excluded; an operator who needs them can rewrite the patterns inline).
+_FLAG_NAMES: dict[str, int] = {
+    "IGNORECASE": re.IGNORECASE,
+    "I": re.IGNORECASE,
+    "MULTILINE": re.MULTILINE,
+    "M": re.MULTILINE,
+    "DOTALL": re.DOTALL,
+    "S": re.DOTALL,
+    "VERBOSE": re.VERBOSE,
+    "X": re.VERBOSE,
+    "ASCII": re.ASCII,
+    "A": re.ASCII,
+}
 
-    # ── Network ────────────────────────────────────────────────────────────────
-    ("CIDR", r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b"),
-    ("IP_ADDRESS", r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
-    (
-        "HOSTNAME",
-        r"\b[a-zA-Z0-9][a-zA-Z0-9-]{0,62}"
-        r"\.(?:local|internal|corp|lan|home|intranet)\b",
-    ),
+_DEFAULT_PATTERNS_RELPATH = "patterns/regex_default.yaml"
+_BUNDLED_PATTERNS_DIR = "patterns"
+# Hard cap on how deep an `extends:` chain can go. Anything past this is
+# almost certainly a config bug (or a deliberate cycle); fail loud rather
+# than recurse forever.
+_MAX_EXTENDS_DEPTH = 8
 
-    # ── Hashes (anchor by length + word boundaries) ────────────────────────────
-    # Order: longest first, so a SHA256 isn't truncated to a SHA1 prefix.
-    ("HASH", r"\b[a-fA-F0-9]{64}\b"),  # SHA-256
-    ("HASH", r"\b[a-fA-F0-9]{40}\b"),  # SHA-1
-    ("HASH", r"\b[a-fA-F0-9]{32}\b"),  # MD5
 
-    # ── Phone (loose; international or US) ─────────────────────────────────────
-    ("PHONE", r"\b\+?\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}\b"),
-]
+def _resolve_flags(raw: Any, source: str) -> int:
+    """Convert a YAML flags entry (list[str]) into a single re-flag bitmask."""
+    if raw is None:
+        return 0
+    if not isinstance(raw, list):
+        raise RuntimeError(
+            f"{source}: `flags` must be a list of flag names, got {type(raw).__name__}"
+        )
+    bits = 0
+    for name in raw:
+        if not isinstance(name, str):
+            raise RuntimeError(f"{source}: flag entries must be strings, got {name!r}")
+        key = name.strip().upper()
+        if key not in _FLAG_NAMES:
+            raise RuntimeError(
+                f"{source}: unknown regex flag {name!r}. "
+                f"Allowed: {', '.join(sorted(set(_FLAG_NAMES) - set('IMSXA')))}."
+            )
+        bits |= _FLAG_NAMES[key]
+    return bits
+
+
+def _read_bundled(relpath: str) -> str:
+    return (
+        resources.files("anonymizer_guardrail")
+        .joinpath(relpath)
+        .read_text(encoding="utf-8")
+    )
+
+
+def _resolve_extends(
+    extends_raw: Any, current_source: str, current_dir: Path | None
+) -> list[tuple[str, str]]:
+    """Resolve an `extends:` field to a list of (yaml_text, source_label) pairs.
+
+    Resolution rules:
+      - bare filename (no slash)  → look up in the bundled patterns/ dir
+      - relative path              → relative to the file containing `extends:`
+                                     (only meaningful when extending a
+                                     filesystem file, not a bundled one)
+      - absolute path              → used as-is
+
+    Bare filenames are the common case (`extends: regex_default.yaml` from
+    a custom file that wants the bundled defaults), and they work uniformly
+    whether we're loading from a filesystem path or a wheel resource.
+    """
+    if extends_raw is None:
+        return []
+    if isinstance(extends_raw, str):
+        names = [extends_raw]
+    elif isinstance(extends_raw, list) and all(isinstance(x, str) for x in extends_raw):
+        names = list(extends_raw)
+    else:
+        raise RuntimeError(
+            f"{current_source}: `extends` must be a string or list of strings."
+        )
+
+    out: list[tuple[str, str]] = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        if "/" not in name and "\\" not in name:
+            # Bundled lookup.
+            try:
+                text = _read_bundled(f"{_BUNDLED_PATTERNS_DIR}/{name}")
+            except (FileNotFoundError, OSError) as exc:
+                raise RuntimeError(
+                    f"{current_source}: extends={name!r} not found in bundled "
+                    f"patterns/ — use a path with `/` to reference an "
+                    f"on-disk file."
+                ) from exc
+            out.append((text, f"bundled patterns/{name}"))
+            continue
+
+        path = Path(name)
+        if not path.is_absolute() and current_dir is not None:
+            path = current_dir / path
+        try:
+            out.append((path.read_text(encoding="utf-8"), str(path)))
+        except OSError as exc:
+            raise RuntimeError(
+                f"{current_source}: extends={name!r} could not be read: {exc}"
+            ) from exc
+    return out
+
+
+def _read_root_patterns_yaml() -> tuple[str, str, Path | None]:
+    """Return (yaml_text, source_label, file_dir) for the root config.
+
+    file_dir is the parent directory if the source is on-disk, else None
+    (used to resolve relative `extends:` paths).
+    """
+    override = config.regex_patterns_path.strip()
+    if override:
+        path = Path(override)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # Fail loud rather than fall back: the operator set this path on
+            # purpose; silently using a different pattern set would be a
+            # nasty source of "why isn't my secret being redacted".
+            raise RuntimeError(
+                f"REGEX_PATTERNS_PATH={override!r} could not be read: {exc}"
+            ) from exc
+        return text, str(path), path.parent
+    return (
+        _read_bundled(_DEFAULT_PATTERNS_RELPATH),
+        f"bundled {_DEFAULT_PATTERNS_RELPATH}",
+        None,
+    )
+
+
+def _parse_yaml(text: str, source: str) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"{source}: invalid YAML — {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"{source}: top-level YAML must be a mapping with a `patterns:` list."
+        )
+    return data
+
+
+def _compile_entries(
+    entries: Any, source: str
+) -> list[tuple[str, re.Pattern[str]]]:
+    if not isinstance(entries, list):
+        raise RuntimeError(f"{source}: `patterns` must be a list.")
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for idx, entry in enumerate(entries):
+        loc = f"{source} entry {idx}"
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"{loc}: each entry must be a mapping.")
+        etype = entry.get("type")
+        pattern = entry.get("pattern")
+        if not isinstance(etype, str) or not etype:
+            raise RuntimeError(f"{loc}: `type` is required and must be a string.")
+        if not isinstance(pattern, str) or not pattern:
+            raise RuntimeError(f"{loc}: `pattern` is required and must be a string.")
+        flags = _resolve_flags(entry.get("flags"), loc)
+        try:
+            compiled.append((etype, re.compile(pattern, flags)))
+        except re.error as exc:
+            raise RuntimeError(
+                f"{loc}: pattern {pattern!r} did not compile — {exc}"
+            ) from exc
+    return compiled
+
+
+def _load_recursive(
+    text: str,
+    source: str,
+    current_dir: Path | None,
+    seen: set[str],
+    depth: int,
+) -> list[tuple[str, re.Pattern[str]]]:
+    if depth > _MAX_EXTENDS_DEPTH:
+        raise RuntimeError(
+            f"{source}: extends chain exceeded depth {_MAX_EXTENDS_DEPTH} — "
+            f"likely a cycle or accidental recursion."
+        )
+    if source in seen:
+        raise RuntimeError(f"{source}: cycle detected in extends chain.")
+    seen = seen | {source}
+
+    data = _parse_yaml(text, source)
+    extended: list[tuple[str, re.Pattern[str]]] = []
+    for ext_text, ext_source in _resolve_extends(
+        data.get("extends"), source, current_dir
+    ):
+        # `extends:` always resolves either to a bundled file (no on-disk
+        # parent dir) or to a path we already absolutised, so children can
+        # only use bundled extends themselves.
+        extended.extend(
+            _load_recursive(ext_text, ext_source, None, seen, depth + 1)
+        )
+    extended.extend(_compile_entries(data.get("patterns", []), source))
+    return extended
+
+
+def _load_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    text, source, current_dir = _read_root_patterns_yaml()
+    compiled = _load_recursive(text, source, current_dir, set(), depth=0)
+    if not compiled:
+        # An empty pattern set is almost certainly a mistake (typo'd top-level
+        # key, accidentally-empty file). The LLM layer keeps working even if
+        # regex is degraded, but the operator deserves to know.
+        raise RuntimeError(f"{source}: no patterns were loaded — is the file empty?")
+    return compiled
+
+
+_COMPILED_PATTERNS = _load_patterns()
 
 
 class RegexDetector:
@@ -60,27 +248,40 @@ class RegexDetector:
     name = "regex"
 
     def __init__(self) -> None:
-        self._compiled: list[tuple[str, re.Pattern[str]]] = [
-            (etype, re.compile(pat)) for etype, pat in _PATTERNS
-        ]
+        self._compiled: list[tuple[str, re.Pattern[str]]] = _COMPILED_PATTERNS
 
     async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]:
         if not text:
             return []
         del api_key  # Regex detection doesn't talk to any backend.
 
-        # Span-based dedup: if two patterns hit overlapping ranges, keep the one
-        # whose pattern appears earlier in _PATTERNS (i.e. the more specific).
+        # Capture-group convention: when a pattern declares one or more groups,
+        # the first non-None group's span IS the entity (the surrounding match
+        # is just label/anchor context). Patterns without groups → full match.
+        # This lets two patterns hit the same line as long as their *value*
+        # spans don't overlap (e.g. one captures password, another username
+        # from the same `user / pass` line).
         claimed: list[tuple[int, int]] = []
         results: list[Match] = []
 
         for entity_type, pattern in self._compiled:
             for m in pattern.finditer(text):
-                start, end = m.span()
+                idx = next(
+                    (i + 1 for i, g in enumerate(m.groups()) if g is not None),
+                    None,
+                )
+                if idx is None:
+                    start, end = m.span()
+                    value = m.group(0)
+                else:
+                    start, end = m.start(idx), m.end(idx)
+                    value = m.group(idx)
                 if any(s < end and start < e for s, e in claimed):
                     continue
+                if not value or not value.strip():
+                    continue
                 claimed.append((start, end))
-                results.append(Match(text=m.group(0), entity_type=entity_type))
+                results.append(Match(text=value.strip(), entity_type=entity_type))
 
         return results
 

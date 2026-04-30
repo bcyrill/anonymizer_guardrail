@@ -95,6 +95,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
+| `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
@@ -132,11 +133,19 @@ likely return 401, which routes through `FAIL_CLOSED`).
 
 ### Customising the detection prompt
 
-The system prompt sent to the LLM detector lives at
-`src/anonymizer_guardrail/prompts/llm_detector.md` and is bundled into the
-package. To swap in your own (extra entity types, domain-specific guidance,
-a different language), point `LLM_SYSTEM_PROMPT_PATH` at any readable file
-— typically a mounted volume in the container:
+Two prompts ship with the package under
+`src/anonymizer_guardrail/prompts/`:
+
+- `llm_default.md` — small, conservative prompt loaded by default.
+- `llm_pentest.md` — verbatim port of the
+  [DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI/blob/main/src/llm_detector.py)
+  system prompt. Tuned for security-engagement output (cracked-password
+  artifacts, NetBIOS names, K8s namespace conventions, pentest tool noise
+  to ignore, etc.).
+
+To swap in one of those (or your own — extra entity types, domain-specific
+guidance, a different language), point `LLM_SYSTEM_PROMPT_PATH` at any
+readable file — typically a mounted volume in the container:
 
 ```bash
 podman run --rm -p 8000:8000 \
@@ -149,6 +158,39 @@ The prompt is loaded once at startup; restart the container to pick up
 edits. A missing/unreadable override path is a hard error rather than a
 silent fall-back to the bundled prompt — if you set the variable, we
 assume you mean it.
+
+### Customising the regex patterns
+
+The deterministic patterns live in
+`src/anonymizer_guardrail/patterns/regex_default.yaml`. Two files ship with
+the package:
+
+- `regex_default.yaml` — small, conservative, low-FP set (loaded by default).
+- `regex_pentest.yaml` — `extends: regex_default.yaml` plus all 173 patterns
+  ported verbatim from
+  [DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI/blob/main/src/regex_detector.py)
+  (cloud creds, NTDS dumps, hashcat output, Pacu, Volatility, BloodHound,
+  K8s secrets, Slack/Teams formats, AD CS templates, etc.). Tuned for
+  pentest output and noisy in non-security contexts — opt in deliberately.
+
+Point `REGEX_PATTERNS_PATH` at any YAML file to swap. To start from the
+pentest set inside the container:
+
+```bash
+podman run --rm -p 8000:8000 \
+  -e REGEX_PATTERNS_PATH=/usr/lib/python3.12/site-packages/anonymizer_guardrail/patterns/regex_pentest.yaml \
+  anonymizer-guardrail:latest
+```
+
+Or supply your own file. Each entry is `{type, pattern, flags?}`; `extends:`
+inherits another file's patterns (bare filename → bundled lookup, path with
+`/` → on-disk). When a pattern declares one or more capturing groups, the
+first non-None group's span is treated as the entity (lets a labeled
+pattern like `password:\s+(\S+)` anonymize only the value, not the label).
+Patterns without groups still anonymize the full match. All patterns
+compile at startup; any bad regex, unknown flag, or unreadable extends
+path crashes the boot rather than silently dropping rules. Order matters
+— first match wins on overlapping spans.
 
 ## Run it
 

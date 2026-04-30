@@ -57,11 +57,18 @@ _GENERATORS: dict[str, Callable[[Faker, str], str]] = {
     "USERNAME":       lambda f, _o: f.user_name(),
     "PHONE":          lambda f, _o: f.phone_number(),
     "UUID":           lambda f, _o: f.uuid4(),
+    "MAC_ADDRESS":    lambda f, _o: f.mac_address(),
+    "URL":            lambda f, _o: f.url(),
     "CREDENTIAL":     _opaque("CRED"),
     "TOKEN":          _opaque("TOKEN"),
     "HASH":           _opaque("HASH"),
     "JWT":            _opaque("JWT"),
     "AWS_ACCESS_KEY": _opaque("AWS"),
+    # PATH and IDENTIFIER are too varied for a "realistic" surrogate
+    # (S3 buckets, ARNs, /opt paths, ADB serials all share the type)
+    # so we use opaque placeholders rather than risk misleading the LLM.
+    "PATH":           _opaque("PATH"),
+    "IDENTIFIER":     _opaque("ID"),
     "OTHER":          _opaque("REDACTED"),
 }
 
