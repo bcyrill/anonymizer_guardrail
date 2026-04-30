@@ -1,16 +1,21 @@
 name: Release
 
-# Triggered ONLY by the canonical vX.Y.Z tag — flavour-variant tags
-# (vX.Y.Z+pf, vX.Y.Z+pf-baked) reuse the existing release rather than
-# create a new one per flavour.
+# Triggered by any vX.Y.Z* tag, but the job itself is skipped for
+# flavour-variant tags (vX.Y.Z+pf, vX.Y.Z+pf-baked) so they reuse the
+# existing release rather than create a new one per flavour.
+#
+# The exclusion is enforced at the job level (`if:`) rather than via a
+# negative tag pattern (`!v*+*`) because GitHub Actions' minimatch
+# parser treats `+*` as the extglob "one or more" quantifier, which
+# fails workflow validation with "invalid tags patterns".
 on:
   push:
     tags:
       - 'v*.*.*'
-      - '!v*+*'   # exclude flavour variants — same release covers them all
 
 jobs:
   release:
+    if: ${{ !contains(github.ref_name, '+') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -25,11 +30,10 @@ jobs:
         with:
           generate_release_notes: true
           draft: false
-          # Pre-release detection: a `-` in the tag (`-rc1`, `-alpha`) but
-          # NOT inside a `+`-suffixed flavour variant — those are filtered
-          # out at the trigger level above, but the guard makes the
-          # condition robust if anyone ever changes the trigger filter.
-          prerelease: ${{ !contains(github.ref_name, '+') && contains(github.ref_name, '-') }}
+          # Pre-release when the tag has a `-` suffix (`-rc1`, `-alpha`).
+          # Flavour variants (`+pf`, `+pf-baked`) are already filtered at
+          # the job level above, so `-` here is unambiguous.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Container images for this release:
             ```
