@@ -96,6 +96,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
 | `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
+| `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
@@ -170,6 +171,26 @@ The prompt is loaded once at startup; restart the container to pick up
 edits. A missing/unreadable override path is a hard error rather than a
 silent fall-back to the bundled prompt — if you set the variable, we
 assume you mean it.
+
+### Localising surrogates
+
+Set `FAKER_LOCALE` to control the locale Faker uses for generated names,
+companies, addresses, phone numbers, etc. Examples:
+
+```bash
+-e FAKER_LOCALE=pt_BR              # Brazilian Portuguese
+-e FAKER_LOCALE=de_DE              # German
+-e FAKER_LOCALE=ja_JP              # Japanese
+-e FAKER_LOCALE=pt_BR,en_US        # try pt_BR first, fall back to en_US
+                                   # for providers it doesn't implement
+```
+
+Empty (the default) means Faker's own default (`en_US`). Invalid locales
+fail at startup with a clear message — the
+[Faker docs](https://faker.readthedocs.io/) list every supported one.
+Surrogates for opaque-token types (`HASH`, `JWT`, `CREDENTIAL`, etc.) are
+unaffected; locale only changes the realistic-substitute types
+(`PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, …).
 
 ### Customising the regex patterns
 

@@ -18,7 +18,14 @@ from typing import Callable
 
 from faker import Faker
 
+from .config import config
 from .detector.base import Match
+
+
+def _parse_locales(raw: str) -> list[str] | None:
+    """Convert FAKER_LOCALE into the form Faker expects (or None for default)."""
+    cleaned = [s.strip() for s in raw.split(",") if s.strip()]
+    return cleaned or None
 
 
 def _seed_for(text: str, entity_type: str) -> int:
@@ -79,6 +86,17 @@ class SurrogateGenerator:
     def __init__(self) -> None:
         self._cache: dict[tuple[str, str], str] = {}
         self._lock = threading.Lock()
+        self._locales = _parse_locales(config.faker_locale)
+        # Instantiate once eagerly so a typo'd locale (e.g. "pr_BR" instead
+        # of "pt_BR") fails at boot with a clear message, not at first
+        # request with a confusing AttributeError from inside Faker.
+        try:
+            Faker(self._locales)
+        except (AttributeError, ValueError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                f"FAKER_LOCALE={config.faker_locale!r} is not a valid Faker "
+                f"locale: {exc}. See https://faker.readthedocs.io/ for the list."
+            ) from exc
 
     def for_match(self, match: Match) -> str:
         """Return a stable surrogate for this match."""
@@ -89,7 +107,7 @@ class SurrogateGenerator:
                 return cached
 
         seed = _seed_for(match.text, match.entity_type)
-        fake = Faker()
+        fake = Faker(self._locales)
         fake.seed_instance(seed)
         gen = _GENERATORS.get(match.entity_type, _GENERATORS["OTHER"])
         surrogate = gen(fake, match.text)

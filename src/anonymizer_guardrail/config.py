@@ -59,6 +59,12 @@ class Config:
     # alternatives also ship with the package (e.g. patterns/regex_pentest.yaml)
     # — point this at any of them or at your own file.
     regex_patterns_path: str = os.getenv("REGEX_PATTERNS_PATH", "")
+    # Faker locale(s) used by the surrogate generator. Empty → Faker's own
+    # default (en_US). Single locale ("pt_BR") or comma-separated list
+    # ("pt_BR,en_US") with the first one preferred and others used as
+    # fallback for providers the primary doesn't implement. Invalid
+    # locales fail at startup, not at first request.
+    faker_locale: str = os.getenv("FAKER_LOCALE", "")
     # Hard cap on input size sent to the LLM in one call. Inputs above this
     # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
     # silently truncated — truncating in a guardrail would let everything past
