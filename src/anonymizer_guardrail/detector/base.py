@@ -51,8 +51,14 @@ class Match:
 
 
 class Detector(Protocol):
-    """A detection layer that returns sensitive substrings found in a text."""
+    """A detection layer that returns sensitive substrings found in a text.
+
+    The base contract is intentionally narrow: pure (text → matches). Detectors
+    that need extra inputs (e.g. LLMDetector accepts a per-call `api_key` for
+    forwarded credentials) declare those on their own concrete signature, and
+    the Pipeline type-narrows with isinstance checks before passing them.
+    """
 
     name: str
 
-    async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]: ...
+    async def detect(self, text: str) -> list[Match]: ...

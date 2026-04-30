@@ -113,9 +113,11 @@ class Pipeline:
         async def _run(det: Detector) -> list[Match]:
             try:
                 if isinstance(det, LLMDetector):
+                    # Only the LLM layer takes an api_key (for forwarded
+                    # virtual-key auth). Regex doesn't talk to any backend.
                     async with self._llm_semaphore:
                         return await det.detect(text, api_key=api_key)
-                return await det.detect(text, api_key=api_key)
+                return await det.detect(text)
             except LLMUnavailableError as exc:
                 if config.fail_closed:
                     raise

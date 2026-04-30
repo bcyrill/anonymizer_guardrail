@@ -276,10 +276,9 @@ class RegexDetector:
     def __init__(self) -> None:
         self._compiled: list[tuple[str, re.Pattern[str]]] = _COMPILED_PATTERNS
 
-    async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]:
+    async def detect(self, text: str) -> list[Match]:
         if not text:
             return []
-        del api_key  # Regex detection doesn't talk to any backend.
 
         # Capture-group convention: when a pattern declares one or more groups,
         # the first non-None group's span IS the entity (the surrounding match
