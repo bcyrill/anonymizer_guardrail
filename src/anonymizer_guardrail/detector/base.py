@@ -42,6 +42,21 @@ ENTITY_TYPES = frozenset(
 )
 
 
+# Entity types where trailing `.,;!?` can be STRUCTURALLY part of the
+# value, so the trim below must NOT touch them. Examples:
+#   - CREDENTIAL: passwords like "hunter2!" or "P@ssw0rd?"
+#   - TOKEN:      opaque, no guarantees about character set
+#   - PATH:       trailing `.` may signal a directory or hidden file
+#   - IDENTIFIER: opaque catch-all bucket
+#   - OTHER:      unknown semantics — safer to leave verbatim
+# Every other type is "natural-text" enough that a trailing period /
+# comma / etc. is almost always sentence punctuation pulled in by the
+# detector, never part of the entity itself.
+_DO_NOT_TRIM_TYPES: frozenset[str] = frozenset(
+    {"CREDENTIAL", "TOKEN", "PATH", "IDENTIFIER", "OTHER"}
+)
+
+
 @dataclass(frozen=True)
 class Match:
     """A single detected sensitive substring."""
@@ -50,9 +65,19 @@ class Match:
     entity_type: str
 
     def __post_init__(self) -> None:
-        # Normalize unknown types to OTHER so downstream code never has to guard.
+        # Normalize unknown types to OTHER first — the trim decision
+        # below depends on the canonical type.
         if self.entity_type not in ENTITY_TYPES:
             object.__setattr__(self, "entity_type", "OTHER")
+        # Trim trailing sentence punctuation that detectors sometimes pull
+        # into spans (the LLM and NER paths especially — regex patterns
+        # mostly anchor with \b already, so this is a no-op for them).
+        # Skipped for types listed in _DO_NOT_TRIM_TYPES, where the
+        # punctuation can legitimately be part of the value.
+        if self.entity_type not in _DO_NOT_TRIM_TYPES:
+            trimmed = self.text.rstrip(".,;!?")
+            if trimmed != self.text:
+                object.__setattr__(self, "text", trimmed)
 
 
 class Detector(Protocol):

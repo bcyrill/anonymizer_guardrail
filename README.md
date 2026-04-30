@@ -305,7 +305,7 @@ Three image flavours, controlled by two build-args, sharing one
 |---|---|---|---|
 | slim | ~200 MB | n/a | DETECTOR_MODE never includes `privacy_filter` |
 | privacy-filter (runtime download) | ~1.3 GB | downloads on first container start | most deployments — pair with a named volume |
-| privacy-filter (model baked in) | ~7 GB | shipped inside image | air-gapped or strict cold-start latency |
+| privacy-filter (model baked in) | ~6.9 GB | shipped inside image | air-gapped or strict cold-start latency |
 
 (Sizes assume the default CPU-only PyTorch build. Override with
 `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121` if
@@ -324,7 +324,7 @@ podman build -t anonymizer-guardrail:privacy-filter \
     --build-arg WITH_PRIVACY_FILTER=true -f Containerfile .
 
 # 3) Privacy-filter, model baked into image — self-contained, no runtime
-#    network, but ~7 GB image and ~6 GB extra in your registry.
+#    network, at the cost of a much larger image (size in the table above).
 podman build -t anonymizer-guardrail:privacy-filter-baked \
     --build-arg WITH_PRIVACY_FILTER=true \
     --build-arg BAKE_PRIVACY_FILTER_MODEL=true \
