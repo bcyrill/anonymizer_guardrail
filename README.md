@@ -308,9 +308,6 @@ uvicorn anonymizer_guardrail.main:app --reload
 - **Single replica.** The vault is in-memory; mappings written on one replica
   aren't visible from another. For multi-replica deployments, swap `Vault`
   for a Redis-backed implementation — the interface is two methods.
-- **Single pass anonymization.** Substitution uses a single-pass regex approach
-  to avoid transitive replacements. Longest keys match first to ensure
-  correctness when one sensitive entity is a substring of another.
 - **No streaming.** LiteLLM's guardrail calls are pre/post; streaming responses
   are deanonymized after assembly. If you need to anonymize partial chunks,
   this isn't the right tool.
