@@ -292,16 +292,24 @@ class RegexDetector:
 
         for entity_type, pattern in self._compiled:
             for m in pattern.finditer(text):
-                idx = next(
-                    (i + 1 for i, g in enumerate(m.groups()) if g is not None),
-                    None,
-                )
-                if idx is None:
-                    start, end = m.span()
-                    value = m.group(0)
-                else:
-                    start, end = m.start(idx), m.end(idx)
-                    value = m.group(idx)
+                # Capture-group priority:
+                # 1. Named group "entity" (explicit designation)
+                # 2. First non-None positional group (backward compatibility)
+                # 3. Full match (no groups defined)
+                try:
+                    start, end = m.span("entity")
+                    value = m.group("entity")
+                except (IndexError, KeyError):
+                    idx = next(
+                        (i + 1 for i, g in enumerate(m.groups()) if g is not None),
+                        None,
+                    )
+                    if idx is None:
+                        start, end = m.span()
+                        value = m.group(0)
+                    else:
+                        start, end = m.start(idx), m.end(idx)
+                        value = m.group(idx)
                 if any(s < end and start < e for s, e in claimed):
                     continue
                 if not value or not value.strip():

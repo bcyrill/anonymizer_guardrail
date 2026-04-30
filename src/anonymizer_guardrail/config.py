@@ -78,6 +78,9 @@ class Config:
     # within typical small-model context windows; tune to your model.
     llm_max_chars: int = _env_int("LLM_MAX_CHARS", 200_000)
 
+    # Max number of concurrent LLM calls.
+    llm_max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
+
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     vault_ttl_s: int = _env_int("VAULT_TTL_S", 600)
 

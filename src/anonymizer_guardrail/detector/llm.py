@@ -145,6 +145,7 @@ class LLMDetector:
         self.api_key = api_key if api_key is not None else config.llm_api_key
         self.model = model or config.llm_model
         self.timeout_s = timeout_s or config.llm_timeout_s
+        self._client = httpx.AsyncClient(timeout=self.timeout_s)
 
     async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]:
         if not text or not text.strip():
@@ -187,8 +188,7 @@ class LLMDetector:
 
         url = f"{self.api_base}/chat/completions"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                resp = await client.post(url, headers=headers, json=payload)
+            resp = await self._client.post(url, headers=headers, json=payload)
         except httpx.ConnectError as exc:
             raise LLMUnavailableError(f"Cannot reach LLM at {url}: {exc}") from exc
         except httpx.TimeoutException as exc:
@@ -207,6 +207,11 @@ class LLMDetector:
             return []
 
         return _parse_entities(content, text)
+
+    async def aclose(self) -> None:
+        """Close the shared httpx client. Called from Pipeline.aclose() at
+        FastAPI shutdown so the connection pool drains cleanly."""
+        await self._client.aclose()
 
 
 __all__ = ["LLMDetector", "LLMUnavailableError"]

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Iterable
 
 from .config import config
@@ -48,17 +49,21 @@ def _dedup(matches: Iterable[Match]) -> list[Match]:
 
 
 def _replace_all(text: str, mapping: dict[str, str]) -> str:
-    """Replace every key in `mapping` with its value, longest keys first.
+    """Replace every key in `mapping` with its value in a single pass.
 
-    Longest-first avoids the case where a short key is a substring of a long
-    one (e.g. "acme" is inside "acmecorp.local") and replacing the short one
-    first would corrupt the long one.
+    Uses a regular expression to find all keys simultaneously, avoiding
+    transitive replacements (where a surrogate generated for Entity A
+    matches the original text of Entity B and gets replaced again).
     """
     if not mapping:
         return text
-    for key in sorted(mapping, key=len, reverse=True):
-        text = text.replace(key, mapping[key])
-    return text
+
+    # Sort keys by length descending to ensure that if one key is a prefix
+    # of another, the longer one matches first in the regex.
+    pattern = re.compile(
+        "|".join(re.escape(k) for k in sorted(mapping.keys(), key=len, reverse=True))
+    )
+    return pattern.sub(lambda m: mapping[m.group(0)], text)
 
 
 class Pipeline:
@@ -66,11 +71,13 @@ class Pipeline:
         self._detectors: list[Detector] = _build_detectors()
         self._surrogates = SurrogateGenerator()
         self._vault = Vault()
+        self._llm_semaphore = asyncio.Semaphore(config.llm_max_concurrency)
         log.info(
-            "Pipeline ready — detectors=[%s], vault_ttl=%ds, fail_closed=%s",
+            "Pipeline ready — detectors=[%s], vault_ttl=%ds, fail_closed=%s, max_concurrency=%d",
             ", ".join(d.name for d in self._detectors),
             config.vault_ttl_s,
             config.fail_closed,
+            config.llm_max_concurrency,
         )
 
     @property
@@ -80,11 +87,22 @@ class Pipeline:
     async def _detect_one(
         self, text: str, *, api_key: str | None = None
     ) -> list[Match]:
-        """Run all configured detectors against one text and dedup."""
+        """Run all configured detectors against one text and dedup.
+
+        The LLM concurrency semaphore is acquired ONLY around LLM detector
+        calls — regex is CPU-only and instant, so throttling it would just
+        serialize work that wasn't a problem. Process-wide cap protects the
+        upstream LLM service from thundering-herd.
+        """
         results: list[list[Match]] = []
         for det in self._detectors:
             try:
-                results.append(await det.detect(text, api_key=api_key))
+                if isinstance(det, LLMDetector):
+                    async with self._llm_semaphore:
+                        matches = await det.detect(text, api_key=api_key)
+                else:
+                    matches = await det.detect(text, api_key=api_key)
+                results.append(matches)
             except LLMUnavailableError as exc:
                 if config.fail_closed:
                     raise
@@ -95,6 +113,17 @@ class Pipeline:
                 results.append([])
         flat = [m for sub in results for m in sub]
         return _dedup(flat)
+
+    async def aclose(self) -> None:
+        """Release per-detector resources (httpx connection pools, etc).
+        Wired to FastAPI's lifespan in main.py so shutdown is clean."""
+        for det in self._detectors:
+            close = getattr(det, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception as exc:  # noqa: BLE001 — never fail shutdown
+                    log.warning("Detector %s aclose failed: %s", det.name, exc)
 
     async def anonymize(
         self,

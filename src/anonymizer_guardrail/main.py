@@ -9,10 +9,10 @@ Single endpoint: POST /beta/litellm_basic_guardrail_api
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Mapping
 
 from fastapi import FastAPI
-
-from typing import Mapping
 
 from .api import GuardrailRequest, GuardrailResponse
 from .config import config
@@ -25,15 +25,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("anonymizer")
 
+# Single Pipeline instance — its surrogate cache and vault are intentionally
+# process-wide so we get cross-call surrogate consistency for free.
+_pipeline = Pipeline()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Drain the LLM detector's connection pool on shutdown so SIGTERM
+    doesn't leave half-open sockets. Pre-yield setup is empty — the
+    Pipeline is constructed at import-time."""
+    yield
+    await _pipeline.aclose()
+
+
 app = FastAPI(
     title="anonymizer-guardrail",
     description="LiteLLM Generic Guardrail API for round-trip anonymization.",
     version="0.1.0",
+    lifespan=lifespan,
 )
-
-# Single Pipeline instance — its surrogate cache and vault are intentionally
-# process-wide so we get cross-call surrogate consistency for free.
-_pipeline = Pipeline()
 
 
 def _forwarded_bearer(headers: Mapping[str, object] | None) -> str | None:
