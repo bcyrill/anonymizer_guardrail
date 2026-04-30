@@ -79,8 +79,8 @@ def _forwarded_bearer(headers: Mapping[str, object] | None) -> str | None:
 async def health() -> dict[str, object]:
     return {
         "status": "ok",
-        "vault_size": _pipeline.vault.size(),
         "detector_mode": config.detector_mode,
+        **_pipeline.stats(),
     }
 
 

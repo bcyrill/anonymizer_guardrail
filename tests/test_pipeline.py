@@ -8,6 +8,8 @@ import os
 # anything that reads config.
 os.environ["DETECTOR_MODE"] = "regex"
 
+import asyncio
+
 import pytest
 
 from anonymizer_guardrail.pipeline import Pipeline
@@ -70,3 +72,124 @@ async def test_vault_evicts_after_pop(pipeline: Pipeline) -> None:
     assert pipeline.vault.size() == 1
     await pipeline.deanonymize(["…"], call_id="evict-test")
     assert pipeline.vault.size() == 0
+
+
+def _patch_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
+    """Replace the frozen Config singleton in pipeline.py for one test.
+    Wraps the real config so all OTHER fields keep their values."""
+    from types import SimpleNamespace
+    from anonymizer_guardrail import pipeline as pipeline_mod
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["fail_closed"] = value
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+
+def _llm_detector_that_raises(exc_factory):
+    """A bare LLMDetector instance whose detect() raises whatever
+    exc_factory returns. Bypasses the real httpx wiring."""
+    from anonymizer_guardrail.detector.llm import LLMDetector
+
+    bad = LLMDetector.__new__(LLMDetector)
+    bad.name = "llm"
+
+    async def boom(*_args, **_kwargs):
+        raise exc_factory()
+
+    bad.detect = boom  # type: ignore[method-assign]
+    return bad
+
+
+async def test_unexpected_llm_failure_routes_through_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under FAIL_CLOSED, any failure inside the LLM detector — even an
+    unexpected one that isn't LLMUnavailableError — must propagate so the
+    guardrail BLOCKs the request instead of silently returning empty
+    matches. Without this, a programmer error in the LLM path would let
+    unredacted text reach the upstream model in fail-closed mode."""
+    from anonymizer_guardrail.detector.llm import LLMUnavailableError
+
+    _patch_fail_closed(monkeypatch, True)
+
+    p = Pipeline()
+    p._detectors = [_llm_detector_that_raises(
+        lambda: RuntimeError("unexpected non-LLMUnavailable explosion")
+    )]
+
+    with pytest.raises(LLMUnavailableError, match="Unexpected failure"):
+        await p.anonymize(["alice"], call_id="unexpected-fail")
+
+
+async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
+    """Pipeline.stats() snapshots vault size, surrogate cache size + cap,
+    and LLM in-flight + cap. Used by /health for ops monitoring."""
+    s = pipeline.stats()
+    expected_keys = {
+        "vault_size",
+        "surrogate_cache_size",
+        "surrogate_cache_max",
+        "llm_in_flight",
+        "llm_max_concurrency",
+    }
+    assert expected_keys.issubset(s.keys())
+    assert s["vault_size"] == 0
+    assert s["llm_in_flight"] == 0
+    assert s["surrogate_cache_max"] >= 1
+
+    # Anonymize a request — surrogate cache should grow, vault should fill.
+    await pipeline.anonymize(
+        ["mail alice@acmecorp.com from 10.0.0.1"], call_id="stats-test"
+    )
+    s = pipeline.stats()
+    assert s["vault_size"] == 1
+    assert s["surrogate_cache_size"] >= 2  # at least email + ip
+
+
+async def test_llm_in_flight_increments_around_detect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counter must reflect concurrent LLM activity. We block the
+    fake detector mid-call, snapshot stats, then unblock it."""
+    _patch_fail_closed(monkeypatch, False)
+    p = Pipeline()
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    from anonymizer_guardrail.detector.llm import LLMDetector
+    bad = LLMDetector.__new__(LLMDetector)
+    bad.name = "llm"
+
+    async def slow_detect(*_args, **_kwargs):
+        started.set()
+        await finish.wait()
+        return []
+
+    bad.detect = slow_detect  # type: ignore[method-assign]
+    p._detectors = [bad]
+
+    task = asyncio.create_task(p.anonymize(["x"], call_id="inflight"))
+    await started.wait()
+    assert p.stats()["llm_in_flight"] == 1
+    finish.set()
+    await task
+    assert p.stats()["llm_in_flight"] == 0
+
+
+async def test_unexpected_llm_failure_swallowed_under_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fail_open=true → LLM exceptions log and fall through to whatever
+    the regex layer produced. The text proceeds, no BLOCK."""
+    _patch_fail_closed(monkeypatch, False)
+
+    p = Pipeline()
+    p._detectors = [_llm_detector_that_raises(lambda: RuntimeError("kaboom"))]
+
+    # With no other detectors and the LLM swallowed, nothing gets
+    # anonymized — the text passes through unchanged.
+    modified, mapping = await p.anonymize(
+        ["alice met bob"], call_id="failopen-test"
+    )
+    assert modified == ["alice met bob"]
+    assert mapping == {}

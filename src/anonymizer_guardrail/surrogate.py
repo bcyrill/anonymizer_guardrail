@@ -5,9 +5,17 @@ Each detected entity is replaced with a *realistic* substitute of the same
 type, so the upstream LLM's reasoning quality survives anonymization
 ("acmecorp.local" → "quasarware.local", not "[ORGANIZATION_7F3A2B]").
 
-Determinism: the same `(original, entity_type)` pair always maps to the same
-surrogate within a process. This matters for multi-turn conversations and for
-the same entity appearing in multiple texts of one request.
+Determinism guarantees, in order of strictness:
+  * **Within a single request**: the same `(original, entity_type)` always
+    maps to the same surrogate. Hard-guaranteed regardless of cache state —
+    the pipeline keeps its own per-call mapping.
+  * **Across requests, while the entry stays in the LRU cache**: the same
+    pair maps to the same surrogate. Backs cross-request consistency for
+    multi-turn conversations.
+  * **After the entry has been evicted from the LRU**: a fresh request may
+    produce a *different* surrogate for the same input. Bounded by
+    SURROGATE_CACHE_MAX_SIZE — raise the cap if your conversations are
+    long enough to outlive default eviction.
 """
 
 from __future__ import annotations
@@ -153,6 +161,12 @@ class SurrogateGenerator:
                     f"FAKER_LOCALE={config.faker_locale!r} is not a valid Faker "
                     f"locale: {exc}. See https://faker.readthedocs.io/ for the list."
                 ) from exc
+
+    def cache_stats(self) -> tuple[int, int]:
+        """Return (current_size, max_size). Read without the lock —
+        len() on a CPython dict is atomic, and max_size is immutable
+        after __init__. Used by Pipeline.stats() for the /health probe."""
+        return len(self._cache), self._max_cache_size
 
     def for_match(self, match: Match) -> str:
         """Return a stable surrogate for this match."""

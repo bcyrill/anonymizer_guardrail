@@ -76,6 +76,12 @@ class Pipeline:
         self._surrogates = SurrogateGenerator()
         self._vault = Vault()
         self._llm_semaphore = asyncio.Semaphore(config.llm_max_concurrency)
+        # In-flight LLM call counter. We increment/decrement around the
+        # detect() call rather than reading Semaphore._value (private)
+        # because the asyncio.Semaphore API doesn't expose a stable
+        # "current waiters" attribute. Single-threaded asyncio means
+        # plain int mutation is safe between await points.
+        self._llm_in_flight = 0
         log.info(
             "Pipeline ready — detectors=[%s], vault_ttl=%ds, fail_closed=%s, max_concurrency=%d",
             ", ".join(d.name for d in self._detectors),
@@ -83,6 +89,18 @@ class Pipeline:
             config.fail_closed,
             config.llm_max_concurrency,
         )
+
+    def stats(self) -> dict[str, int | str]:
+        """Snapshot of pipeline-internal counters for the /health probe.
+        All reads are cheap and lock-free."""
+        cache_size, cache_max = self._surrogates.cache_stats()
+        return {
+            "vault_size": self._vault.size(),
+            "surrogate_cache_size": cache_size,
+            "surrogate_cache_max": cache_max,
+            "llm_in_flight": self._llm_in_flight,
+            "llm_max_concurrency": config.llm_max_concurrency,
+        }
 
     @property
     def vault(self) -> Vault:
@@ -116,7 +134,11 @@ class Pipeline:
                     # Only the LLM layer takes an api_key (for forwarded
                     # virtual-key auth). Regex doesn't talk to any backend.
                     async with self._llm_semaphore:
-                        return await det.detect(text, api_key=api_key)
+                        self._llm_in_flight += 1
+                        try:
+                            return await det.detect(text, api_key=api_key)
+                        finally:
+                            self._llm_in_flight -= 1
                 return await det.detect(text)
             except LLMUnavailableError as exc:
                 if config.fail_closed:
@@ -125,6 +147,19 @@ class Pipeline:
                 return []
             except Exception as exc:  # defensive: a buggy detector shouldn't kill us
                 log.exception("Detector %s crashed: %s", det.name, exc)
+                # Asymmetry on purpose: a buggy regex pattern can degrade to
+                # empty matches without taking the request down — the LLM
+                # layer still runs. But an unexpected LLM failure under
+                # FAIL_CLOSED is not safely degradable; if we silently
+                # returned [] here, an operator who set FAIL_CLOSED=true
+                # specifically to BLOCK on any LLM problem would instead
+                # see the request quietly proceed with regex-only redaction.
+                # Re-raise as LLMUnavailableError so the BLOCKED path fires.
+                if isinstance(det, LLMDetector) and config.fail_closed:
+                    raise LLMUnavailableError(
+                        f"Unexpected failure in LLM detector "
+                        f"({type(exc).__name__}): {exc}"
+                    ) from exc
                 return []
 
         results = await asyncio.gather(*[_run(d) for d in self._detectors])
