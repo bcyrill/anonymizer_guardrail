@@ -1,0 +1,83 @@
+# Fake-LLM rules — minimal config covering the common test scenarios.
+#
+# Each rule is checked in order; the FIRST match wins. A rule fires
+# when any of its configured matchers succeeds:
+#   match:       substring (case-sensitive)
+#   match_regex: Python regex, .search semantics
+#
+# Response controls:
+#   entities:    list of {text, type} returned as the LLM's parsed JSON
+#                (the default — what you want for ordinary tests)
+#   raw_content: assistant message content as a literal string
+#                (for parser-robustness tests: malformed JSON, prose
+#                output, code-fenced JSON, <think>…</think> blocks, …)
+#   status_code: non-200 to test the FAIL_CLOSED path
+#   delay_s:     seconds to sleep before responding (timeout testing)
+#
+# When no rule matches, the `default:` block applies.
+
+rules:
+  # Reproduces the UUID-overlap case: regex catches the full UUID, the
+  # LLM (us, here) reports only the trailing 12-digit suffix as
+  # IDENTIFIER. Useful for verifying that longest-match-wins works at
+  # substitution time.
+  - description: "UUID — substring match returns trailing 12 digits"
+    match: "550e8400-e29b-41d4-a716-446655440000"
+    entities:
+      - text: "446655440000"
+        type: IDENTIFIER
+
+  # Catches a generic "Alice <surname>" mention as PERSON.
+  - description: "Alice Smith → PERSON"
+    match_regex: 'Alice\s+\w+'
+    entities:
+      - text: "Alice Smith"
+        type: PERSON
+
+  # Multi-entity rule: org + project codename in one prose chunk.
+  - description: "AcmeCorp / Project Zephyr"
+    match: "AcmeCorp"
+    entities:
+      - text: "AcmeCorp"
+        type: ORGANIZATION
+      - text: "Project Zephyr"
+        type: IDENTIFIER
+
+  # Hallucination: returns a substring that is NOT in the input. The
+  # guardrail's parser should drop it (look for "dropped 1 hallucinations"
+  # in DEBUG logs).
+  - description: "Hallucination test"
+    match: "hallucinate-me"
+    entities:
+      - text: "this-is-not-in-the-input"
+        type: PERSON
+
+  # Parser robustness: code-fenced JSON, with a <think> block prefix.
+  - description: "Reasoning model output (think-block + fenced JSON)"
+    match: "reasoning-model-test"
+    raw_content: |
+      <think>The user is asking about Bob.</think>
+      ```json
+      {"entities": [{"text": "Bob", "type": "PERSON"}]}
+      ```
+
+  # Parser failure: malformed JSON. Detector logs a warning and
+  # returns no matches.
+  - description: "Malformed JSON"
+    match: "broken-json-test"
+    raw_content: '{"entities": [{"text": "broken"'
+
+  # Forces a 5xx so FAIL_CLOSED kicks in (request blocked).
+  - description: "Backend error → 503"
+    match: "force-5xx"
+    status_code: 503
+
+  # Slow response → trips LLM_TIMEOUT_S (default 30). Adjust delay
+  # to be just over your configured timeout.
+  - description: "Timeout"
+    match: "force-timeout"
+    delay_s: 35
+
+# Anything else: empty entities → guardrail sees regex matches only.
+default:
+  entities: []

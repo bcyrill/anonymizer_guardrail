@@ -1,0 +1,40 @@
+# Fake OpenAI-compatible Chat Completions server for guardrail testing.
+#
+# Build:
+#   podman build -t fake-llm:latest -f fake-llm/Containerfile fake-llm/
+#
+# Run with the bundled rules.example.yaml:
+#   podman run --rm -p 4000:4000 fake-llm:latest
+#
+# Run with your own rules file (typical case):
+#   podman run --rm -p 4000:4000 \
+#     -v $PWD/my-rules.yaml:/app/rules.yaml:ro \
+#     fake-llm:latest
+
+FROM docker.io/library/python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install --no-cache-dir \
+        'fastapi>=0.110' \
+        'uvicorn[standard]>=0.27' \
+        'pyyaml>=6.0'
+
+WORKDIR /app
+COPY main.py /app/main.py
+COPY rules.example.yaml /app/rules.yaml
+
+ENV PORT=4000 \
+    RULES_PATH=/app/rules.yaml \
+    MODEL_NAME=fake \
+    LOG_LEVEL=info
+
+EXPOSE 4000
+
+# Lowercase LOG_LEVEL — both our Python logger and uvicorn's --log-level
+# accept it. Using `tr` keeps the CMD working under /bin/sh (dash on
+# Debian-slim doesn't support bash's ${VAR,,} expansion).
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT} --log-level $(echo ${LOG_LEVEL} | tr A-Z a-z)"]
