@@ -209,8 +209,22 @@ class Pipeline:
                 return []
 
         results = await asyncio.gather(*[_run(d) for d in self._detectors])
+        if log.isEnabledFor(logging.DEBUG):
+            for det, matches in zip(self._detectors, results):
+                log.debug(
+                    "Detector %s returned %d matches: %s",
+                    det.name, len(matches),
+                    [(m.text, m.entity_type) for m in matches],
+                )
         flat = [m for sub in results for m in sub]
-        return _dedup(flat)
+        deduped = _dedup(flat)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "After dedup: %d matches: %s",
+                len(deduped),
+                [(m.text, m.entity_type) for m in deduped],
+            )
+        return deduped
 
     async def aclose(self) -> None:
         """Release per-detector resources (httpx connection pools, etc).

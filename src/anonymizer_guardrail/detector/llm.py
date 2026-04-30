@@ -132,15 +132,25 @@ def _parse_entities(raw: str, source_text: str) -> list[Match]:
         return []
 
     out: list[Match] = []
+    dropped: list[tuple[str, str]] = []
     for entry in data.get("entities", []):
         if not isinstance(entry, dict):
             continue
         text = str(entry.get("text", "")).strip()
+        etype = str(entry.get("type", "OTHER"))
         # Hallucination guard: if the model invents a substring that isn't
         # actually in the input, drop it. We can't anonymize what isn't there.
         if not text or text not in source_text:
+            dropped.append((text, etype))
             continue
-        out.append(Match(text=text, entity_type=str(entry.get("type", "OTHER"))))
+        out.append(Match(text=text, entity_type=etype))
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            "LLM parsed %d entities, dropped %d hallucinations: kept=%s dropped=%s",
+            len(out), len(dropped),
+            [(m.text, m.entity_type) for m in out],
+            dropped,
+        )
     return out
 
 
