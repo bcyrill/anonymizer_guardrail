@@ -59,6 +59,33 @@ async def test_new_default_patterns_match(sample: str, expected_type: str) -> No
     )
 
 
+@pytest.mark.parametrize(
+    "sample,expected_match",
+    [
+        # Leading + must be captured — the original `\b\+?…` pattern dropped
+        # it because `\b` doesn't anchor on `+` (both space and `+` are
+        # non-word). The (?<![\w+]) lookbehind fixes that.
+        ("Reach me at +1-415-555-0100 today",   "+1-415-555-0100"),
+        ("Number +44 20 7946 0958 here",         "+44 20 7946 0958"),
+        # No-+ form still works.
+        ("Plain phone 555-1234-5678 here",       "555-1234-5678"),
+        # International with separators.
+        ("Call +49 30 12345678 anytime",          "+49 30 12345678"),
+    ],
+)
+async def test_phone_regex_captures_leading_plus(
+    sample: str, expected_match: str
+) -> None:
+    """Regression test for the leading-+ bug — the previous \\b-anchored
+    pattern matched the digits but dropped the leading +. The fix uses a
+    negative lookbehind so the match can start AT a + when one is present."""
+    detector = regex_mod.RegexDetector()
+    matches = await detector.detect(sample)
+    phone = next((m for m in matches if m.entity_type == "PHONE"), None)
+    assert phone is not None, f"no PHONE match in {sample!r}"
+    assert phone.text == expected_match
+
+
 async def test_pentest_yaml_relabels_brazilian_docs_as_national_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
