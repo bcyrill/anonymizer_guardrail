@@ -1,10 +1,31 @@
 name: Publish container image
 
+# Triggers:
+#   - push to main          → slim image, tagged :latest + :sha-XXX
+#   - push of vX.Y.Z        → slim image, tagged :vX.Y.Z (+ semver siblings)
+#   - push of vX.Y.Z+pf     → pf image, tagged :vX.Y.Z-pf
+#   - push of vX.Y.Z+pf-baked → pf-baked image, tagged :vX.Y.Z-pf-baked
+#   - workflow_dispatch     → operator picks the flavour from a dropdown
+#
+# Each tag publishes ONE flavour. To publish all three for a given
+# version, push three tags pointing at the same commit
+# (`scripts/release.sh` walks operators through this).
+
 on:
   push:
     branches: [main]
-    tags: ['v*.*.*']
+    tags: ['v*.*.*']  # also matches v*.*.*+pf and v*.*.*+pf-baked
   workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Image flavour to build'
+        required: true
+        default: 'slim'
+        type: choice
+        options:
+          - slim
+          - pf
+          - pf-baked
 
 env:
   REGISTRY: ghcr.io
@@ -21,6 +42,62 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Decide which flavour to build based on the trigger:
+      #   - workflow_dispatch  → operator's `flavor` input
+      #   - tag with +pf-baked → pf-baked
+      #   - tag with +pf       → pf
+      #   - any other tag / branch push → slim
+      # Also emits the matching --build-args and the image-tag suffix
+      # so subsequent steps don't need to repeat the case statement.
+      - name: Decide flavor + build-args + image-tag suffix
+        id: flavor
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FLAVOR='${{ inputs.flavor }}'
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            case '${{ github.ref_name }}' in
+              *+pf-baked) FLAVOR=pf-baked ;;
+              *+pf)       FLAVOR=pf ;;
+              *+*)
+                echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf or +pf-baked."
+                exit 1
+                ;;
+              *)          FLAVOR=slim ;;
+            esac
+          else
+            FLAVOR=slim
+          fi
+          echo "name=$FLAVOR" >> "$GITHUB_OUTPUT"
+
+          case "$FLAVOR" in
+            slim)
+              echo "suffix=" >> "$GITHUB_OUTPUT"
+              {
+                echo "build_args<<EOF"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            pf)
+              echo "suffix=-pf" >> "$GITHUB_OUTPUT"
+              {
+                echo "build_args<<EOF"
+                echo "WITH_PRIVACY_FILTER=true"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            pf-baked)
+              echo "suffix=-pf-baked" >> "$GITHUB_OUTPUT"
+              {
+                echo "build_args<<EOF"
+                echo "WITH_PRIVACY_FILTER=true"
+                echo "BAKE_PRIVACY_FILTER_MODEL=true"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          echo "Building flavour: $FLAVOR"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -34,11 +111,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The flavour suffix is applied to every generated tag, including
+      # `latest`, via docker/metadata-action's `flavor: suffix=…,onlatest=true`.
+      # That gives us :v1.0.0-pf, :latest-pf, :sha-…-pf etc. for the pf
+      # flavour, while slim (suffix="") keeps the original :v1.0.0, :latest, …
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=${{ steps.flavor.outputs.suffix }},onlatest=true
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -49,17 +132,24 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.flavor=${{ steps.flavor.outputs.name }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
-          platforms: linux/amd64,linux/arm64
+          # Skip arm64 for the heavy flavours — torch wheels and the
+          # model weights make a multi-arch build painfully slow on
+          # GitHub-hosted runners. Slim is cheap and stays multi-arch.
+          platforms: ${{ steps.flavor.outputs.name == 'slim' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: true
+          build-args: ${{ steps.flavor.outputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-flavour cache scope so a slim build doesn't invalidate
+          # the privacy-filter cache or vice-versa.
+          cache-from: type=gha,scope=${{ steps.flavor.outputs.name }}
+          cache-to: type=gha,mode=max,scope=${{ steps.flavor.outputs.name }}
           provenance: true
           sbom: true

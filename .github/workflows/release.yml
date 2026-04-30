@@ -1,8 +1,13 @@
 name: Release
 
+# Triggered ONLY by the canonical vX.Y.Z tag — flavour-variant tags
+# (vX.Y.Z+pf, vX.Y.Z+pf-baked) reuse the existing release rather than
+# create a new one per flavour.
 on:
   push:
-    tags: ['v*.*.*']
+    tags:
+      - 'v*.*.*'
+      - '!v*+*'   # exclude flavour variants — same release covers them all
 
 jobs:
   release:
@@ -20,11 +25,24 @@ jobs:
         with:
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Pre-release detection: a `-` in the tag (`-rc1`, `-alpha`) but
+          # NOT inside a `+`-suffixed flavour variant — those are filtered
+          # out at the trigger level above, but the guard makes the
+          # condition robust if anyone ever changes the trigger filter.
+          prerelease: ${{ !contains(github.ref_name, '+') && contains(github.ref_name, '-') }}
           body: |
-            Container image:
+            Container images for this release:
             ```
+            # Slim (always published)
             podman pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+
+            # Privacy-filter — published only if the matching tag
+            # ${{ github.ref_name }}+pf was pushed alongside this one
+            podman pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-pf
+
+            # Privacy-filter, model baked in — published only if the
+            # matching tag ${{ github.ref_name }}+pf-baked was pushed
+            podman pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-pf-baked
             ```
 
-            See the [Packages page](${{ github.server_url }}/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}) for all tags and digests.
+            See the [Packages page](${{ github.server_url }}/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}) for all available tags and digests.

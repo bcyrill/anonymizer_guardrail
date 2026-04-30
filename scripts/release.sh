@@ -4,6 +4,13 @@
 # Triggers the GitHub Actions workflows in .github/workflows/:
 #   - publish-image.yml  (builds & pushes the container to ghcr.io)
 #   - release.yml        (creates a GitHub Release on tag push)
+#
+# After the canonical vX.Y.Z tag, the script optionally also pushes
+# flavour-variant tags pointing at the same commit:
+#   vX.Y.Z+pf        → publishes the privacy-filter image
+#   vX.Y.Z+pf-baked  → publishes the privacy-filter image with model
+# Each one triggers publish-image.yml separately. release.yml only
+# creates a GitHub Release for the canonical tag (variants reuse it).
 
 set -euo pipefail
 
@@ -125,5 +132,41 @@ fi
 
 git tag -a "$new_tag" -m "$msg"
 git push "$remote" "$new_tag"
-ok "Tag ${new_tag} pushed. GitHub Actions will build the image and create the release."
+ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create the release."
+
+# ── Flavour variants ─────────────────────────────────────────────────────────
+# The publish-image.yml workflow inspects the tag suffix:
+#   vX.Y.Z+pf       → privacy-filter image (no model baked in)
+#   vX.Y.Z+pf-baked → privacy-filter image with model baked in
+# Pushing additional tags pointing at the same commit publishes those
+# flavours alongside the slim one. Each is opt-in because pf-baked in
+# particular is a multi-GB image that takes a while to build and store.
+say ""
+say "Also publish privacy-filter variants?"
+say ""
+say "  ${c_grn}1)${c_rst} no, slim only"
+say "  ${c_grn}2)${c_rst} +pf       — privacy-filter, model downloaded at runtime"
+say "  ${c_grn}3)${c_rst} +pf-baked — privacy-filter with model in image (~6.9 GB)"
+say "  ${c_grn}4)${c_rst} both +pf and +pf-baked"
+read -r -p "Choose [1-4, default 1]: " variant_choice || true
+case "${variant_choice:-1}" in
+  1) variants=() ;;
+  2) variants=("pf") ;;
+  3) variants=("pf-baked") ;;
+  4) variants=("pf" "pf-baked") ;;
+  *) err "Invalid choice."; exit 1 ;;
+esac
+
+for v in "${variants[@]:-}"; do
+  [[ -z "$v" ]] && continue
+  variant_tag="${new_tag}+${v}"
+  if git rev-parse "$variant_tag" >/dev/null 2>&1; then
+    warn "Tag ${variant_tag} already exists — skipping."
+    continue
+  fi
+  git tag -a "$variant_tag" -m "${msg} (${v})"
+  git push "$remote" "$variant_tag"
+  ok "Tag ${variant_tag} pushed."
+done
+
 say "${c_dim}Watch: https://github.com/$(git config --get remote."${remote}".url | sed -E 's#.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')/actions${c_rst}"
