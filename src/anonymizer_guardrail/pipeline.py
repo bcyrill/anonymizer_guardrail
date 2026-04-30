@@ -20,6 +20,7 @@ from typing import Callable, Iterable
 from .config import config
 from .detector.base import Detector, Match
 from .detector.llm import LLMDetector, LLMUnavailableError
+from .detector.privacy_filter import PrivacyFilterDetector
 from .detector.regex import RegexDetector
 from .surrogate import SurrogateGenerator
 from .vault import Vault
@@ -28,8 +29,12 @@ log = logging.getLogger("anonymizer.pipeline")
 
 
 _DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
-    "regex": RegexDetector,
-    "llm":   LLMDetector,
+    "regex":          RegexDetector,
+    "llm":            LLMDetector,
+    # Optional: requires the `privacy-filter` extras (torch + transformers).
+    # The class itself imports cheap stuff; instantiation lazy-loads the
+    # heavy deps. So unused, this entry costs nothing.
+    "privacy_filter": PrivacyFilterDetector,
 }
 
 

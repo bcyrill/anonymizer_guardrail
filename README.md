@@ -12,11 +12,11 @@ sides of the round-trip.
 
 ## Detection layers
 
-Two layers, both optional, controlled by `DETECTOR_MODE` — a comma-separated
-list of detector names. Examples: `regex`, `llm`, `regex,llm` (both, in
-that order). Order determines type-resolution priority: when the same
-text is detected by multiple detectors, the type from the one listed
-first wins.
+Three layers, all optional, controlled by `DETECTOR_MODE` — a comma-
+separated list of detector names. Available names: `regex`, `llm`,
+`privacy_filter`. Order determines type-resolution priority: when the
+same text is detected by multiple detectors, the type from the one
+listed first wins. Example: `DETECTOR_MODE=regex,privacy_filter,llm`.
 
 - **regex** — high-precision patterns for things with recognizable shapes:
   IPs, CIDRs, emails, hashes, JWTs, AWS keys, GitHub tokens, OpenAI-style
@@ -27,6 +27,17 @@ first wins.
   JSON-mode prompt that asks the model to enumerate sensitive entities.
   Catches contextual stuff regex cannot: org names, personal names,
   internal product/project codenames embedded in prose.
+
+- **privacy_filter** — local NER backed by
+  [openai/privacy-filter](https://huggingface.co/openai/privacy-filter)
+  (Apache 2.0). Encoder-only token classifier, ~1.5 B params (50 M active
+  via MoE), runs in-process — no external service, no API key. Detects
+  8 PII categories: people, emails, phones, URLs, addresses, dates,
+  account numbers, secrets. Coverage is a strict subset of what the LLM
+  prompt picks up (no orgs, hostnames, IP/MAC, etc.) so it's a
+  *complement* to — not a replacement for — the LLM detector. Optional
+  dependency: `pip install "anonymizer-guardrail[privacy-filter]"` or
+  build the container with `--build-arg WITH_PRIVACY_FILTER=true`.
 
 When multiple detectors are configured (`DETECTOR_MODE=regex,llm`), they
 run in parallel and the matches are merged and deduped.
@@ -287,14 +298,74 @@ path crashes the boot rather than silently dropping rules. Order matters
 
 ## Run it
 
+Three image flavours, controlled by two build-args, sharing one
+`Containerfile`:
+
+| flavour | size | model | when to pick it |
+|---|---|---|---|
+| slim | ~150 MB | n/a | DETECTOR_MODE never includes `privacy_filter` |
+| privacy-filter (runtime download) | ~700 MB | downloads on first container start | most deployments — pair with a named volume |
+| privacy-filter (model baked in) | ~3.5 GB | shipped inside image | air-gapped or strict cold-start latency |
+
 ```bash
+# 1) Slim — no ML deps.
 podman build -t anonymizer-guardrail:latest -f Containerfile .
+
+# 2) Privacy-filter, runtime download — small image, downloads ~3 GB on
+#    first container start. Mount a NAMED VOLUME so subsequent starts
+#    skip the download (see below).
+podman build -t anonymizer-guardrail:privacy-filter \
+    --build-arg WITH_PRIVACY_FILTER=true -f Containerfile .
+
+# 3) Privacy-filter, model baked into image — self-contained, no runtime
+#    network, but ~3.5 GB image and ~3 GB extra in your registry.
+podman build -t anonymizer-guardrail:privacy-filter-baked \
+    --build-arg WITH_PRIVACY_FILTER=true \
+    --build-arg BAKE_PRIVACY_FILTER_MODEL=true \
+    -f Containerfile .
+```
+
+Slim or baked images run without any volume:
+
+```bash
 podman run --rm -p 8000:8000 \
   -e LLM_API_BASE=http://litellm:4000/v1 \
   -e LLM_API_KEY=sk-litellm-master \
   -e LLM_MODEL=anonymize \
   --name anonymizer anonymizer-guardrail:latest
 ```
+
+The runtime-download image **needs** a persistent volume at
+`/app/.cache/huggingface` — without one, every `podman run` re-downloads
+the ~3 GB. Use a named volume:
+
+```bash
+podman volume create anonymizer-hf-cache
+
+podman run --rm -p 8000:8000 \
+  -e DETECTOR_MODE=regex,privacy_filter,llm \
+  -e LLM_API_BASE=http://litellm:4000/v1 \
+  -e LLM_API_KEY=sk-litellm-master \
+  -v anonymizer-hf-cache:/app/.cache/huggingface \
+  --name anonymizer anonymizer-guardrail:privacy-filter
+```
+
+First `podman run` of the privacy-filter image takes a few minutes (the
+model downloads into the volume, blocking app startup). The container's
+healthcheck has a 300-second start-period to accommodate this — slower
+networks may need a longer override via `--health-start-period`.
+Subsequent runs reuse the volume and start in seconds.
+
+Volume options compared:
+
+- **Named volume** (`-v anonymizer-hf-cache:/app/.cache/huggingface`):
+  recommended. Auto-managed by Podman/Docker; survives `podman rm`.
+- **Bind mount** (`-v /host/path:/app/.cache/huggingface`): same effect
+  but stores the cache wherever you point it on the host. Useful if you
+  want the files visible outside Podman's volume store.
+- **Kubernetes**: mount a `PersistentVolumeClaim` at the same path —
+  first pod pays the download; later pods reuse the PVC. Use
+  `ReadWriteMany` for shared cache across replicas.
 
 Smoke test:
 

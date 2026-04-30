@@ -25,6 +25,14 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
 ]
+# Pulls in the dependencies needed to run the local privacy-filter NER
+# detector (openai/privacy-filter on HuggingFace). Heavy: torch alone is
+# ~700 MB on disk plus the model weights (~3 GB at fp32). Only install
+# when DETECTOR_MODE will include `privacy_filter`.
+privacy-filter = [
+    "torch>=2.0",
+    "transformers>=4.40",
+]
 
 [project.scripts]
 anonymizer-guardrail = "anonymizer_guardrail.main:app"

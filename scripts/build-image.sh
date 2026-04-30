@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Build the anonymizer-guardrail container image.
+#
+# The Containerfile takes two orthogonal build-args (WITH_PRIVACY_FILTER
+# and BAKE_PRIVACY_FILTER_MODEL); this script wraps the three sensible
+# combinations as named flavours so you don't have to remember which
+# flag goes where.
+#
+# Usage: scripts/build-image.sh [-t TYPE] [-T TAG] [--] [extra build args]
+
+set -euo pipefail
+
+# cd to repo root regardless of where the script was invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.."
+
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'; c_rst=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s%s%s\n' "$c_ylw" "$*" "$c_rst"; }
+err()  { printf '%s%s%s\n' "$c_red" "$*" "$c_rst" >&2; }
+ok()   { printf '%s%s%s\n' "$c_grn" "$*" "$c_rst"; }
+
+# ── Container engine detection ───────────────────────────────────────────────
+# Prefer podman (rootless by default) but fall back to docker. Operators
+# with both can force one via ENGINE=docker scripts/build-image.sh.
+ENGINE="${ENGINE:-}"
+if [[ -z "$ENGINE" ]]; then
+  if command -v podman >/dev/null 2>&1; then
+    ENGINE=podman
+  elif command -v docker >/dev/null 2>&1; then
+    ENGINE=docker
+  else
+    err "Neither podman nor docker found in PATH. Install one or set ENGINE=…"
+    exit 1
+  fi
+fi
+
+# ── Default image tags per flavour ───────────────────────────────────────────
+TAG_SLIM="${TAG_SLIM:-anonymizer-guardrail:latest}"
+TAG_PF="${TAG_PF:-anonymizer-guardrail:privacy-filter}"
+TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [-t TYPE] [-T TAG] [-h] [-- EXTRA_BUILD_ARGS...]
+
+Build the anonymizer-guardrail container image. Without -t, prompts
+interactively.
+
+  -t, --type TYPE     One of:
+                        slim       no privacy-filter detector (~150 MB)
+                        pf         privacy-filter, runtime download (~700 MB)
+                                   — needs a persistent volume to avoid
+                                   re-downloading the ~3 GB model every run
+                        pf-baked   privacy-filter + model baked in (~3.5 GB)
+                                   — self-contained; works air-gapped
+  -T, --tag TAG       Override the default image tag for this build.
+  -h, --help          Show this help.
+
+Anything after \`--\` is passed straight through to the build engine,
+e.g. \`-- --no-cache --pull\`.
+
+Environment overrides:
+  ENGINE         podman | docker (auto-detected; current: ${ENGINE})
+  TAG_SLIM       Default tag for slim (current: ${TAG_SLIM})
+  TAG_PF         Default tag for pf (current: ${TAG_PF})
+  TAG_PF_BAKED   Default tag for pf-baked (current: ${TAG_PF_BAKED})
+EOF
+}
+
+TYPE=""
+TAG_OVERRIDE=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--type) TYPE="${2:-}"; shift 2 ;;
+    -T|--tag)  TAG_OVERRIDE="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; EXTRA_ARGS=("$@"); break ;;
+    *) err "Unknown argument: $1"; usage; exit 1 ;;
+  esac
+done
+
+# ── Interactive menu when no -t given ────────────────────────────────────────
+if [[ -z "$TYPE" ]]; then
+  say ""
+  say "Which image flavour do you want to build?"
+  say ""
+  say "  ${c_grn}1)${c_rst} slim       no privacy-filter detector ${c_dim}(~150 MB)${c_rst}"
+  say "  ${c_grn}2)${c_rst} pf         privacy-filter, runtime download ${c_dim}(~700 MB)${c_rst}"
+  say "  ${c_grn}3)${c_rst} pf-baked   privacy-filter + model baked in ${c_dim}(~3.5 GB)${c_rst}"
+  say ""
+  read -r -p "Choose [1-3, default 1]: " choice || true
+  case "${choice:-1}" in
+    1) TYPE="slim" ;;
+    2) TYPE="pf" ;;
+    3) TYPE="pf-baked" ;;
+    *) err "Invalid choice."; exit 1 ;;
+  esac
+fi
+
+# ── Resolve flavour to build-args + default tag ──────────────────────────────
+case "$TYPE" in
+  slim)
+    BUILD_ARGS=()
+    DEFAULT_TAG="$TAG_SLIM"
+    ;;
+  pf|privacy-filter)
+    BUILD_ARGS=(--build-arg WITH_PRIVACY_FILTER=true)
+    DEFAULT_TAG="$TAG_PF"
+    TYPE="pf"
+    ;;
+  pf-baked|privacy-filter-baked)
+    BUILD_ARGS=(
+      --build-arg WITH_PRIVACY_FILTER=true
+      --build-arg BAKE_PRIVACY_FILTER_MODEL=true
+    )
+    DEFAULT_TAG="$TAG_PF_BAKED"
+    TYPE="pf-baked"
+    ;;
+  *)
+    err "Unknown type '${TYPE}'. Valid: slim, pf, pf-baked."
+    exit 1
+    ;;
+esac
+
+TAG="${TAG_OVERRIDE:-$DEFAULT_TAG}"
+
+say ""
+say "Engine:    ${c_grn}${ENGINE}${c_rst}"
+say "Flavour:   ${c_grn}${TYPE}${c_rst}"
+say "Tag:       ${c_grn}${TAG}${c_rst}"
+if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+  say "Build args: ${c_dim}${BUILD_ARGS[*]}${c_rst}"
+fi
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  say "Passthrough: ${c_dim}${EXTRA_ARGS[*]}${c_rst}"
+fi
+say ""
+
+if [[ "$TYPE" == "pf-baked" ]]; then
+  warn "This build downloads the openai/privacy-filter model (~3 GB) at"
+  warn "build time. Network access is required and the build will take"
+  warn "several minutes the first time (subsequent builds use the layer cache)."
+  say ""
+fi
+
+read -r -p "Proceed? [Y/n] " reply || true
+reply="${reply:-y}"
+if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+  warn "Aborted."
+  exit 0
+fi
+
+say ""
+say "${c_dim}Running: ${ENGINE} build -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f Containerfile .${c_rst}"
+"$ENGINE" build -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f Containerfile .
+
+say ""
+ok "Built ${TAG}."
+
+# ── Post-build run hint, tailored to the flavour ─────────────────────────────
+say ""
+say "${c_dim}Next — try it locally:${c_rst}"
+case "$TYPE" in
+  slim)
+    say "  ${ENGINE} run --rm -p 8000:8000 \\"
+    say "      -e DETECTOR_MODE=regex,llm \\"
+    say "      -e LLM_API_BASE=http://litellm:4000/v1 \\"
+    say "      -e LLM_API_KEY=sk-litellm-master \\"
+    say "      ${TAG}"
+    ;;
+  pf)
+    say "  # Create a named volume so the model download survives recreates."
+    say "  ${ENGINE} volume create anonymizer-hf-cache"
+    say "  ${ENGINE} run --rm -p 8000:8000 \\"
+    say "      -e DETECTOR_MODE=regex,privacy_filter,llm \\"
+    say "      -v anonymizer-hf-cache:/app/.cache/huggingface \\"
+    say "      ${TAG}"
+    ;;
+  pf-baked)
+    say "  ${ENGINE} run --rm -p 8000:8000 \\"
+    say "      -e DETECTOR_MODE=regex,privacy_filter,llm \\"
+    say "      ${TAG}"
+    ;;
+esac
+say ""
+say "  ${c_dim}# Then in another terminal:${c_rst}"
+say "  curl -s http://localhost:8000/health | python -m json.tool"
