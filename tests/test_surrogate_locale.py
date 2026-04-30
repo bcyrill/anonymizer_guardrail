@@ -291,6 +291,50 @@ def test_resolve_salt_empty_returns_random_bytes() -> None:
 
 
 @pytest.mark.parametrize(
+    "locale,expected_pattern",
+    [
+        # Babel "medium" date format per locale.
+        ("de_CH", r"^\d{2}\.\d{2}\.\d{4}$"),       # 15.02.1985
+        ("de_DE", r"^\d{2}\.\d{2}\.\d{4}$"),
+        ("ja_JP", r"^\d{4}/\d{2}/\d{2}$"),         # 1985/02/15
+        ("en_US", r"^[A-Za-z]{3} \d{1,2}, \d{4}$"),  # Feb 15, 1985
+    ],
+)
+def test_dob_uses_locale_specific_format(
+    monkeypatch: pytest.MonkeyPatch, locale: str, expected_pattern: str
+) -> None:
+    """Babel renders the date_of_birth surrogate per the configured
+    locale's medium-form convention. Without this we'd ship ISO 8601
+    for every locale, which looks out of place when the rest of the
+    surrogate (name, address, phone) is locale-shaped."""
+    import re
+
+    monkeypatch.setattr(surrogate_mod, "config", _fake_config(faker_locale=locale))
+    gen = surrogate_mod.SurrogateGenerator()
+    out = gen.for_match(Match(text="1985-04-15", entity_type="DATE_OF_BIRTH"))
+    assert re.match(expected_pattern, out), (
+        f"locale={locale}: expected {expected_pattern}, got {out!r}"
+    )
+
+
+def test_dob_falls_back_to_iso_when_babel_doesnt_know_locale() -> None:
+    """If Babel doesn't recognise the locale, `_format_dob` must catch
+    UnknownLocaleError and emit ISO instead of crashing. Faker validates
+    its own locale list at construction (so a totally bogus string is
+    rejected up-front), but a Faker-accepted locale that Babel doesn't
+    know IS reachable in principle. Test the fallback in isolation by
+    pointing the helper at a stub `Faker` whose .locales reports a
+    Babel-unknown string."""
+    from datetime import date
+
+    class _FakerStub:
+        locales = ["zz_ZZ"]  # not in CLDR
+
+    out = surrogate_mod._format_dob(_FakerStub(), date(1985, 2, 15))
+    assert out == "1985-02-15"
+
+
+@pytest.mark.parametrize(
     "entity_type,sample_input",
     [
         ("ADDRESS",       "123 Main St, Springfield, IL 62701"),

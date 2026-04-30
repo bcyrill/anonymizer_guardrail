@@ -17,6 +17,9 @@ dependencies = [
     "httpx>=0.27",
     "faker>=25.0",
     "pyyaml>=6.0",
+    # Locale-aware date formatting (CLDR-backed). Used by the surrogate
+    # generator to render DATE_OF_BIRTH per the configured FAKER_LOCALE.
+    "babel>=2.12",
 ]
 
 [project.optional-dependencies]

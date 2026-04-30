@@ -37,12 +37,35 @@ import hashlib
 import secrets
 import threading
 from collections import OrderedDict
+from datetime import date
 from typing import Callable
 
+from babel.core import UnknownLocaleError
+from babel.dates import format_date
 from faker import Faker
 
 from .config import config
 from .detector.base import Match
+
+
+def _format_dob(faker: Faker, dob: date) -> str:
+    """Render a date_of_birth in the locale's medium-form date convention.
+
+    Faker returns a `datetime.date`; using `.isoformat()` would always
+    give ISO 8601 (`1985-04-15`) regardless of locale, which looks out
+    of place when the rest of the surrogate (name, address, phone) is
+    locale-shaped. Babel's CLDR data knows that de_CH wants `15.02.1985`,
+    en_US wants `Feb 15, 1985`, ja_JP wants `1985/02/15`, etc.
+
+    Falls back to ISO if Babel doesn't recognise the configured locale —
+    we'd rather emit a reasonable date than crash the surrogate path.
+    """
+    locales = getattr(faker, "locales", None) or ["en_US"]
+    primary = locales[0]
+    try:
+        return format_date(dob, format="medium", locale=primary)
+    except UnknownLocaleError:
+        return dob.isoformat()
 
 # blake2b accepts a key up to 64 bytes — anything longer is rejected at
 # hash construction. We truncate to be safe.
@@ -141,7 +164,7 @@ _GENERATOR_SPEC: dict[str, _FakerGen | None] = {
     # ISO-format date string keeps the substitution unambiguous; Faker's
     # date_of_birth() returns a datetime.date object that we'd otherwise
     # have to coerce.
-    "DATE_OF_BIRTH":  lambda f, _o: f.date_of_birth().isoformat(),
+    "DATE_OF_BIRTH":  lambda f, _o: _format_dob(f, f.date_of_birth()),
     "IBAN":           lambda f, _o: f.iban(),
     # Locale-aware: en_US → SSN, pt_BR → CPF, etc. Operators set
     # FAKER_LOCALE to match their data.
