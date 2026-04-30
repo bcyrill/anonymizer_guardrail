@@ -176,6 +176,105 @@ async def test_llm_in_flight_increments_around_detect(
     assert p.stats()["llm_in_flight"] == 0
 
 
+def test_detector_mode_parses_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`regex,llm` produces a regex detector followed by an llm detector
+    — order preserved (it determines _dedup type priority)."""
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    from anonymizer_guardrail.detector.llm import LLMDetector
+    from anonymizer_guardrail.detector.regex import RegexDetector
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["detector_mode"] = "regex,llm"
+    from types import SimpleNamespace
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    detectors = pipeline_mod._build_detectors()
+    assert [type(d).__name__ for d in detectors] == ["RegexDetector", "LLMDetector"]
+
+
+def test_detector_mode_order_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operators picking `llm,regex` get LLM type-priority on duplicates."""
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    from types import SimpleNamespace
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["detector_mode"] = "llm,regex"
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    detectors = pipeline_mod._build_detectors()
+    assert [type(d).__name__ for d in detectors] == ["LLMDetector", "RegexDetector"]
+
+
+def test_detector_mode_tolerates_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    from types import SimpleNamespace
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["detector_mode"] = "  regex ,  llm  "
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    detectors = pipeline_mod._build_detectors()
+    assert len(detectors) == 2
+
+
+def test_detector_mode_dedupes_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`regex,regex` collapses to a single detector and logs a warning."""
+    import logging
+
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    from types import SimpleNamespace
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["detector_mode"] = "regex,regex"
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    with caplog.at_level(logging.WARNING, logger="anonymizer.pipeline"):
+        detectors = pipeline_mod._build_detectors()
+    assert len(detectors) == 1
+    assert any("duplicate" in r.message.lower() for r in caplog.records)
+
+
+def test_detector_mode_both_emits_migration_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Legacy `both` is no longer accepted; the warning must point operators
+    at the new syntax so a migration is obvious from the logs."""
+    import logging
+
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    from types import SimpleNamespace
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["detector_mode"] = "both"
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    with caplog.at_level(logging.ERROR, logger="anonymizer.pipeline"):
+        detectors = pipeline_mod._build_detectors()
+    # No detectors built from `both` → falls back to regex.
+    assert len(detectors) == 1
+    assert type(detectors[0]).__name__ == "RegexDetector"
+    assert any(
+        "regex,llm" in r.message and "both" in r.message for r in caplog.records
+    )
+
+
+def test_detector_mode_unknown_falls_back_to_regex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Garbage in DETECTOR_MODE: warn, fall back to regex so the service boots."""
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    from types import SimpleNamespace
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["detector_mode"] = "magic-detector"
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    detectors = pipeline_mod._build_detectors()
+    assert [type(d).__name__ for d in detectors] == ["RegexDetector"]
+
+
 async def test_unexpected_llm_failure_swallowed_under_fail_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

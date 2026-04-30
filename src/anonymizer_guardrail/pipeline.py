@@ -27,16 +27,57 @@ from .vault import Vault
 log = logging.getLogger("anonymizer.pipeline")
 
 
+_DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
+    "regex": RegexDetector,
+    "llm":   LLMDetector,
+}
+
+
 def _build_detectors() -> list[Detector]:
-    mode = config.detector_mode
-    if mode == "regex":
-        return [RegexDetector()]
-    if mode == "llm":
-        return [LLMDetector()]
-    if mode == "both":
-        return [RegexDetector(), LLMDetector()]
-    log.warning("Unknown DETECTOR_MODE=%r, defaulting to 'regex'", mode)
-    return [RegexDetector()]
+    """Parse DETECTOR_MODE as a comma-separated list of detector names.
+
+    Order is preserved — it determines the order detectors run in (parallel
+    via asyncio.gather, but `_dedup` keeps first-seen entity_type, so a
+    duplicate match will adopt the type from the detector listed earlier).
+    Whitespace around names is tolerated; duplicates are collapsed with
+    a warning.
+
+    The historical `both` value is no longer accepted — use `regex,llm`.
+    Unknown names log a warning and are skipped; if nothing valid remains,
+    we fall back to regex-only so the service still boots.
+    """
+    raw = config.detector_mode or ""
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+
+    detectors: list[Detector] = []
+    seen: set[str] = set()
+    for name in names:
+        if name == "both":
+            log.error(
+                "DETECTOR_MODE=both has been removed. Use 'regex,llm' for the "
+                "same behaviour, or pick a single detector ('regex' or 'llm')."
+            )
+            continue
+        if name in seen:
+            log.warning("DETECTOR_MODE: duplicate detector %r — collapsed", name)
+            continue
+        factory = _DETECTOR_FACTORIES.get(name)
+        if factory is None:
+            log.warning(
+                "DETECTOR_MODE: unknown detector %r (valid names: %s)",
+                name, ", ".join(sorted(_DETECTOR_FACTORIES)),
+            )
+            continue
+        seen.add(name)
+        detectors.append(factory())
+
+    if not detectors:
+        log.warning(
+            "DETECTOR_MODE=%r produced no valid detectors — falling back to regex.",
+            raw,
+        )
+        detectors = [RegexDetector()]
+    return detectors
 
 
 def _dedup(matches: Iterable[Match]) -> list[Match]:

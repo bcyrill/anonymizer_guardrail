@@ -46,7 +46,7 @@ RUN chown -R app:app /app
 ENV HOST=0.0.0.0 \
     PORT=8000 \
     LOG_LEVEL=info \
-    DETECTOR_MODE=both \
+    DETECTOR_MODE=regex,llm \
     LLM_API_BASE=http://litellm:4000/v1 \
     LLM_MODEL=anonymize \
     LLM_TIMEOUT_S=30 \

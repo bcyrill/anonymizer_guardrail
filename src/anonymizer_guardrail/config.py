@@ -31,10 +31,14 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ── Detector pipeline ──────────────────────────────────────────────────────
-    # "regex"  → regex layer only (deterministic, no external deps)
-    # "llm"    → LLM layer only
-    # "both"   → regex first, then LLM on the same input (matches deduped)
-    detector_mode: str = os.getenv("DETECTOR_MODE", "both").lower()
+    # Comma-separated list of detector names. Order matters: `_dedup` keeps
+    # the first-seen entity_type for any duplicate text, so the detector
+    # listed first wins type-resolution conflicts. Examples:
+    #   "regex"      → regex layer only (deterministic, no external deps)
+    #   "llm"        → LLM layer only
+    #   "regex,llm"  → both detectors run in parallel; regex types win
+    # Whitespace tolerated; duplicates collapsed; unknown names warn-and-skip.
+    detector_mode: str = os.getenv("DETECTOR_MODE", "regex,llm").lower()
 
     # ── LLM detector ───────────────────────────────────────────────────────────
     # OpenAI-compatible endpoint. When pointed at LiteLLM, ensure the model used

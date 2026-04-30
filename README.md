@@ -12,7 +12,11 @@ sides of the round-trip.
 
 ## Detection layers
 
-Two layers, both optional, controlled by `DETECTOR_MODE` (`regex` | `llm` | `both`):
+Two layers, both optional, controlled by `DETECTOR_MODE` — a comma-separated
+list of detector names. Examples: `regex`, `llm`, `regex,llm` (both, in
+that order). Order determines type-resolution priority: when the same
+text is detected by multiple detectors, the type from the one listed
+first wins.
 
 - **regex** — high-precision patterns for things with recognizable shapes:
   IPs, CIDRs, emails, hashes, JWTs, AWS keys, GitHub tokens, OpenAI-style
@@ -24,7 +28,8 @@ Two layers, both optional, controlled by `DETECTOR_MODE` (`regex` | `llm` | `bot
   Catches contextual stuff regex cannot: org names, personal names,
   internal product/project codenames embedded in prose.
 
-In `both` mode the regex matches and LLM matches are merged and deduped.
+When multiple detectors are configured (`DETECTOR_MODE=regex,llm`), they
+run in parallel and the matches are merged and deduped.
 
 ## Surrogates
 
@@ -90,7 +95,7 @@ All knobs are environment variables; sensible defaults baked into
 | `HOST`            | `0.0.0.0`                     |                                          |
 | `PORT`            | `8000`                        |                                          |
 | `LOG_LEVEL`       | `INFO`                        |                                          |
-| `DETECTOR_MODE`   | `both`                        | `regex` / `llm` / `both`                 |
+| `DETECTOR_MODE`   | `regex,llm`                   | comma-separated list of detector names  |
 | `LLM_API_BASE`    | `http://litellm:4000/v1`      | OpenAI-compatible endpoint               |
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
