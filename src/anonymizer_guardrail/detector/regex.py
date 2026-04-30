@@ -273,6 +273,13 @@ def _load_patterns() -> list[tuple[str, re.Pattern[str]]]:
 
 _COMPILED_PATTERNS = _load_patterns()
 
+_VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
+if config.regex_overlap_strategy not in _VALID_OVERLAP_STRATEGIES:
+    raise RuntimeError(
+        f"Invalid REGEX_OVERLAP_STRATEGY={config.regex_overlap_strategy!r}. "
+        f"Allowed: {', '.join(sorted(_VALID_OVERLAP_STRATEGIES))}."
+    )
+
 
 class RegexDetector:
     """Compiled-regex detector. Stateless and synchronous; async only by interface."""
@@ -286,15 +293,18 @@ class RegexDetector:
         if not text:
             return []
 
-        # Capture-group convention: when a pattern declares one or more groups,
-        # the first non-None group's span IS the entity (the surrounding match
-        # is just label/anchor context). Patterns without groups → full match.
-        # This lets two patterns hit the same line as long as their *value*
-        # spans don't overlap (e.g. one captures password, another username
-        # from the same `user / pass` line).
-        claimed: list[tuple[int, int]] = []
-        results: list[Match] = []
-
+        # Pass 1: walk every pattern and collect every non-empty candidate.
+        # Both strategies pay the same regex cost — Python's re engine
+        # has to scan the text for each pattern regardless of strategy
+        # (there's no API to mask out already-claimed regions). The
+        # strategy only changes the iteration order in pass 2.
+        #
+        # Capture-group convention: when a pattern declares one or more
+        # groups, the first non-None group's span IS the entity (the
+        # surrounding match is just label/anchor context). Patterns
+        # without groups → full match. This lets two patterns hit the
+        # same line as long as their *value* spans don't overlap.
+        candidates: list[tuple[int, int, str, str]] = []  # (start, end, value, type)
         for entity_type, pattern in self._compiled:
             for m in pattern.finditer(text):
                 # Capture-group priority:
@@ -315,13 +325,30 @@ class RegexDetector:
                     else:
                         start, end = m.start(idx), m.end(idx)
                         value = m.group(idx)
-                if any(s < end and start < e for s, e in claimed):
+                stripped = value.strip() if value else ""
+                if not stripped:
                     continue
-                if not value or not value.strip():
-                    continue
-                claimed.append((start, end))
-                results.append(Match(text=value.strip(), entity_type=entity_type))
+                candidates.append((start, end, stripped, entity_type))
 
+        # Pass 2: greedy span allocation. Iteration order is the strategy.
+        #   - "longest"  sort by descending span length, ties broken by
+        #                earliest start, then by YAML order (Python's
+        #                stable sort preserves insertion order for equal
+        #                keys). A longer match wins over a shorter one
+        #                that overlaps it.
+        #   - "priority" keep insertion order (YAML order, then in-pattern
+        #                position). The first pattern that matches a span
+        #                wins — same as the pre-v0.2 behaviour.
+        if config.regex_overlap_strategy == "longest":
+            candidates.sort(key=lambda c: (-(c[1] - c[0]), c[0]))
+
+        claimed: list[tuple[int, int]] = []
+        results: list[Match] = []
+        for start, end, value, entity_type in candidates:
+            if any(s < end and start < e for s, e in claimed):
+                continue
+            claimed.append((start, end))
+            results.append(Match(text=value, entity_type=entity_type))
         return results
 
 

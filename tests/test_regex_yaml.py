@@ -15,7 +15,12 @@ from anonymizer_guardrail.detector import regex as regex_mod
 
 
 def _fake_config(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(regex_patterns_path="")
+    base: dict[str, Any] = dict(
+        regex_patterns_path="",
+        # Default detect()'s overlap strategy. Tests that exercise the
+        # opposite strategy override per-test.
+        regex_overlap_strategy="longest",
+    )
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -353,3 +358,81 @@ def test_bundled_prefix_rejects_path_separators(
     )
     with pytest.raises(RuntimeError, match="bare filename"):
         regex_mod._load_patterns()
+
+# ── Overlap-strategy tests ─────────────────────────────────────────────────
+# The motivating case: regex_pentest.yaml's `\b\d{12}\b` (AWS Account ID)
+# matches the trailing 12-digit group of a UUID. With "priority" the
+# pentest pattern claims first and shadows the UUID. With "longest" the
+# UUID's 36-char span wins.
+
+@pytest.mark.asyncio
+async def test_overlap_strategy_longest_picks_uuid_over_aws_account_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        regex_mod,
+        "config",
+        _fake_config(
+            regex_patterns_path="bundled:regex_pentest.yaml",
+            regex_overlap_strategy="longest",
+        ),
+    )
+    monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
+
+    detector = regex_mod.RegexDetector()
+    matches = await detector.detect("test 550e8400-e29b-41d4-a716-446655440000.")
+    by_text = {m.text: m.entity_type for m in matches}
+    # The full UUID's 36-char span wins under longest, and inherits
+    # the UUID label from the default YAML (the pentest YAML no longer
+    # redeclares the UUID pattern — see the comment in regex_pentest.yaml).
+    assert by_text.get("550e8400-e29b-41d4-a716-446655440000") == "UUID"
+    # The trailing-12-digit \d{12} pattern's match must NOT have been
+    # adopted: its span is contained in the UUID's, and longest-wins
+    # consumed it. This is the bug fix.
+    assert "446655440000" not in by_text
+
+
+@pytest.mark.asyncio
+async def test_overlap_strategy_priority_keeps_legacy_first_match_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        regex_mod,
+        "config",
+        _fake_config(
+            regex_patterns_path="bundled:regex_pentest.yaml",
+            regex_overlap_strategy="priority",
+        ),
+    )
+    monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
+
+    detector = regex_mod.RegexDetector()
+    matches = await detector.detect("test 550e8400-e29b-41d4-a716-446655440000.")
+    by_text = {m.text: m.entity_type for m in matches}
+    # Pre-v0.2 behaviour: the pentest YAML's own \d{12} pattern claims
+    # the inner span first, the inherited UUID pattern is then skipped
+    # because its match overlaps the claim.
+    assert "446655440000" in by_text
+    assert by_text["446655440000"] == "IDENTIFIER"
+    assert "550e8400-e29b-41d4-a716-446655440000" not in by_text
+
+
+@pytest.mark.asyncio
+async def test_overlap_strategy_longest_does_not_drop_unrelated_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 12-digit AWS account ID NOT inside a UUID must still be caught."""
+    monkeypatch.setattr(
+        regex_mod,
+        "config",
+        _fake_config(
+            regex_patterns_path="bundled:regex_pentest.yaml",
+            regex_overlap_strategy="longest",
+        ),
+    )
+    monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
+
+    detector = regex_mod.RegexDetector()
+    matches = await detector.detect("Account 123456789012 was suspended.")
+    by_text = {m.text: m.entity_type for m in matches}
+    assert by_text.get("123456789012") == "IDENTIFIER"

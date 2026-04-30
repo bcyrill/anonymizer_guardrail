@@ -63,6 +63,18 @@ class Config:
     # alternatives also ship with the package (e.g. patterns/regex_pentest.yaml)
     # — point this at any of them or at your own file.
     regex_patterns_path: str = os.getenv("REGEX_PATTERNS_PATH", "")
+    # How the regex detector resolves overlapping matches between patterns:
+    #   - "longest"  pick the longest match span (default). Robust against
+    #                a child YAML's narrow pattern shadowing a parent's
+    #                wider pattern — e.g. the pentest set's
+    #                `\b\d{12}\b` (AWS Account ID) matching the trailing
+    #                group of a UUID and squeezing out the UUID pattern.
+    #   - "priority" first pattern in YAML order wins. Useful when an
+    #                operator deliberately orders patterns most-specific-
+    #                first and wants that ordering to be load-bearing.
+    # Validated at startup; a typo crashes loudly rather than silently
+    # falling through to a default.
+    regex_overlap_strategy: str = os.getenv("REGEX_OVERLAP_STRATEGY", "longest").lower()
     # Faker locale(s) used by the surrogate generator. Empty → Faker's own
     # default (en_US). Single locale ("pt_BR") or comma-separated list
     # ("pt_BR,en_US") with the first one preferred and others used as

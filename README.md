@@ -112,6 +112,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
 | `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
+| `REGEX_OVERLAP_STRATEGY` | `longest`              | `longest` (longest match wins on overlapping spans) or `priority` (first pattern in YAML order wins). See *Regex overlap resolution* below. |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
 | `SURROGATE_CACHE_MAX_SIZE` | `100000`             | LRU cap on the surrogate cache (cross-request consistency) |
@@ -323,8 +324,29 @@ first non-None group's span is treated as the entity (lets a labeled
 pattern like `password:\s+(\S+)` anonymize only the value, not the label).
 Patterns without groups still anonymize the full match. All patterns
 compile at startup; any bad regex, unknown flag, or unreadable extends
-path crashes the boot rather than silently dropping rules. Order matters
-— first match wins on overlapping spans.
+path crashes the boot rather than silently dropping rules.
+
+### Regex overlap resolution
+
+When two patterns from the loaded YAML match overlapping spans, the
+`REGEX_OVERLAP_STRATEGY` env var picks the winner:
+
+- **`longest`** *(default)* — the longer span wins. Ties broken by
+  earliest start, then by YAML order. Recommended whenever you load
+  the pentest set or any other large pattern bundle, where a narrow
+  pattern in one file can accidentally match a substring of a wider
+  pattern in another. Concretely, the pentest YAML's `\b\d{12}\b` AWS
+  Account ID pattern would otherwise eat the trailing 12-digit group
+  of any UUID whose last segment is all-digits, leaving the regex
+  layer with only the inner span instead of the whole UUID.
+- **`priority`** — first pattern in YAML order wins (the pre-v0.2
+  behaviour). Useful when patterns are deliberately ordered
+  most-specific-first and that ordering is load-bearing.
+
+Both strategies pay the same regex cost: every pattern still scans the
+text via `finditer` (Python's `re` engine has no API to skip
+already-claimed regions). The strategy only changes how candidate
+matches are resolved at adoption time.
 
 ## Run it
 
