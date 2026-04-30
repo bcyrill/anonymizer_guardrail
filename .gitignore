@@ -37,3 +37,6 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Coding Agent
+.junie/
