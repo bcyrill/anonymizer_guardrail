@@ -71,6 +71,13 @@ class Config:
     # real data, or when realism would mislead a downstream tool. Faker is
     # not even instantiated when disabled.
     use_faker: bool = _env_bool("USE_FAKER", True)
+    # Cap on the surrogate generator's process-wide LRU cache. Each entry is
+    # ~150–300 bytes (entity type + original text + surrogate + bookkeeping),
+    # so 100k entries ≈ 30 MB worst case. The cache backs cross-request
+    # surrogate consistency for multi-turn conversations — set higher if
+    # you have very chatty users; lower (or zero, effectively disabling)
+    # if memory is tight and per-request consistency is enough.
+    surrogate_cache_max_size: int = _env_int("SURROGATE_CACHE_MAX_SIZE", 100_000)
     # Hard cap on input size sent to the LLM in one call. Inputs above this
     # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
     # silently truncated — truncating in a guardrail would let everything past

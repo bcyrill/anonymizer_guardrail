@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from collections import OrderedDict
 from typing import Callable
 
 from faker import Faker
@@ -113,9 +114,20 @@ class SurrogateGenerator:
     """Process-wide cache of original → surrogate mappings."""
 
     def __init__(self) -> None:
-        self._cache: dict[tuple[str, str], str] = {}
+        # OrderedDict so we can implement LRU eviction in O(1):
+        #   - on hit: move_to_end(key) marks it most-recently-used
+        #   - on overflow: popitem(last=False) drops least-recently-used
+        # Cap is configurable via SURROGATE_CACHE_MAX_SIZE.
+        self._cache: OrderedDict[tuple[str, str], str] = OrderedDict()
+        # Sane minimum: a request can produce hundreds of unique entities,
+        # so we don't want zero-or-tiny caps to silently cripple within-
+        # request consistency. The pipeline still de-dups within a single
+        # request via its own dict, so this is purely about cross-request
+        # consistency — but we keep the floor as a guard against typos.
+        self._max_cache_size = max(1, int(config.surrogate_cache_max_size))
         # Surrogate values already issued, for collision detection.
-        # Kept in sync with _cache.values() under the same lock.
+        # Kept in sync with _cache.values() under the same lock — eviction
+        # removes from BOTH so a surrogate "freed" by LRU can be re-issued.
         self._used_surrogates: set[str] = set()
         # The lock guards the cache, the used-surrogates set, AND the
         # shared Faker instance: `seed_instance + gen()` is a critical
@@ -148,6 +160,9 @@ class SurrogateGenerator:
         with self._lock:
             cached = self._cache.get(key)
             if cached is not None:
+                # Mark this entry as most-recently-used so a busy entity
+                # survives eviction churn from one-shot lookups.
+                self._cache.move_to_end(key)
                 return cached
 
             seed = _seed_for(match.text, match.entity_type)
@@ -186,6 +201,15 @@ class SurrogateGenerator:
 
             self._cache[key] = surrogate
             self._used_surrogates.add(surrogate)
+            # LRU eviction: if we're over capacity, drop the oldest entry
+            # and free its surrogate value for future re-use. Note this
+            # weakens the cross-request consistency invariant for evicted
+            # entries — same input may hash to a different surrogate after
+            # eviction. Within-request consistency is unaffected because
+            # the pipeline de-dups via its own per-request mapping.
+            while len(self._cache) > self._max_cache_size:
+                _, evicted_surrogate = self._cache.popitem(last=False)
+                self._used_surrogates.discard(evicted_surrogate)
             return surrogate
 
 

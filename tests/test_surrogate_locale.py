@@ -16,7 +16,11 @@ from anonymizer_guardrail.detector.base import Match
 
 
 def _fake_config(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(faker_locale="", use_faker=True)
+    base: dict[str, Any] = dict(
+        faker_locale="",
+        use_faker=True,
+        surrogate_cache_max_size=10_000,
+    )
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -145,3 +149,70 @@ def test_collision_with_original_still_avoided(
     gen = surrogate_mod.SurrogateGenerator()
     out = gen.for_match(Match(text="anything", entity_type="OTHER"))
     assert out != "anything"
+
+
+def test_lru_evicts_least_recently_used_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With cache cap N, the (N+1)-th unique entity must evict the oldest;
+    a touched entry must be promoted out of eviction range."""
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, surrogate_cache_max_size=3),
+    )
+    gen = surrogate_mod.SurrogateGenerator()
+
+    a = gen.for_match(Match(text="alice", entity_type="PERSON"))
+    b = gen.for_match(Match(text="bob",   entity_type="PERSON"))
+    c = gen.for_match(Match(text="carol", entity_type="PERSON"))
+    assert len(gen._cache) == 3
+
+    # Touching "alice" promotes it; the next eviction should drop "bob",
+    # not "alice".
+    a_again = gen.for_match(Match(text="alice", entity_type="PERSON"))
+    assert a == a_again
+
+    gen.for_match(Match(text="dan", entity_type="PERSON"))
+    keys = set(gen._cache.keys())
+    assert ("PERSON", "alice") in keys
+    assert ("PERSON", "carol") in keys
+    assert ("PERSON", "dan") in keys
+    assert ("PERSON", "bob") not in keys, "least-recently-used should have been evicted"
+
+
+def test_evicted_surrogate_is_freed_for_collision_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When an LRU entry is evicted, its surrogate must leave the
+    used-set too — otherwise collision detection would treat freed
+    values as still-taken and force needless salt-retries."""
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, surrogate_cache_max_size=2),
+    )
+    gen = surrogate_mod.SurrogateGenerator()
+
+    s_a = gen.for_match(Match(text="alice", entity_type="PERSON"))
+    gen.for_match(Match(text="bob", entity_type="PERSON"))
+    # Force eviction of "alice" by adding a third entry.
+    gen.for_match(Match(text="carol", entity_type="PERSON"))
+
+    assert ("PERSON", "alice") not in gen._cache
+    # The surrogate that "alice" used to hold is now free for re-issue.
+    assert s_a not in gen._used_surrogates
+
+
+def test_zero_or_negative_cap_floored_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator typo (cap=0) must not fully disable caching — we floor
+    to 1 to keep within-request behaviour predictable."""
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, surrogate_cache_max_size=0),
+    )
+    gen = surrogate_mod.SurrogateGenerator()
+    assert gen._max_cache_size == 1

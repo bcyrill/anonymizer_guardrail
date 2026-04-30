@@ -98,6 +98,7 @@ All knobs are environment variables; sensible defaults baked into
 | `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
+| `SURROGATE_CACHE_MAX_SIZE` | `100000`             | LRU cap on the surrogate cache (cross-request consistency) |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
