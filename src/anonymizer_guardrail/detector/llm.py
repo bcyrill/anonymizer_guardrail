@@ -67,28 +67,43 @@ def _load_system_prompt() -> str:
         the site-packages path.
 
     Loaded once at import-time — restart to pick up edits, same as every
-    other config knob.
+    other config knob. An empty/whitespace-only file is rejected: a
+    no-instructions LLM would happily return `{"entities": []}` for every
+    input, which is a silent regex-only fallback masquerading as success.
     """
     override = config.llm_system_prompt_path.strip()
     if override:
         if override.startswith(_BUNDLED_PREFIX):
-            return _read_bundled_prompt(override[len(_BUNDLED_PREFIX):].strip())
-        path = Path(override)
-        try:
-            return path.read_text(encoding="utf-8")
-        except OSError as exc:
-            # Fail loud rather than silently fall back: an operator who set
-            # this path expects their prompt to be used. Crashing at import
-            # surfaces the typo immediately instead of after the first call.
-            raise RuntimeError(
-                f"LLM_SYSTEM_PROMPT_PATH={override!r} could not be read: {exc}"
-            ) from exc
-    # Anchor at the parent package so `prompts/` doesn't need __init__.py.
-    return (
-        resources.files("anonymizer_guardrail")
-        .joinpath(_DEFAULT_PROMPT_RELPATH)
-        .read_text(encoding="utf-8")
-    )
+            text = _read_bundled_prompt(override[len(_BUNDLED_PREFIX):].strip())
+            source = f"LLM_SYSTEM_PROMPT_PATH={override!r}"
+        else:
+            path = Path(override)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                # Fail loud rather than silently fall back: an operator who set
+                # this path expects their prompt to be used. Crashing at import
+                # surfaces the typo immediately instead of after the first call.
+                raise RuntimeError(
+                    f"LLM_SYSTEM_PROMPT_PATH={override!r} could not be read: {exc}"
+                ) from exc
+            source = f"LLM_SYSTEM_PROMPT_PATH={override!r}"
+    else:
+        # Anchor at the parent package so `prompts/` doesn't need __init__.py.
+        text = (
+            resources.files("anonymizer_guardrail")
+            .joinpath(_DEFAULT_PROMPT_RELPATH)
+            .read_text(encoding="utf-8")
+        )
+        source = f"bundled {_DEFAULT_PROMPT_RELPATH}"
+
+    if not text.strip():
+        raise RuntimeError(
+            f"{source} is empty — refusing to load. An empty prompt makes the "
+            f"LLM detector useless: the model would have no instructions and "
+            f"would consistently return zero entities."
+        )
+    return text
 
 
 _SYSTEM_PROMPT = _load_system_prompt()
@@ -193,6 +208,16 @@ class LLMDetector:
             raise LLMUnavailableError(f"Cannot reach LLM at {url}: {exc}") from exc
         except httpx.TimeoutException as exc:
             raise LLMUnavailableError(f"LLM timed out at {url}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            # Catches ReadError, WriteError, RemoteProtocolError, NetworkError,
+            # ProxyError, etc. — any HTTP-layer failure that isn't a clean
+            # connect/timeout. Routing through LLMUnavailableError ensures
+            # FAIL_CLOSED applies; bare exceptions used to be swallowed by
+            # the pipeline's defensive handler, which would silently ship
+            # unredacted text upstream.
+            raise LLMUnavailableError(
+                f"HTTP error talking to LLM at {url}: {exc}"
+            ) from exc
 
         if resp.status_code != 200:
             raise LLMUnavailableError(

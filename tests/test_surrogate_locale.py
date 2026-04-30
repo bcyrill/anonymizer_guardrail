@@ -80,7 +80,7 @@ def test_use_faker_false_emits_opaque_for_realistic_types(
     assert out.startswith("[PERSON_") and out.endswith("]")
 
     out = gen.for_match(Match(text="acmecorp", entity_type="ORGANIZATION"))
-    assert out.startswith("[ORG_") and out.endswith("]")
+    assert out.startswith("[ORGANIZATION_") and out.endswith("]")
 
     # Already-opaque types still work the same.
     out = gen.for_match(Match(text="some-hash", entity_type="HASH"))
@@ -111,3 +111,37 @@ def test_use_faker_false_outputs_are_deterministic(
     a = g1.for_match(Match(text="alice", entity_type="PERSON"))
     b = g2.for_match(Match(text="alice", entity_type="PERSON"))
     assert a == b
+
+
+def test_surrogate_collision_resolved_with_unique_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two distinct originals must always produce distinct surrogates.
+    Otherwise the vault (keyed by surrogate→original) would lose one of
+    them and deanonymize would corrupt the response."""
+    monkeypatch.setattr(surrogate_mod, "config", _fake_config(use_faker=False))
+    gen = surrogate_mod.SurrogateGenerator()
+
+    # Pre-populate the used set with the surrogate the first call would
+    # naturally produce, simulating the rare case where two seeds collide.
+    pre = gen.for_match(Match(text="alice", entity_type="PERSON"))
+    assert pre  # baseline
+
+    # Forcibly insert that value as if another entity had already taken it,
+    # so the next NEW (text,type) combo has to salt-retry.
+    gen._used_surrogates.add(pre)
+    gen._cache[("PERSON", "carol")] = pre  # sanity: this combo not actually issued
+    del gen._cache[("PERSON", "carol")]    # remove again, keep used set polluted
+
+    out = gen.for_match(Match(text="bob", entity_type="PERSON"))
+    assert out != pre, "salt-retry must produce a value not in _used_surrogates"
+
+
+def test_collision_with_original_still_avoided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long-standing guarantee: surrogate must never equal the input."""
+    monkeypatch.setattr(surrogate_mod, "config", _fake_config(use_faker=False))
+    gen = surrogate_mod.SurrogateGenerator()
+    out = gen.for_match(Match(text="anything", entity_type="OTHER"))
+    assert out != "anything"

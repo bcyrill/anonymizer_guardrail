@@ -3,7 +3,7 @@ Surrogate generator.
 
 Each detected entity is replaced with a *realistic* substitute of the same
 type, so the upstream LLM's reasoning quality survives anonymization
-("acmecorp.local" → "quasarware.local", not "[ORG_7F3A2B]").
+("acmecorp.local" → "quasarware.local", not "[ORGANIZATION_7F3A2B]").
 
 Determinism: the same `(original, entity_type)` pair always maps to the same
 surrogate within a process. This matters for multi-turn conversations and for
@@ -51,14 +51,23 @@ def _opaque(prefix: str) -> Callable[[Faker, str], str]:
     return gen
 
 
-# Generators run against a Faker instance that has already been seeded with the
-# entity's stable seed, so calling e.g. fake.company() is deterministic.
-_REALISTIC_GENERATORS: dict[str, Callable[[Faker, str], str]] = {
+# Single source of truth for both Faker-mode and opaque-mode generators.
+# A value of None means this type is always opaque (e.g. credentials,
+# hashes, paths — where a realistic substitute would mislead). The opaque
+# prefix is just the entity type name, so adding a new type only requires
+# editing this one table.
+_FakerGen = Callable[[Faker, str], str]
+_GENERATOR_SPEC: dict[str, _FakerGen | None] = {
     "PERSON":         lambda f, _o: f.name(),
     "ORGANIZATION":   lambda f, _o: f.company(),
     "EMAIL_ADDRESS":  lambda f, _o: f.email(),
-    "IP_ADDRESS":     lambda f, _o: f.ipv4_public(),
-    "CIDR":           lambda f, _o: f"{f.ipv4_public()}/24",
+    "IPV4_ADDRESS":   lambda f, _o: f.ipv4_public(),
+    "IPV6_ADDRESS":   lambda f, _o: f.ipv6(),
+    "IPV4_CIDR":      lambda f, _o: f"{f.ipv4_public()}/24",
+    # /64 is the standard end-site allocation in IPv6 land — picking one
+    # consistent length keeps surrogates readable and matches what most
+    # real-world configs ship with.
+    "IPV6_CIDR":      lambda f, _o: f"{f.ipv6()}/64",
     "HOSTNAME":       lambda f, _o: f.hostname(),
     "DOMAIN":         lambda f, _o: f.domain_name(),
     "USERNAME":       lambda f, _o: f.user_name(),
@@ -66,45 +75,38 @@ _REALISTIC_GENERATORS: dict[str, Callable[[Faker, str], str]] = {
     "UUID":           lambda f, _o: f.uuid4(),
     "MAC_ADDRESS":    lambda f, _o: f.mac_address(),
     "URL":            lambda f, _o: f.url(),
-    "CREDENTIAL":     _opaque("CRED"),
-    "TOKEN":          _opaque("TOKEN"),
-    "HASH":           _opaque("HASH"),
-    "JWT":            _opaque("JWT"),
-    "AWS_ACCESS_KEY": _opaque("AWS"),
-    # PATH and IDENTIFIER are too varied for a "realistic" surrogate
-    # (S3 buckets, ARNs, /opt paths, ADB serials all share the type)
-    # so we use opaque placeholders rather than risk misleading the LLM.
-    "PATH":           _opaque("PATH"),
-    "IDENTIFIER":     _opaque("ID"),
-    "OTHER":          _opaque("REDACTED"),
+    # Always-opaque types: realism would mislead. Token/path varieties are
+    # too broad for a single Faker provider to substitute meaningfully.
+    "CREDENTIAL":     None,
+    "TOKEN":          None,
+    "HASH":           None,
+    "JWT":            None,
+    "AWS_ACCESS_KEY": None,
+    "PATH":           None,
+    "IDENTIFIER":     None,
+    "OTHER":          None,
 }
 
-# All-opaque mode (USE_FAKER=false). Each type still gets a distinct prefix so
-# the upstream model can tell categories apart, but no realistic substitutes
-# are emitted — useful when realism would mislead a downstream tool, or when
-# you want a hard guarantee that the model never sees Faker-generated names.
-_OPAQUE_GENERATORS: dict[str, Callable[[Faker, str], str]] = {
-    "PERSON":         _opaque("PERSON"),
-    "ORGANIZATION":   _opaque("ORG"),
-    "EMAIL_ADDRESS":  _opaque("EMAIL"),
-    "IP_ADDRESS":     _opaque("IP"),
-    "CIDR":           _opaque("CIDR"),
-    "HOSTNAME":       _opaque("HOST"),
-    "DOMAIN":         _opaque("DOMAIN"),
-    "USERNAME":       _opaque("USER"),
-    "PHONE":          _opaque("PHONE"),
-    "UUID":           _opaque("UUID"),
-    "MAC_ADDRESS":    _opaque("MAC"),
-    "URL":            _opaque("URL"),
-    "CREDENTIAL":     _opaque("CRED"),
-    "TOKEN":          _opaque("TOKEN"),
-    "HASH":           _opaque("HASH"),
-    "JWT":            _opaque("JWT"),
-    "AWS_ACCESS_KEY": _opaque("AWS"),
-    "PATH":           _opaque("PATH"),
-    "IDENTIFIER":     _opaque("ID"),
-    "OTHER":          _opaque("REDACTED"),
-}
+
+def _build_generators(use_faker: bool) -> dict[str, _FakerGen]:
+    """Materialize either the Faker-backed table (USE_FAKER=true) or the
+    all-opaque one (USE_FAKER=false) from the single _GENERATOR_SPEC."""
+    out: dict[str, _FakerGen] = {}
+    for etype, faker_fn in _GENERATOR_SPEC.items():
+        if use_faker and faker_fn is not None:
+            out[etype] = faker_fn
+        else:
+            out[etype] = _opaque(etype)
+    return out
+
+
+# Cap on how many salted retries we attempt to find a non-colliding
+# surrogate. Three retries is plenty: collisions are rare to begin with,
+# and the salted-seed/salted-text path is independent of the original.
+_MAX_COLLISION_RETRIES = 4
+# Golden-ratio-derived constant. Used to perturb the seed across retries
+# so each attempt explores a different Faker output.
+_SALT_MULTIPLIER = 0x9E3779B97F4A7C15
 
 
 class SurrogateGenerator:
@@ -112,17 +114,20 @@ class SurrogateGenerator:
 
     def __init__(self) -> None:
         self._cache: dict[tuple[str, str], str] = {}
-        # The lock guards both the cache and the shared Faker instance:
-        # `seed_instance + gen()` is a critical section that must not be
-        # interleaved by another caller (or one match's seed would bleed
-        # into another's output). Sub-millisecond hold time, so contention
-        # under realistic concurrency is invisible.
+        # Surrogate values already issued, for collision detection.
+        # Kept in sync with _cache.values() under the same lock.
+        self._used_surrogates: set[str] = set()
+        # The lock guards the cache, the used-surrogates set, AND the
+        # shared Faker instance: `seed_instance + gen()` is a critical
+        # section that must not be interleaved by another caller (or one
+        # match's seed would bleed into another's output). Sub-millisecond
+        # hold time, so contention under realistic concurrency is invisible.
         self._lock = threading.Lock()
         self._use_faker = bool(config.use_faker)
         self._locales = _parse_locales(config.faker_locale)
+        self._generators = _build_generators(self._use_faker)
         self._fake: Faker | None = None
         if self._use_faker:
-            self._generators = _REALISTIC_GENERATORS
             # Instantiate once and reuse — Faker construction is ~1–2 ms;
             # `seed_instance` on an existing instance is ~0.15 ms. With a
             # cache that dedupes by (text, type), this only matters when a
@@ -136,9 +141,6 @@ class SurrogateGenerator:
                     f"FAKER_LOCALE={config.faker_locale!r} is not a valid Faker "
                     f"locale: {exc}. See https://faker.readthedocs.io/ for the list."
                 ) from exc
-        else:
-            # USE_FAKER=false → no Faker instance is ever created.
-            self._generators = _OPAQUE_GENERATORS
 
     def for_match(self, match: Match) -> str:
         """Return a stable surrogate for this match."""
@@ -150,19 +152,40 @@ class SurrogateGenerator:
 
             seed = _seed_for(match.text, match.entity_type)
             gen = self._generators.get(match.entity_type, self._generators["OTHER"])
-            if self._fake is not None:
-                self._fake.seed_instance(seed)
-                surrogate = gen(self._fake, match.text)
-            else:
-                # Opaque generators ignore the Faker arg.
-                surrogate = gen(None, match.text)  # type: ignore[arg-type]
 
-            # If by astronomical luck the surrogate equals the original, salt
-            # and retry with a different opaque prefix derived from the type.
-            if surrogate == match.text:
-                surrogate = _opaque(match.entity_type)(None, match.text)  # type: ignore[arg-type]
+            # Try the natural surrogate first. Salt-retry on collision —
+            # either with the original itself, or with a surrogate already
+            # issued for some other entity in this process. Without this,
+            # two distinct originals could share a surrogate, and the vault
+            # (keyed by surrogate→original) would lose one of them.
+            #
+            # Salting strategy: change BOTH the seed (for Faker-backed gens)
+            # AND the input text (for opaque gens). Faker types respond to
+            # the reseed; opaque types respond to the text-salt. Doing both
+            # is harmless overlap and lets us share one retry loop.
+            surrogate: str | None = None
+            for attempt in range(_MAX_COLLISION_RETRIES):
+                attempt_seed = seed if attempt == 0 else seed ^ (attempt * _SALT_MULTIPLIER)
+                attempt_text = match.text if attempt == 0 else f"{match.text}#{attempt}"
+                if self._fake is not None:
+                    self._fake.seed_instance(attempt_seed)
+                    candidate = gen(self._fake, attempt_text)
+                else:
+                    candidate = gen(None, attempt_text)  # type: ignore[arg-type]
+                if candidate != match.text and candidate not in self._used_surrogates:
+                    surrogate = candidate
+                    break
+
+            if surrogate is None:
+                # All retries collided — extraordinarily unlikely, but bound
+                # the worst case with a guaranteed-unique opaque token. The
+                # 64-bit seed is derived from (entity_type, text), so two
+                # distinct entities would need a blake2b collision to land
+                # here on the same value (~2⁻⁶⁴).
+                surrogate = f"[{match.entity_type}_{seed:016x}]"
 
             self._cache[key] = surrogate
+            self._used_surrogates.add(surrogate)
             return surrogate
 
 

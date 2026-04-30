@@ -29,7 +29,7 @@ In `both` mode the regex matches and LLM matches are merged and deduped.
 ## Surrogates
 
 Each detected entity is replaced with a *realistic* substitute of the same
-type — `acmecorp.local` → `quasarware.local`, not `[ORG_7F3A2B]` —
+type — `acmecorp.local` → `quasarware.local`, not `[ORGANIZATION_7F3A2B]` —
 generated with [Faker](https://faker.readthedocs.io/) seeded by a hash of
 the original. Determinism means the same input always maps to the same
 surrogate within a process, so the upstream model sees consistent
@@ -177,7 +177,7 @@ assume you mean it.
 
 Set `USE_FAKER=false` to replace every realistic surrogate with an opaque
 deterministic token (`alice` → `[PERSON_AE708E5D]`, `acmecorp` →
-`[ORG_77116DCC]`). The token's prefix still encodes the entity type so the
+`[ORGANIZATION_77116DCC]`). The token's prefix still encodes the entity type so the
 upstream model can tell categories apart, but no Faker output ever reaches
 it. Useful when:
 

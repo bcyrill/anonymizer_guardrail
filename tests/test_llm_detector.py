@@ -78,7 +78,7 @@ async def test_single_call_for_input_within_cap(
 ) -> None:
     """Normal input → one HTTP call carrying the full text, full results returned."""
     mock_post.return_value = _ok_response(
-        [{"text": "alice", "type": "PERSON"}, {"text": "10.0.0.1", "type": "IP_ADDRESS"}]
+        [{"text": "alice", "type": "PERSON"}, {"text": "10.0.0.1", "type": "IPV4_ADDRESS"}]
     )
 
     result = await detector.detect("hello alice at 10.0.0.1")
@@ -158,6 +158,34 @@ async def test_non_200_response_becomes_llm_unavailable(
         await detector.detect("hello")
 
 
+async def test_read_error_routes_through_llm_unavailable(
+    detector: LLMDetector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guardrail-bypass we're guarding against: any httpx error must
+    become LLMUnavailableError so FAIL_CLOSED fires. Bare exceptions used
+    to leak past the pipeline's defensive handler and silently ship
+    unredacted text upstream."""
+    async def boom(*args, **kwargs):
+        raise httpx.ReadError("connection reset by peer")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", boom)
+
+    with pytest.raises(LLMUnavailableError, match="HTTP error"):
+        await detector.detect("hello")
+
+
+async def test_remote_protocol_error_routes_through_llm_unavailable(
+    detector: LLMDetector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(*args, **kwargs):
+        raise httpx.RemoteProtocolError("invalid HTTP framing")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", boom)
+
+    with pytest.raises(LLMUnavailableError, match="HTTP error"):
+        await detector.detect("hello")
+
+
 def test_default_system_prompt_loads_from_bundled_file() -> None:
     """The bundled prompt must be readable at import-time — if hatchling
     stops packaging the prompts/ directory, this fails loudly."""
@@ -191,6 +219,20 @@ def test_override_path_missing_file_raises_at_load(
         llm_mod, "config", _fake_config(llm_system_prompt_path="/no/such/file.md")
     )
     with pytest.raises(RuntimeError, match="could not be read"):
+        llm_mod._load_system_prompt()
+
+
+def test_empty_prompt_file_rejected(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 0-byte/whitespace-only prompt would make the LLM return [] every
+    time — that's silent regex-only mode. Reject at load."""
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n\n  \t\n", encoding="utf-8")
+    monkeypatch.setattr(
+        llm_mod, "config", _fake_config(llm_system_prompt_path=str(empty))
+    )
+    with pytest.raises(RuntimeError, match="empty"):
         llm_mod._load_system_prompt()
 
 

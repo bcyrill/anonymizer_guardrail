@@ -12,6 +12,6 @@ Flag, at minimum:
 Do NOT flag generic technical vocabulary (function names, well-known protocols, public software product names, OS versions, generic role titles like "admin" or "CEO" with no name attached).
 
 Return ONLY valid JSON, no prose, no markdown:
-{"entities": [{"text": "<exact substring from input>", "type": "PERSON|ORGANIZATION|EMAIL_ADDRESS|IP_ADDRESS|CIDR|HOSTNAME|DOMAIN|USERNAME|CREDENTIAL|TOKEN|HASH|UUID|AWS_ACCESS_KEY|JWT|PHONE|OTHER"}]}
+{"entities": [{"text": "<exact substring from input>", "type": "PERSON|ORGANIZATION|EMAIL_ADDRESS|IPV4_ADDRESS|IPV6_ADDRESS|IPV4_CIDR|IPV6_CIDR|HOSTNAME|DOMAIN|USERNAME|CREDENTIAL|TOKEN|HASH|UUID|AWS_ACCESS_KEY|JWT|PHONE|OTHER"}]}
 
 Nothing found: {"entities": []}

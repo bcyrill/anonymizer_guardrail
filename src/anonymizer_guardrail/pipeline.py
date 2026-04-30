@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .config import config
 from .detector.base import Detector, Match
@@ -48,22 +48,26 @@ def _dedup(matches: Iterable[Match]) -> list[Match]:
     return list(seen.values())
 
 
-def _replace_all(text: str, mapping: dict[str, str]) -> str:
-    """Replace every key in `mapping` with its value in a single pass.
+def _build_replacer(mapping: dict[str, str]) -> Callable[[str], str]:
+    """Compile the alternation pattern ONCE and return a closure that
+    applies it to a text. Callers process N texts with one compile, instead
+    of recompiling per text.
 
-    Uses a regular expression to find all keys simultaneously, avoiding
-    transitive replacements (where a surrogate generated for Entity A
-    matches the original text of Entity B and gets replaced again).
+    The pattern alternates over all keys, longest-first so a shorter key
+    that's a prefix of a longer one doesn't shadow it. A single regex pass
+    avoids transitive replacements (where a surrogate generated for Entity
+    A matches the original of Entity B and gets replaced again).
     """
     if not mapping:
-        return text
-
-    # Sort keys by length descending to ensure that if one key is a prefix
-    # of another, the longer one matches first in the regex.
+        return lambda text: text
     pattern = re.compile(
         "|".join(re.escape(k) for k in sorted(mapping.keys(), key=len, reverse=True))
     )
-    return pattern.sub(lambda m: mapping[m.group(0)], text)
+
+    def apply(text: str) -> str:
+        return pattern.sub(lambda m: mapping[m.group(0)], text)
+
+    return apply
 
 
 class Pipeline:
@@ -87,30 +91,41 @@ class Pipeline:
     async def _detect_one(
         self, text: str, *, api_key: str | None = None
     ) -> list[Match]:
-        """Run all configured detectors against one text and dedup.
+        """Run all configured detectors against one text in parallel and dedup.
+
+        Regex is CPU-bound and fast; the LLM call dominates total latency.
+        Running them concurrently means the per-text floor is `max(regex,
+        llm)` instead of `regex + llm`. Cheap regardless — and if a second
+        slow detector ever gets added, the win compounds.
 
         The LLM concurrency semaphore is acquired ONLY around LLM detector
-        calls — regex is CPU-only and instant, so throttling it would just
-        serialize work that wasn't a problem. Process-wide cap protects the
-        upstream LLM service from thundering-herd.
+        calls — throttling regex would just serialize work that wasn't a
+        problem. Process-wide cap protects the upstream LLM service from
+        thundering-herd.
+
+        Per-detector exceptions are handled inside the inner runner so one
+        detector crashing doesn't poison the gather. LLMUnavailableError
+        still propagates under FAIL_CLOSED, in which case asyncio cancels
+        the other in-flight detectors — the right behaviour because we're
+        about to BLOCK the request anyway.
         """
-        results: list[list[Match]] = []
-        for det in self._detectors:
+
+        async def _run(det: Detector) -> list[Match]:
             try:
                 if isinstance(det, LLMDetector):
                     async with self._llm_semaphore:
-                        matches = await det.detect(text, api_key=api_key)
-                else:
-                    matches = await det.detect(text, api_key=api_key)
-                results.append(matches)
+                        return await det.detect(text, api_key=api_key)
+                return await det.detect(text, api_key=api_key)
             except LLMUnavailableError as exc:
                 if config.fail_closed:
                     raise
                 log.warning("LLM detector unavailable, proceeding fail-open: %s", exc)
-                results.append([])
+                return []
             except Exception as exc:  # defensive: a buggy detector shouldn't kill us
                 log.exception("Detector %s crashed: %s", det.name, exc)
-                results.append([])
+                return []
+
+        results = await asyncio.gather(*[_run(d) for d in self._detectors])
         flat = [m for sub in results for m in sub]
         return _dedup(flat)
 
@@ -159,7 +174,8 @@ class Pipeline:
         # that's what deanonymize needs.
         reverse_mapping = {v: k for k, v in original_to_surrogate.items()}
 
-        modified = [_replace_all(t, original_to_surrogate) for t in texts]
+        replace = _build_replacer(original_to_surrogate)
+        modified = [replace(t) for t in texts]
 
         if reverse_mapping and call_id:
             self._vault.put(call_id, reverse_mapping)
@@ -184,7 +200,8 @@ class Pipeline:
         if not mapping:
             log.debug("deanonymize call_id=%s — nothing to restore", call_id)
             return texts
-        restored = [_replace_all(t, mapping) for t in texts]
+        replace = _build_replacer(mapping)
+        restored = [replace(t) for t in texts]
         log.info(
             "deanonymize call_id=%s entities=%d texts=%d",
             call_id, len(mapping), len(texts),
