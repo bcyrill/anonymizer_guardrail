@@ -50,14 +50,23 @@ CONTAINER_NAME_DEFAULT="anonymizer-guardrail"
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [-t TYPE] [-p PORT] [-n NAME] [-h] [-- EXTRA_RUN_ARGS...]
+Usage: $(basename "$0") [-t TYPE] [-p PORT] [-n NAME] [--faker|--no-faker]
+                       [--locale LOCALE] [-h] [-- EXTRA_RUN_ARGS...]
 
 Launch the anonymizer-guardrail container. Without -t, prompts interactively.
 
   -t, --type TYPE   slim | pf | pf-baked
   -p, --port PORT   Host port to publish (default: ${PORT})
   -n, --name NAME   Container name (default: ${CONTAINER_NAME_DEFAULT})
+  --faker           Use Faker for realistic surrogates (skips the prompt).
+  --no-faker        Set USE_FAKER=false (skips the prompt; surrogates
+                    are opaque [TYPE_…] tokens).
+  --locale LOCALE   Faker locale (e.g. pt_BR). Skips the locale prompt.
+                    Implies --faker.
   -h, --help        Show this help.
+
+Without --faker / --no-faker / --locale flags, the script prompts
+interactively to let you toggle Faker on/off and pick a locale.
 
 Anything after \`--\` is passed straight through to \`${ENGINE} run\`,
 e.g. additional -e env vars (-e LLM_API_KEY=...) or -v volume mounts.
@@ -79,14 +88,20 @@ EOF
 TYPE=""
 NAME="$CONTAINER_NAME_DEFAULT"
 EXTRA_ARGS=()
+# Faker config: empty string = "ask interactively". CLI flags override.
+USE_FAKER_CHOICE=""    # "true" | "false" | ""
+LOCALE_CHOICE=""       # locale string or ""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -t|--type) TYPE="${2:-}"; shift 2 ;;
-    -p|--port) PORT="${2:-}"; shift 2 ;;
-    -n|--name) NAME="${2:-}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    --)        shift; EXTRA_ARGS=("$@"); break ;;
+    -t|--type)    TYPE="${2:-}"; shift 2 ;;
+    -p|--port)    PORT="${2:-}"; shift 2 ;;
+    -n|--name)    NAME="${2:-}"; shift 2 ;;
+    --faker)      USE_FAKER_CHOICE="true";  shift ;;
+    --no-faker)   USE_FAKER_CHOICE="false"; shift ;;
+    --locale)     LOCALE_CHOICE="${2:-}";   USE_FAKER_CHOICE="true"; shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; EXTRA_ARGS=("$@"); break ;;
     *) err "Unknown argument: $1"; usage; exit 1 ;;
   esac
 done
@@ -178,6 +193,61 @@ if "$ENGINE" container inspect "$NAME" >/dev/null 2>&1; then
   "$ENGINE" rm -f "$NAME" >/dev/null
 fi
 
+# ── Faker config (interactive unless flags provided) ────────────────────────
+# USE_FAKER controls whether surrogates are realistic (Faker-generated
+# names/companies/etc.) or opaque tokens like [PERSON_HEX]. FAKER_LOCALE
+# picks the locale Faker uses for those substitutes — only meaningful
+# when Faker is enabled.
+if [[ -z "$USE_FAKER_CHOICE" ]]; then
+  say ""
+  read -r -p "Use Faker for realistic surrogates? [Y/n] " reply || true
+  reply="${reply:-y}"
+  if [[ "$reply" =~ ^[Yy]$ ]]; then
+    USE_FAKER_CHOICE="true"
+  else
+    USE_FAKER_CHOICE="false"
+  fi
+fi
+
+if [[ "$USE_FAKER_CHOICE" == "true" && -z "$LOCALE_CHOICE" ]]; then
+  say ""
+  say "Override the Faker locale? Picks a region for generated names,"
+  say "addresses, phone formats, etc. Empty = container default (en_US)."
+  say ""
+  say "  ${c_grn}1)${c_rst} skip — use the container default ${c_dim}(en_US)${c_rst}"
+  say "  ${c_grn}2)${c_rst} pt_BR ${c_dim}(Brazilian Portuguese)${c_rst}"
+  say "  ${c_grn}3)${c_rst} de_CH ${c_dim}(Switzerland)${c_rst}"
+  say "  ${c_grn}4)${c_rst} fr_FR ${c_dim}(French)${c_rst}"
+  say "  ${c_grn}5)${c_rst} es_ES ${c_dim}(Spanish)${c_rst}"
+  say "  ${c_grn}6)${c_rst} ja_JP ${c_dim}(Japanese)${c_rst}"
+  say "  ${c_grn}7)${c_rst} custom ${c_dim}— enter your own (e.g. zh_CN, en_GB, ko_KR, or a comma-separated list)${c_rst}"
+  read -r -p "Choose [1-7, default 1]: " loc_choice || true
+  case "${loc_choice:-1}" in
+    1) LOCALE_CHOICE="" ;;
+    2) LOCALE_CHOICE="pt_BR" ;;
+    3) LOCALE_CHOICE="de_CH" ;;
+    4) LOCALE_CHOICE="fr_FR" ;;
+    5) LOCALE_CHOICE="es_ES" ;;
+    6) LOCALE_CHOICE="ja_JP" ;;
+    7)
+      read -r -p "Enter locale (e.g. zh_CN or pt_BR,en_US): " LOCALE_CHOICE || true
+      LOCALE_CHOICE="${LOCALE_CHOICE//[[:space:]]/}"
+      ;;
+    *) err "Invalid choice."; exit 1 ;;
+  esac
+fi
+
+# Translate the Faker decisions into -e env-var arguments. Empty values
+# are deliberately omitted so the container falls back to its compiled-in
+# defaults (USE_FAKER=true, FAKER_LOCALE="").
+RUN_FAKER_ARGS=()
+if [[ "$USE_FAKER_CHOICE" == "false" ]]; then
+  RUN_FAKER_ARGS+=(-e "USE_FAKER=false")
+fi
+if [[ -n "$LOCALE_CHOICE" ]]; then
+  RUN_FAKER_ARGS+=(-e "FAKER_LOCALE=${LOCALE_CHOICE}")
+fi
+
 # ── Print plan + confirm ────────────────────────────────────────────────────
 say ""
 say "Engine:     ${c_grn}${ENGINE}${c_rst}"
@@ -186,6 +256,15 @@ say "Image:      ${c_grn}${IMAGE}${c_rst}"
 say "Container:  ${c_grn}${NAME}${c_rst}"
 say "Port:       ${c_grn}${PORT}:8000${c_rst}"
 say "Detectors:  ${c_grn}${DETECTOR_MODE}${c_rst}"
+if [[ "$USE_FAKER_CHOICE" == "false" ]]; then
+  say "Faker:      ${c_grn}disabled${c_rst} ${c_dim}(opaque [TYPE_HEX] surrogates)${c_rst}"
+else
+  if [[ -n "$LOCALE_CHOICE" ]]; then
+    say "Faker:      ${c_grn}enabled${c_rst}, locale=${c_grn}${LOCALE_CHOICE}${c_rst}"
+  else
+    say "Faker:      ${c_grn}enabled${c_rst} ${c_dim}(default locale)${c_rst}"
+  fi
+fi
 if [[ ${#RUN_VOLUME_ARGS[@]} -gt 0 ]]; then
   say "Volume:     ${c_grn}${HF_VOLUME}${c_rst} → /app/.cache/huggingface"
 fi
@@ -228,5 +307,6 @@ say ""
 
 exec "$ENGINE" run --rm --name "$NAME" -p "${PORT}:8000" \
   -e "DETECTOR_MODE=${DETECTOR_MODE}" \
+  "${RUN_FAKER_ARGS[@]}" \
   "${RUN_VOLUME_ARGS[@]}" "${EXTRA_ARGS[@]}" \
   "$IMAGE"
