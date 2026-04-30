@@ -119,6 +119,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
+| `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
 | `FAIL_CLOSED`     | `true`                        | Block requests if LLM detector errors    |
 
@@ -150,6 +151,35 @@ If the header is missing or arrives as `[present]`, we fall back to
 `LLM_API_KEY`. If both are empty, the LLM call goes out without an
 `Authorization` header (fine for local/dev backends; everything else will
 likely return 401, which routes through `FAIL_CLOSED`).
+
+### Capping LLM detector concurrency
+
+`LLM_MAX_CONCURRENCY` is a process-wide semaphore around the LLM
+detector — it does **not** throttle regex or privacy-filter, both of
+which run locally and don't have a backend to overwhelm. Every text in
+the request's `texts` array triggers its own detection call, so a
+single guardrail invocation with four texts already consumes four
+slots; once the cap is reached, further detection calls await rather
+than fire in parallel.
+
+The default of `10` is a conservative number that keeps a small backend
+(local Ollama, a single LiteLLM instance fronting a rate-limited
+provider) from getting buried under a burst of concurrent users. Raise
+it if your detection backend is generously provisioned and you're
+seeing detection latency dominated by queueing, lower it if you're
+hitting upstream 429s.
+
+Saturation is observable via `/health`:
+
+```json
+{ "status": "ok", "llm_in_flight": 8, "llm_max_concurrency": 10, ... }
+```
+
+`llm_in_flight` close to `llm_max_concurrency` for sustained periods
+means detection is the bottleneck — either the upstream LLM is slow,
+or the cap needs to come up. The counter is the actual in-flight
+count, not the semaphore's queue depth, so it tops out at
+`llm_max_concurrency`.
 
 ### Customising the detection prompt
 
