@@ -90,5 +90,10 @@ patterns:
     pattern: '(?i)\b(?:Date\s+of\s+Birth|Birthdate|Birthday|Born|D\.?O\.?B\.?|DOB)\s*[:=]\s*(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4})\b'
 
   # ── Phone (loose; international or US) ─────────────────────────────────────
+  # Negative lookbehind `(?<![\w+])` — instead of `\b` — lets the match
+  # start AT a leading `+`. `\b` is a word/non-word boundary, but both
+  # space and `+` are non-word, so `\b\+?…` never anchors on `+` and the
+  # `+` ends up outside the matched span. Excluding `+` from the allowed
+  # preceding chars also blocks the rare `++123…` double-plus shape.
   - type: PHONE
-    pattern: '\b\+?\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}\b'
+    pattern: '(?<![\w+])\+?\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}\b'
