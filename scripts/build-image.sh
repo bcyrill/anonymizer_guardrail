@@ -48,11 +48,11 @@ Build the anonymizer-guardrail container image. Without -t, prompts
 interactively.
 
   -t, --type TYPE     One of:
-                        slim       no privacy-filter detector (~150 MB)
-                        pf         privacy-filter, runtime download (~700 MB)
+                        slim       no privacy-filter detector
+                        pf         privacy-filter, runtime download
                                    — needs a persistent volume to avoid
-                                   re-downloading the ~3 GB model every run
-                        pf-baked   privacy-filter + model baked in (~3.5 GB)
+                                   re-downloading the model every run
+                        pf-baked   privacy-filter + model baked in
                                    — self-contained; works air-gapped
   -T, --tag TAG       Override the default image tag for this build.
   -h, --help          Show this help.
@@ -87,9 +87,9 @@ if [[ -z "$TYPE" ]]; then
   say ""
   say "Which image flavour do you want to build?"
   say ""
-  say "  ${c_grn}1)${c_rst} slim       no privacy-filter detector ${c_dim}(~150 MB)${c_rst}"
-  say "  ${c_grn}2)${c_rst} pf         privacy-filter, runtime download ${c_dim}(~700 MB)${c_rst}"
-  say "  ${c_grn}3)${c_rst} pf-baked   privacy-filter + model baked in ${c_dim}(~3.5 GB)${c_rst}"
+  say "  ${c_grn}1)${c_rst} slim       no privacy-filter detector"
+  say "  ${c_grn}2)${c_rst} pf         privacy-filter, runtime download"
+  say "  ${c_grn}3)${c_rst} pf-baked   privacy-filter + model baked in"
   say ""
   read -r -p "Choose [1-3, default 1]: " choice || true
   case "${choice:-1}" in
@@ -140,7 +140,7 @@ fi
 say ""
 
 if [[ "$TYPE" == "pf-baked" ]]; then
-  warn "This build downloads the openai/privacy-filter model (~3 GB) at"
+  warn "This build downloads the openai/privacy-filter model at"
   warn "build time. Network access is required and the build will take"
   warn "several minutes the first time (subsequent builds use the layer cache)."
   say ""

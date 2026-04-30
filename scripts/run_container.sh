@@ -42,7 +42,7 @@ TAG_PF="${TAG_PF:-anonymizer-guardrail:privacy-filter}"
 TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
 
 # Named volume for the runtime-download flavour. Reused across `pf` runs
-# so the ~3 GB model download only happens once per host.
+# so the model download only happens once per host.
 HF_VOLUME="${HF_VOLUME:-anonymizer-hf-cache}"
 
 PORT="${PORT:-8000}"
@@ -196,8 +196,8 @@ say ""
 
 if [[ "$JUST_CREATED_VOLUME" == "true" ]]; then
   warn "First run with this volume — the openai/privacy-filter model"
-  warn "(~3 GB) downloads before /health responds. Subsequent runs"
-  warn "with \"${HF_VOLUME}\" reuse the cache and start in seconds."
+  warn "downloads before /health responds. Subsequent runs with"
+  warn "\"${HF_VOLUME}\" reuse the cache and start in seconds."
   say ""
 fi
 
@@ -210,8 +210,20 @@ fi
 
 # ── Run (foreground; --rm cleans up on exit) ────────────────────────────────
 say ""
-say "${c_dim}Running. Ctrl-C to stop. Smoke test from another shell:${c_rst}"
+say "${c_dim}Running. Ctrl-C to stop. Smoke tests from another shell:${c_rst}"
+say "${c_dim}  # Health probe:${c_rst}"
 say "${c_dim}  curl -s http://localhost:${PORT}/health | python -m json.tool${c_rst}"
+say ""
+say "${c_dim}  # Anonymize a request with PII the detectors should catch:${c_rst}"
+say "${c_dim}  curl -s -X POST http://localhost:${PORT}/beta/litellm_basic_guardrail_api \\${c_rst}"
+say "${c_dim}      -H 'Content-Type: application/json' \\${c_rst}"
+say "${c_dim}      -d '{${c_rst}"
+say "${c_dim}        \"texts\": [${c_rst}"
+say "${c_dim}          \"Hi, my name is Alice Smith and you can reach me at alice.smith@example.com or +1-415-555-0100. I live at 123 Main Street, Springfield. My DOB is 1985-04-15.\"${c_rst}"
+say "${c_dim}        ],${c_rst}"
+say "${c_dim}        \"input_type\": \"request\",${c_rst}"
+say "${c_dim}        \"litellm_call_id\": \"smoke-test\"${c_rst}"
+say "${c_dim}      }' | python -m json.tool${c_rst}"
 say ""
 
 exec "$ENGINE" run --rm --name "$NAME" -p "${PORT}:8000" \

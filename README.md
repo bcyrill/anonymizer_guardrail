@@ -303,22 +303,28 @@ Three image flavours, controlled by two build-args, sharing one
 
 | flavour | size | model | when to pick it |
 |---|---|---|---|
-| slim | ~150 MB | n/a | DETECTOR_MODE never includes `privacy_filter` |
-| privacy-filter (runtime download) | ~700 MB | downloads on first container start | most deployments — pair with a named volume |
-| privacy-filter (model baked in) | ~3.5 GB | shipped inside image | air-gapped or strict cold-start latency |
+| slim | ~200 MB | n/a | DETECTOR_MODE never includes `privacy_filter` |
+| privacy-filter (runtime download) | ~1.3 GB | downloads on first container start | most deployments — pair with a named volume |
+| privacy-filter (model baked in) | ~7 GB | shipped inside image | air-gapped or strict cold-start latency |
+
+(Sizes assume the default CPU-only PyTorch build. Override with
+`--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121` if
+you're deploying behind GPUs; expect ~4 GB extra on top — that's roughly
+how much `nvidia-cuda-runtime`, `nvidia-cudnn`, `nvidia-cublas`, etc.
+weigh on Linux x86.)
 
 ```bash
 # 1) Slim — no ML deps.
 podman build -t anonymizer-guardrail:latest -f Containerfile .
 
-# 2) Privacy-filter, runtime download — small image, downloads ~3 GB on
+# 2) Privacy-filter, runtime download — small image, downloads ~6 GB on
 #    first container start. Mount a NAMED VOLUME so subsequent starts
 #    skip the download (see below).
 podman build -t anonymizer-guardrail:privacy-filter \
     --build-arg WITH_PRIVACY_FILTER=true -f Containerfile .
 
 # 3) Privacy-filter, model baked into image — self-contained, no runtime
-#    network, but ~3.5 GB image and ~3 GB extra in your registry.
+#    network, but ~7 GB image and ~6 GB extra in your registry.
 podman build -t anonymizer-guardrail:privacy-filter-baked \
     --build-arg WITH_PRIVACY_FILTER=true \
     --build-arg BAKE_PRIVACY_FILTER_MODEL=true \
@@ -337,7 +343,7 @@ podman run --rm -p 8000:8000 \
 
 The runtime-download image **needs** a persistent volume at
 `/app/.cache/huggingface` — without one, every `podman run` re-downloads
-the ~3 GB. Use a named volume:
+the ~6 GB. Use a named volume:
 
 ```bash
 podman volume create anonymizer-hf-cache

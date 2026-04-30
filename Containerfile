@@ -6,23 +6,27 @@
 #   WITH_PRIVACY_FILTER         install torch + transformers (default false)
 #   BAKE_PRIVACY_FILTER_MODEL   pre-download the model weights (default false)
 #
-# 1. Slim (~150 MB):
+# See README for image sizes; they shift with each torch / model release.
+# Default torch is CPU-only (TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu);
+# override for a CUDA build.
+#
+# 1. Slim:
 #      podman build -t anonymizer-guardrail:latest -f Containerfile .
 #    No ML deps. Pick this if DETECTOR_MODE never includes privacy_filter.
 #
-# 2. Privacy-filter, runtime download (~700 MB image):
+# 2. Privacy-filter, runtime download:
 #      podman build -t anonymizer-guardrail:privacy-filter \
 #          --build-arg WITH_PRIVACY_FILTER=true -f Containerfile .
-#    Has torch/transformers, but downloads the ~3 GB model on first
-#    container start. Mount a NAMED VOLUME at /app/.cache/huggingface so
-#    the download survives container recreation:
+#    Has torch/transformers, but downloads the model on first container
+#    start. Mount a NAMED VOLUME at /app/.cache/huggingface so the
+#    download survives container recreation:
 #      podman volume create anonymizer-hf-cache
 #      podman run --rm -p 8000:8000 \
 #          -e DETECTOR_MODE=regex,privacy_filter,llm \
 #          -v anonymizer-hf-cache:/app/.cache/huggingface \
 #          anonymizer-guardrail:privacy-filter
 #
-# 3. Privacy-filter, model baked in (~3.5 GB):
+# 3. Privacy-filter, model baked in:
 #      podman build -t anonymizer-guardrail:privacy-filter-baked \
 #          --build-arg WITH_PRIVACY_FILTER=true \
 #          --build-arg BAKE_PRIVACY_FILTER_MODEL=true \
@@ -68,17 +72,30 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-# Build-args separating two orthogonal decisions:
-#   - WITH_PRIVACY_FILTER:        install torch + transformers (~500 MB)
-#   - BAKE_PRIVACY_FILTER_MODEL:  pre-download the ~3 GB model into the image
-# Defaulting both to false keeps the slim image as the no-flag-needed default.
-# Operators who want runtime download must mount a persistent volume at
-# /app/.cache/huggingface; otherwise every container start re-downloads.
+# Build-args separating three orthogonal decisions:
+#   - WITH_PRIVACY_FILTER:        install torch + transformers
+#   - BAKE_PRIVACY_FILTER_MODEL:  pre-download the model into the image
+#   - TORCH_INDEX_URL:            which PyTorch wheel index to use
+#
+# Defaulting WITH_PRIVACY_FILTER and BAKE_PRIVACY_FILTER_MODEL to false
+# keeps the slim image as the no-flag-needed default. TORCH_INDEX_URL
+# defaults to the CPU-only index — `pip install torch` from PyPI on Linux
+# x86 silently pulls in nvidia-cuda-runtime, nvidia-cudnn, nvidia-cublas,
+# etc. that we don't use; the CPU wheel skips them, dropping the image
+# substantially. Operators deploying behind GPUs can override:
+#   --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
 ARG WITH_PRIVACY_FILTER=false
 ARG BAKE_PRIVACY_FILTER_MODEL=false
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
+# When privacy-filter is enabled, install torch first from the chosen
+# index so the version we want is already on disk. The subsequent
+# `pip install ".[privacy-filter]"` then satisfies its torch dep without
+# pulling a different (possibly CUDA-fattened) build from the default
+# PyPI index.
 RUN if [ "$WITH_PRIVACY_FILTER" = "true" ]; then \
-        pip install --no-cache-dir ".[privacy-filter]"; \
+        pip install --no-cache-dir --index-url "$TORCH_INDEX_URL" torch \
+     && pip install --no-cache-dir ".[privacy-filter]"; \
     else \
         pip install --no-cache-dir .; \
     fi
@@ -112,7 +129,7 @@ EXPOSE 8000
 USER app
 
 # Generous start-period to accommodate the no-bake privacy-filter case,
-# where the first container start downloads ~3 GB of model weights before
+# where the first container start downloads the model weights before
 # /health responds. start-period only affects the "starting" → "unhealthy"
 # transition; once /health succeeds the container moves to "healthy" and
 # subsequent failures count normally. Operators with very slow networks
