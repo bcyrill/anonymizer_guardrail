@@ -97,6 +97,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
 | `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
+| `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
@@ -171,6 +172,24 @@ The prompt is loaded once at startup; restart the container to pick up
 edits. A missing/unreadable override path is a hard error rather than a
 silent fall-back to the bundled prompt — if you set the variable, we
 assume you mean it.
+
+### Disabling Faker
+
+Set `USE_FAKER=false` to replace every realistic surrogate with an opaque
+deterministic token (`alice` → `[PERSON_AE708E5D]`, `acmecorp` →
+`[ORG_77116DCC]`). The token's prefix still encodes the entity type so the
+upstream model can tell categories apart, but no Faker output ever reaches
+it. Useful when:
+
+- Realistic surrogates would mislead a downstream tool (e.g. an automation
+  that grep's for company names in the model's response).
+- You want a hard guarantee that the model never sees plausibly-real PII.
+- Faker-related behaviour is causing trouble and you want to take it out
+  of the loop entirely (Faker isn't even instantiated in this mode).
+
+The opaque tokens are still deterministic, so the same input always maps
+to the same surrogate within a process — round-trip restoration works
+identically.
 
 ### Localising surrogates
 

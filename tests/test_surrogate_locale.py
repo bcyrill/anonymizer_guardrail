@@ -16,7 +16,7 @@ from anonymizer_guardrail.detector.base import Match
 
 
 def _fake_config(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(faker_locale="")
+    base: dict[str, Any] = dict(faker_locale="", use_faker=True)
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -66,3 +66,48 @@ def test_invalid_locale_fails_at_construction(
     )
     with pytest.raises(RuntimeError, match="not a valid Faker locale"):
         surrogate_mod.SurrogateGenerator()
+
+
+def test_use_faker_false_emits_opaque_for_realistic_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """USE_FAKER=false → realistic-type surrogates become opaque tokens
+    (e.g. `[PERSON_…]` instead of a Faker-generated name)."""
+    monkeypatch.setattr(surrogate_mod, "config", _fake_config(use_faker=False))
+    gen = surrogate_mod.SurrogateGenerator()
+
+    out = gen.for_match(Match(text="alice", entity_type="PERSON"))
+    assert out.startswith("[PERSON_") and out.endswith("]")
+
+    out = gen.for_match(Match(text="acmecorp", entity_type="ORGANIZATION"))
+    assert out.startswith("[ORG_") and out.endswith("]")
+
+    # Already-opaque types still work the same.
+    out = gen.for_match(Match(text="some-hash", entity_type="HASH"))
+    assert out.startswith("[HASH_") and out.endswith("]")
+
+
+def test_use_faker_false_skips_locale_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Faker is off, an invalid locale shouldn't crash boot —
+    Faker is never instantiated, so the locale value is moot."""
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, faker_locale="garbage"),
+    )
+    # Should construct without raising; the locale is unused.
+    surrogate_mod.SurrogateGenerator()
+
+
+def test_use_faker_false_outputs_are_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same (text, type) → same opaque token across instances."""
+    monkeypatch.setattr(surrogate_mod, "config", _fake_config(use_faker=False))
+    g1 = surrogate_mod.SurrogateGenerator()
+    g2 = surrogate_mod.SurrogateGenerator()
+    a = g1.for_match(Match(text="alice", entity_type="PERSON"))
+    b = g2.for_match(Match(text="alice", entity_type="PERSON"))
+    assert a == b

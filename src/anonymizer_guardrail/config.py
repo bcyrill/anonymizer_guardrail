@@ -65,6 +65,12 @@ class Config:
     # fallback for providers the primary doesn't implement. Invalid
     # locales fail at startup, not at first request.
     faker_locale: str = os.getenv("FAKER_LOCALE", "")
+    # When false, every surrogate is an opaque deterministic placeholder
+    # (e.g. `[PERSON_7F3A2B]`) instead of a realistic Faker substitute.
+    # Useful when the upstream model misinterprets realistic surrogates as
+    # real data, or when realism would mislead a downstream tool. Faker is
+    # not even instantiated when disabled.
+    use_faker: bool = _env_bool("USE_FAKER", True)
     # Hard cap on input size sent to the LLM in one call. Inputs above this
     # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
     # silently truncated — truncating in a guardrail would let everything past
