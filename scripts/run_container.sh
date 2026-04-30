@@ -89,6 +89,10 @@ container in the background. Without -t, prompts interactively.
                     Override DETECTOR_MODE on the guardrail (e.g.
                     \`regex,llm\` or \`regex,privacy_filter,llm\`).
                     Skips the interactive prompt.
+  --regex-overlap-strategy S
+                    \`longest\` (default) or \`priority\`. Only relevant
+                    when DETECTOR_MODE includes \`regex\`. Skips the
+                    prompt.
   --llm-backend B   When DETECTOR_MODE includes \`llm\`, which backend to
                     talk to: \`fake-llm\` (joins ${SHARED_NETWORK} and
                     points at http://fake-llm:4000/v1) or \`custom\`
@@ -152,6 +156,7 @@ EXTRA_ARGS=()
 USE_FAKER_CHOICE=""        # "true" | "false" | ""
 LOCALE_CHOICE=""           # locale string or ""
 DETECTOR_MODE_OVERRIDE=""  # comma-separated detectors, or ""
+REGEX_OVERLAP_CHOICE=""    # "longest" | "priority" | ""
 RULES_FILE=""              # fake-llm only: host path to a custom rules.yaml
 LLM_BACKEND=""             # "fake-llm" | "custom" | ""
 LLM_API_BASE_OVERRIDE=""
@@ -165,6 +170,7 @@ while [[ $# -gt 0 ]]; do
     -p|--port)             PORT="${2:-}"; shift 2 ;;
     -n|--name)             NAME="${2:-}"; shift 2 ;;
     -d|--detector-mode)    DETECTOR_MODE_OVERRIDE="${2:-}"; shift 2 ;;
+    --regex-overlap-strategy) REGEX_OVERLAP_CHOICE="${2:-}"; shift 2 ;;
     --llm-backend)         LLM_BACKEND="${2:-}"; shift 2 ;;
     --llm-api-base)        LLM_API_BASE_OVERRIDE="${2:-}"; LLM_BACKEND="custom"; shift 2 ;;
     --llm-api-key)         LLM_API_KEY_OVERRIDE="${2:-}"; LLM_BACKEND="custom"; shift 2 ;;
@@ -341,12 +347,40 @@ else
   esac
 fi
 
-# Quick predicate used by later blocks: does DETECTOR_MODE include
-# the LLM detector? Comma-wrapping keeps `llm` from matching `xllm`,
-# `llm2`, etc.
+# Quick predicates for later blocks. Comma-wrapping keeps `llm` from
+# matching `xllm`, `llm2`, etc.
 DETECTOR_HAS_LLM=false
 if [[ ",${DETECTOR_MODE}," == *",llm,"* ]]; then
   DETECTOR_HAS_LLM=true
+fi
+DETECTOR_HAS_REGEX=false
+if [[ ",${DETECTOR_MODE}," == *",regex,"* ]]; then
+  DETECTOR_HAS_REGEX=true
+fi
+
+# ── Regex overlap strategy (only when regex detector is in the mode) ────────
+# Two strategies, see README "Regex overlap resolution":
+#   longest  — longest match span wins (default; robust against
+#              child-YAML narrow patterns shadowing a parent's wider one)
+#   priority — first pattern in YAML order wins (legacy; useful when
+#              the YAML's pattern ordering is deliberately load-bearing)
+REGEX_OVERLAP_ARGS=()
+if [[ "$DETECTOR_HAS_REGEX" == "true" ]]; then
+  if [[ -z "$REGEX_OVERLAP_CHOICE" ]]; then
+    say ""
+    read -r -p "Use legacy 'priority' regex-overlap strategy (first-pattern-wins)? [y/N] " reply || true
+    reply="${reply:-n}"
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+      REGEX_OVERLAP_CHOICE="priority"
+    else
+      REGEX_OVERLAP_CHOICE="longest"
+    fi
+  fi
+  if [[ "$REGEX_OVERLAP_CHOICE" != "longest" && "$REGEX_OVERLAP_CHOICE" != "priority" ]]; then
+    err "Invalid --regex-overlap-strategy '${REGEX_OVERLAP_CHOICE}'. Use 'longest' or 'priority'."
+    exit 1
+  fi
+  REGEX_OVERLAP_ARGS=(-e "REGEX_OVERLAP_STRATEGY=${REGEX_OVERLAP_CHOICE}")
 fi
 
 # ── LLM backend selection (only when DETECTOR_MODE includes llm) ────────────
@@ -593,6 +627,9 @@ say "Image:      ${c_grn}${IMAGE}${c_rst}"
 say "Container:  ${c_grn}${NAME}${c_rst}"
 say "Port:       ${c_grn}${PORT}:8000${c_rst}"
 say "Detectors:  ${c_grn}${DETECTOR_MODE}${c_rst}"
+if [[ "$DETECTOR_HAS_REGEX" == "true" ]]; then
+  say "Regex strat: ${c_grn}${REGEX_OVERLAP_CHOICE}${c_rst}"
+fi
 say "Log level:  ${c_grn}${LOG_LEVEL_CHOICE}${c_rst}"
 if [[ "$DETECTOR_HAS_LLM" == "true" ]]; then
   case "$LLM_BACKEND" in
@@ -671,6 +708,7 @@ status=0
   "${RUN_NETWORK_ARGS[@]}" \
   -e "DETECTOR_MODE=${DETECTOR_MODE}" \
   "${RUN_LOG_LEVEL_ARGS[@]}" \
+  "${REGEX_OVERLAP_ARGS[@]}" \
   "${RUN_LLM_ARGS[@]}" \
   "${RUN_FAKER_ARGS[@]}" \
   "${RUN_OFFLINE_ARGS[@]}" \
