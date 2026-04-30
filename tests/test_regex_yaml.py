@@ -238,3 +238,35 @@ def test_pentest_yaml_loads_with_full_pattern_count(
     # 173 patterns from DontFeedTheAI + 14 from the bundled defaults via extends.
     # Loose lower bound so a small future cleanup doesn't fail the test.
     assert len(compiled) >= 180
+
+
+def test_bundled_prefix_resolves_to_packaged_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`bundled:regex_pentest.yaml` should resolve via importlib.resources,
+    so the env var works the same regardless of Python install layout."""
+    monkeypatch.setattr(
+        regex_mod, "config", _fake_config(regex_patterns_path="bundled:regex_pentest.yaml")
+    )
+    compiled = regex_mod._load_patterns()
+    assert len(compiled) >= 180
+
+
+def test_bundled_prefix_unknown_name_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        regex_mod, "config", _fake_config(regex_patterns_path="bundled:no_such.yaml")
+    )
+    with pytest.raises(RuntimeError, match="not found in bundled patterns"):
+        regex_mod._load_patterns()
+
+
+def test_bundled_prefix_rejects_path_separators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        regex_mod, "config", _fake_config(regex_patterns_path="bundled:../etc/passwd")
+    )
+    with pytest.raises(RuntimeError, match="bare filename"):
+        regex_mod._load_patterns()

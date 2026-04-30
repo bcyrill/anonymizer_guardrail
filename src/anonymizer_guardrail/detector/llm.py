@@ -31,17 +31,48 @@ class LLMUnavailableError(RuntimeError):
 
 
 _DEFAULT_PROMPT_RELPATH = "prompts/llm_default.md"
+_BUNDLED_PROMPTS_DIR = "prompts"
+_BUNDLED_PREFIX = "bundled:"
+
+
+def _read_bundled_prompt(name: str) -> str:
+    """Read a file from the package's bundled prompts/ directory."""
+    if not name or "/" in name or "\\" in name:
+        raise RuntimeError(
+            f"LLM_SYSTEM_PROMPT_PATH=bundled:{name!r}: name must be a bare "
+            f"filename (no path separators). Use a filesystem path if you "
+            f"want to reference a file outside the bundled prompts/."
+        )
+    try:
+        return (
+            resources.files("anonymizer_guardrail")
+            .joinpath(f"{_BUNDLED_PROMPTS_DIR}/{name}")
+            .read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError(
+            f"LLM_SYSTEM_PROMPT_PATH=bundled:{name!r} not found in "
+            f"bundled prompts/: {exc}"
+        ) from exc
 
 
 def _load_system_prompt() -> str:
     """Load the detector's system prompt.
 
     LLM_SYSTEM_PROMPT_PATH wins if set; otherwise we fall back to the
-    bundled default. Loaded once at import-time — restart to pick up edits,
-    same as every other config knob.
+    bundled default. The override accepts either:
+      * a filesystem path (absolute or relative)
+      * `bundled:<name>` — a bare filename in the package's prompts/ dir,
+        which insulates the env var from the Python version embedded in
+        the site-packages path.
+
+    Loaded once at import-time — restart to pick up edits, same as every
+    other config knob.
     """
     override = config.llm_system_prompt_path.strip()
     if override:
+        if override.startswith(_BUNDLED_PREFIX):
+            return _read_bundled_prompt(override[len(_BUNDLED_PREFIX):].strip())
         path = Path(override)
         try:
             return path.read_text(encoding="utf-8")

@@ -194,6 +194,40 @@ def test_override_path_missing_file_raises_at_load(
         llm_mod._load_system_prompt()
 
 
+def test_bundled_prefix_resolves_to_packaged_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`bundled:llm_pentest.md` should load the file shipped under
+    prompts/, regardless of the Python install location."""
+    monkeypatch.setattr(
+        llm_mod, "config", _fake_config(llm_system_prompt_path="bundled:llm_pentest.md")
+    )
+    text = llm_mod._load_system_prompt()
+    # Stable phrase from the DontFeedTheAI prompt.
+    assert "data privacy guardian" in text
+
+
+def test_bundled_prefix_unknown_name_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        llm_mod, "config", _fake_config(llm_system_prompt_path="bundled:does_not_exist.md")
+    )
+    with pytest.raises(RuntimeError, match="not found in bundled prompts"):
+        llm_mod._load_system_prompt()
+
+
+def test_bundled_prefix_rejects_path_separators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`bundled:` is for bare filenames only — disallow path traversal."""
+    monkeypatch.setattr(
+        llm_mod, "config", _fake_config(llm_system_prompt_path="bundled:../etc/passwd")
+    )
+    with pytest.raises(RuntimeError, match="bare filename"):
+        llm_mod._load_system_prompt()
+
+
 async def test_per_call_api_key_overrides_configured_key(
     monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
 ) -> None:

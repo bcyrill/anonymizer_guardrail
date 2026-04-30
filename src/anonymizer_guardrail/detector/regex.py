@@ -133,14 +133,40 @@ def _resolve_extends(
     return out
 
 
+_BUNDLED_PREFIX = "bundled:"
+
+
 def _read_root_patterns_yaml() -> tuple[str, str, Path | None]:
     """Return (yaml_text, source_label, file_dir) for the root config.
 
     file_dir is the parent directory if the source is on-disk, else None
-    (used to resolve relative `extends:` paths).
+    (used to resolve relative `extends:` paths). The override env var
+    accepts either:
+      * a filesystem path (absolute or relative)
+      * `bundled:<name>` — a bare filename in the package's patterns/ dir,
+        which insulates the env var from the Python version embedded in
+        the site-packages path.
     """
     override = config.regex_patterns_path.strip()
     if override:
+        if override.startswith(_BUNDLED_PREFIX):
+            name = override[len(_BUNDLED_PREFIX):].strip()
+            if not name or "/" in name or "\\" in name:
+                raise RuntimeError(
+                    f"REGEX_PATTERNS_PATH=bundled:{name!r}: name must be a "
+                    f"bare filename (no path separators). Use a filesystem "
+                    f"path if you want a file outside the bundled patterns/."
+                )
+            try:
+                text = _read_bundled(f"{_BUNDLED_PATTERNS_DIR}/{name}")
+            except (FileNotFoundError, OSError) as exc:
+                raise RuntimeError(
+                    f"REGEX_PATTERNS_PATH=bundled:{name!r} not found in "
+                    f"bundled patterns/: {exc}"
+                ) from exc
+            # No on-disk parent → child `extends:` directives must use
+            # bundled lookups too (cannot resolve a relative path).
+            return text, f"bundled patterns/{name}", None
         path = Path(override)
         try:
             text = path.read_text(encoding="utf-8")

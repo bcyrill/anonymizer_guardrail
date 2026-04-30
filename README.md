@@ -144,10 +144,22 @@ Two prompts ship with the package under
   to ignore, etc.).
 
 To swap in one of those (or your own — extra entity types, domain-specific
-guidance, a different language), point `LLM_SYSTEM_PROMPT_PATH` at any
-readable file — typically a mounted volume in the container:
+guidance, a different language), set `LLM_SYSTEM_PROMPT_PATH`. Two forms
+are accepted:
+
+- `bundled:<filename>` — a file shipped inside the package, e.g.
+  `bundled:llm_pentest.md`. Resolved via `importlib.resources`, so the env
+  var is independent of the Python version embedded in the site-packages
+  path.
+- A regular filesystem path — typically a mounted volume:
 
 ```bash
+# Use the bundled pentest prompt — no path-juggling needed.
+podman run --rm -p 8000:8000 \
+  -e LLM_SYSTEM_PROMPT_PATH=bundled:llm_pentest.md \
+  anonymizer-guardrail:latest
+
+# Or mount your own:
 podman run --rm -p 8000:8000 \
   -v $PWD/my_prompt.md:/etc/anonymizer/prompt.md:ro \
   -e LLM_SYSTEM_PROMPT_PATH=/etc/anonymizer/prompt.md \
@@ -173,12 +185,13 @@ the package:
   K8s secrets, Slack/Teams formats, AD CS templates, etc.). Tuned for
   pentest output and noisy in non-security contexts — opt in deliberately.
 
-Point `REGEX_PATTERNS_PATH` at any YAML file to swap. To start from the
-pentest set inside the container:
+`REGEX_PATTERNS_PATH` accepts the same two forms as
+`LLM_SYSTEM_PROMPT_PATH`: `bundled:<filename>` for in-package files, or a
+filesystem path. To start from the pentest set:
 
 ```bash
 podman run --rm -p 8000:8000 \
-  -e REGEX_PATTERNS_PATH=/usr/lib/python3.12/site-packages/anonymizer_guardrail/patterns/regex_pentest.yaml \
+  -e REGEX_PATTERNS_PATH=bundled:regex_pentest.yaml \
   anonymizer-guardrail:latest
 ```
 
