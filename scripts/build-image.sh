@@ -39,21 +39,27 @@ fi
 TAG_SLIM="${TAG_SLIM:-anonymizer-guardrail:latest}"
 TAG_PF="${TAG_PF:-anonymizer-guardrail:privacy-filter}"
 TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
+TAG_FAKE_LLM="${TAG_FAKE_LLM:-fake-llm:latest}"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [-t TYPE] [-T TAG] [-h] [-- EXTRA_BUILD_ARGS...]
 
-Build the anonymizer-guardrail container image. Without -t, prompts
-interactively.
+Build the anonymizer-guardrail (or companion fake-llm) container image.
+Without -t, prompts interactively.
 
   -t, --type TYPE     One of:
-                        slim       no privacy-filter detector
+                        slim       without privacy-filter
                         pf         privacy-filter, runtime download
                                    — needs a persistent volume to avoid
                                    re-downloading the model every run
                         pf-baked   privacy-filter + model baked in
                                    — self-contained; works air-gapped
+                        fake-llm   companion test backend — an OpenAI-
+                                   compatible Chat Completions server
+                                   with a YAML rules file, for driving
+                                   the guardrail's LLM detector
+                                   deterministically (see fake-llm/)
   -T, --tag TAG       Override the default image tag for this build.
   -h, --help          Show this help.
 
@@ -65,6 +71,7 @@ Environment overrides:
   TAG_SLIM       Default tag for slim (current: ${TAG_SLIM})
   TAG_PF         Default tag for pf (current: ${TAG_PF})
   TAG_PF_BAKED   Default tag for pf-baked (current: ${TAG_PF_BAKED})
+  TAG_FAKE_LLM   Default tag for fake-llm (current: ${TAG_FAKE_LLM})
 EOF
 }
 
@@ -87,20 +94,27 @@ if [[ -z "$TYPE" ]]; then
   say ""
   say "Which image flavour do you want to build?"
   say ""
-  say "  ${c_grn}1)${c_rst} slim       no privacy-filter detector"
+  say "  ${c_grn}1)${c_rst} slim       without privacy-filter"
   say "  ${c_grn}2)${c_rst} pf         privacy-filter, runtime download"
   say "  ${c_grn}3)${c_rst} pf-baked   privacy-filter + model baked in"
+  say "  ${c_grn}4)${c_rst} fake-llm   companion test backend ${c_dim}(deterministic LLM)${c_rst}"
   say ""
-  read -r -p "Choose [1-3, default 1]: " choice || true
+  read -r -p "Choose [1-4, default 1]: " choice || true
   case "${choice:-1}" in
     1) TYPE="slim" ;;
     2) TYPE="pf" ;;
     3) TYPE="pf-baked" ;;
+    4) TYPE="fake-llm" ;;
     *) err "Invalid choice."; exit 1 ;;
   esac
 fi
 
-# ── Resolve flavour to build-args + default tag ──────────────────────────────
+# ── Resolve flavour to build-args, Containerfile, context, tag ───────────────
+# Most flavours build the main guardrail image from the repo root
+# Containerfile. fake-llm is a separate companion image with its own
+# Containerfile and a self-contained build context under fake-llm/.
+CONTAINERFILE="Containerfile"
+BUILD_CONTEXT="."
 case "$TYPE" in
   slim)
     BUILD_ARGS=()
@@ -119,8 +133,14 @@ case "$TYPE" in
     DEFAULT_TAG="$TAG_PF_BAKED"
     TYPE="pf-baked"
     ;;
+  fake-llm)
+    BUILD_ARGS=()
+    DEFAULT_TAG="$TAG_FAKE_LLM"
+    CONTAINERFILE="fake-llm/Containerfile"
+    BUILD_CONTEXT="fake-llm"
+    ;;
   *)
-    err "Unknown type '${TYPE}'. Valid: slim, pf, pf-baked."
+    err "Unknown type '${TYPE}'. Valid: slim, pf, pf-baked, fake-llm."
     exit 1
     ;;
 esac
@@ -154,8 +174,8 @@ if [[ ! "$reply" =~ ^[Yy]$ ]]; then
 fi
 
 say ""
-say "${c_dim}Running: ${ENGINE} build -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f Containerfile .${c_rst}"
-"$ENGINE" build -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f Containerfile .
+say "${c_dim}Running: ${ENGINE} build -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f ${CONTAINERFILE} ${BUILD_CONTEXT}${c_rst}"
+"$ENGINE" build -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f "$CONTAINERFILE" "$BUILD_CONTEXT"
 
 say ""
 ok "Built ${TAG}."
@@ -184,7 +204,18 @@ case "$TYPE" in
     say "      -e DETECTOR_MODE=regex,privacy_filter,llm \\"
     say "      ${TAG}"
     ;;
+  fake-llm)
+    say "  ${c_dim}# fake-llm is auto-started by run_container.sh when you${c_rst}"
+    say "  ${c_dim}# pick a DETECTOR_MODE that includes llm and choose the${c_rst}"
+    say "  ${c_dim}# fake-llm backend. Just run a guardrail flavour:${c_rst}"
+    say "  scripts/run_container.sh -t slim -d regex,llm"
+    say ""
+    say "  ${c_dim}# To run it standalone (e.g. to probe rules directly):${c_rst}"
+    say "  ${ENGINE} run --rm -p 4000:4000 ${TAG}"
+    ;;
 esac
 say ""
-say "  ${c_dim}# Then in another terminal:${c_rst}"
-say "  curl -s http://localhost:8000/health | python -m json.tool"
+if [[ "$TYPE" != "fake-llm" ]]; then
+  say "  ${c_dim}# Then in another terminal:${c_rst}"
+  say "  curl -s http://localhost:8000/health | python -m json.tool"
+fi
