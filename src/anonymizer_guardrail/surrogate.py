@@ -112,16 +112,25 @@ class SurrogateGenerator:
 
     def __init__(self) -> None:
         self._cache: dict[tuple[str, str], str] = {}
+        # The lock guards both the cache and the shared Faker instance:
+        # `seed_instance + gen()` is a critical section that must not be
+        # interleaved by another caller (or one match's seed would bleed
+        # into another's output). Sub-millisecond hold time, so contention
+        # under realistic concurrency is invisible.
         self._lock = threading.Lock()
         self._use_faker = bool(config.use_faker)
         self._locales = _parse_locales(config.faker_locale)
+        self._fake: Faker | None = None
         if self._use_faker:
             self._generators = _REALISTIC_GENERATORS
-            # Instantiate once eagerly so a typo'd locale (e.g. "pr_BR" instead
-            # of "pt_BR") fails at boot with a clear message, not at first
-            # request with a confusing AttributeError from inside Faker.
+            # Instantiate once and reuse — Faker construction is ~1–2 ms;
+            # `seed_instance` on an existing instance is ~0.15 ms. With a
+            # cache that dedupes by (text, type), this only matters when a
+            # request brings many unique entities, but it's a free win.
+            # An invalid locale also fails here at boot with a clear message
+            # rather than at first request with a confusing AttributeError.
             try:
-                Faker(self._locales)
+                self._fake = Faker(self._locales)
             except (AttributeError, ValueError, ModuleNotFoundError) as exc:
                 raise RuntimeError(
                     f"FAKER_LOCALE={config.faker_locale!r} is not a valid Faker "
@@ -139,26 +148,22 @@ class SurrogateGenerator:
             if cached is not None:
                 return cached
 
-        seed = _seed_for(match.text, match.entity_type)
-        gen = self._generators.get(match.entity_type, self._generators["OTHER"])
-        if self._use_faker:
-            fake = Faker(self._locales)
-            fake.seed_instance(seed)
-            surrogate = gen(fake, match.text)
-        else:
-            # Opaque generators ignore the Faker arg, but the signature is
-            # shared — pass None to avoid the per-call Faker construction.
-            surrogate = gen(None, match.text)  # type: ignore[arg-type]
+            seed = _seed_for(match.text, match.entity_type)
+            gen = self._generators.get(match.entity_type, self._generators["OTHER"])
+            if self._fake is not None:
+                self._fake.seed_instance(seed)
+                surrogate = gen(self._fake, match.text)
+            else:
+                # Opaque generators ignore the Faker arg.
+                surrogate = gen(None, match.text)  # type: ignore[arg-type]
 
-        # If by astronomical luck the surrogate equals the original, salt and
-        # retry with a different opaque prefix derived from the entity type.
-        if surrogate == match.text:
-            surrogate = _opaque(match.entity_type)(None, match.text)  # type: ignore[arg-type]
+            # If by astronomical luck the surrogate equals the original, salt
+            # and retry with a different opaque prefix derived from the type.
+            if surrogate == match.text:
+                surrogate = _opaque(match.entity_type)(None, match.text)  # type: ignore[arg-type]
 
-        with self._lock:
-            # Re-check under lock; another coroutine may have populated it.
-            self._cache.setdefault(key, surrogate)
-            return self._cache[key]
+            self._cache[key] = surrogate
+            return surrogate
 
 
 __all__ = ["SurrogateGenerator"]
