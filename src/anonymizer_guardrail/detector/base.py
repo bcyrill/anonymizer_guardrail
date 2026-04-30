@@ -32,6 +32,11 @@ ENTITY_TYPES = frozenset(
         "URL",
         "PATH",
         "IDENTIFIER",
+        "ADDRESS",
+        "CREDIT_CARD",
+        "DATE_OF_BIRTH",
+        "IBAN",
+        "NATIONAL_ID",
         "OTHER",
     }
 )

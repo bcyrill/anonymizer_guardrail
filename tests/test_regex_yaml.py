@@ -29,6 +29,59 @@ def test_default_yaml_loads_at_import_time() -> None:
     assert "EMAIL_ADDRESS" in types
     assert "AWS_ACCESS_KEY" in types
     assert "JWT" in types
+    # Newly-added high-PII types must also be present.
+    assert "CREDIT_CARD" in types
+    assert "IBAN" in types
+    assert "DATE_OF_BIRTH" in types
+
+
+@pytest.mark.parametrize(
+    "sample,expected_type",
+    [
+        ("Visa: 4111-1111-1111-1111",        "CREDIT_CARD"),
+        ("Mastercard 5500 0000 0000 0004",   "CREDIT_CARD"),
+        ("Amex 3782 822463 10005",           "CREDIT_CARD"),
+        ("DE89370400440532013000",           "IBAN"),
+        ("GB82WEST12345698765432",           "IBAN"),
+        ("DOB: 1985-04-15",                  "DATE_OF_BIRTH"),
+        ("Date of Birth: 12/25/1990",        "DATE_OF_BIRTH"),
+    ],
+)
+async def test_new_default_patterns_match(sample: str, expected_type: str) -> None:
+    """Each new bundled-default pattern matches a representative input
+    with the right entity type. Locks in the regex shape against future
+    drift."""
+    detector = regex_mod.RegexDetector()
+    matches = await detector.detect(sample)
+    assert matches, f"no match in: {sample!r}"
+    assert any(m.entity_type == expected_type for m in matches), (
+        f"expected {expected_type} in {[(m.entity_type, m.text) for m in matches]}"
+    )
+
+
+async def test_pentest_yaml_relabels_brazilian_docs_as_national_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pentest YAML had Brazilian CPF/CNPJ/RG labelled CREDENTIAL
+    (verbatim from DontFeedTheAI). They were relabelled NATIONAL_ID so
+    the surrogate generator picks Faker's locale-aware ssn() for them.
+    Pin that down."""
+    monkeypatch.setattr(
+        regex_mod, "config", _fake_config(regex_patterns_path="bundled:regex_pentest.yaml")
+    )
+    regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
+    detector = regex_mod.RegexDetector()
+    try:
+        matches = await detector.detect("CPF 123.456.789-01 here")
+        assert any(m.entity_type == "NATIONAL_ID" for m in matches), (
+            f"expected NATIONAL_ID, got {[(m.entity_type, m.text) for m in matches]}"
+        )
+    finally:
+        # Restore the default-bundled patterns so other tests stay isolated.
+        monkeypatch.setattr(
+            regex_mod, "config", _fake_config(regex_patterns_path="")
+        )
+        regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
 
 
 def test_override_path_replaces_patterns(
@@ -71,8 +124,11 @@ def test_override_with_bundled_extends_merges(
     compiled = regex_mod._load_patterns()
     # > defaults plus our one extra.
     assert len(compiled) > 1
-    # Last entry is the locally-defined one (defaults load first per design).
-    assert compiled[-1][1].pattern == r"CUSTOM_TOKEN_\w+"
+    # Local patterns load FIRST so they take precedence over inherited
+    # patterns on overlapping spans (child-overrides-parent semantics).
+    assert compiled[0][1].pattern == r"CUSTOM_TOKEN_\w+"
+    # And the inherited defaults are still present somewhere down the list.
+    assert any(et == "EMAIL_ADDRESS" for et, _ in compiled)
 
 
 def test_pentest_yaml_extends_default_yaml() -> None:

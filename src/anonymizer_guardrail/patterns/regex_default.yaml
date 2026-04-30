@@ -3,11 +3,11 @@
 # Loaded at startup. Override with REGEX_PATTERNS_PATH=/path/to/your.yaml.
 #
 # Schema (per entry):
-#   type:    one of the entity types in detector/base.py:ENTITY_TYPES
-#            (PERSON, ORGANIZATION, EMAIL_ADDRESS, IPV4_ADDRESS, IPV6_ADDRESS,
-#            IPV4_CIDR, IPV6_CIDR, HOSTNAME,
-#            DOMAIN, USERNAME, CREDENTIAL, TOKEN, HASH, UUID, AWS_ACCESS_KEY,
-#            JWT, PHONE, OTHER). Unknown types fall back to OTHER.
+#   type:    one of the entity types declared in
+#              src/anonymizer_guardrail/detector/base.py → ENTITY_TYPES
+#            (single source of truth — check that file for the current list).
+#            Unknown types fall back to OTHER. Each known type has a matching
+#            generator in surrogate.py:_GENERATOR_SPEC.
 #   pattern: a Python regex string (use single quotes to avoid YAML escaping).
 #   flags:   optional list of re.<flag> names — IGNORECASE, MULTILINE, DOTALL,
 #            VERBOSE, ASCII. Inline flags like (?i)…(?-i) work too.
@@ -15,8 +15,9 @@
 # Top-level `extends:` (string or list of strings) inherits another file's
 # patterns. Bare filenames look up bundled files (e.g. `extends:
 # regex_default.yaml`); paths with a slash are filesystem paths resolved
-# relative to the file containing the directive. Inherited patterns load
-# first, then this file's own — first-match-wins ordering still applies.
+# relative to the file containing the directive. THIS file's own patterns
+# load FIRST, then the inherited chain — child-overrides-parent semantics.
+# So if you write a stricter version of an inherited pattern, yours wins.
 #
 # Ordering matters: when patterns hit overlapping spans, the FIRST match wins.
 # Put more specific patterns above more general ones (CIDR before bare IP,
@@ -63,6 +64,30 @@ patterns:
   - type: HASH
     pattern: '\b[a-fA-F0-9]{32}\b'
     note: MD5
+
+  # ── Credit card numbers ────────────────────────────────────────────────────
+  # Major-brand prefixes + length, optional space/hyphen group separators.
+  # Doesn't validate the Luhn checksum — Python re can't — but the prefix +
+  # length combo is tight enough to keep false-positives manageable. Placed
+  # BEFORE the loose phone pattern so a 16-digit card doesn't get partially
+  # eaten by the phone regex.
+  - type: CREDIT_CARD
+    pattern: '\b(?:4\d{3}(?:[- ]?\d{4}){3}|5[1-5]\d{2}(?:[- ]?\d{4}){3}|3[47]\d{2}[- ]?\d{6}[- ]?\d{5}|6011(?:[- ]?\d{4}){3})\b'
+    note: Visa / Mastercard / Amex / Discover
+
+  # ── IBAN (international bank account number) ───────────────────────────────
+  # 2-letter country code + 2 check digits + 11–30 alphanumerics (BBAN).
+  # Strict uppercase: lowercase IBANs are non-standard and frequently match
+  # other prose by accident.
+  - type: IBAN
+    pattern: '\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b'
+
+  # ── Date of birth (label-anchored) ─────────────────────────────────────────
+  # Plain dates aren't reliably PII (timestamps, version numbers, etc.) —
+  # only the labelled form is. Capture group narrows the entity span to just
+  # the date so the surrogate replaces only the value, not the label.
+  - type: DATE_OF_BIRTH
+    pattern: '(?i)\b(?:Date\s+of\s+Birth|Birthdate|Birthday|Born|D\.?O\.?B\.?|DOB)\s*[:=]\s*(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4})\b'
 
   # ── Phone (loose; international or US) ─────────────────────────────────────
   - type: PHONE

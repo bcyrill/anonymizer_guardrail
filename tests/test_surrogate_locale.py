@@ -290,6 +290,32 @@ def test_resolve_salt_empty_returns_random_bytes() -> None:
     assert a != b
 
 
+@pytest.mark.parametrize(
+    "entity_type,sample_input",
+    [
+        ("ADDRESS",       "123 Main St, Springfield, IL 62701"),
+        ("CREDIT_CARD",   "4111-1111-1111-1111"),
+        ("DATE_OF_BIRTH", "1985-04-15"),
+        ("IBAN",          "DE89370400440532013000"),
+        ("NATIONAL_ID",   "123-45-6789"),
+    ],
+)
+def test_new_pii_types_produce_realistic_surrogates(
+    monkeypatch: pytest.MonkeyPatch, entity_type: str, sample_input: str
+) -> None:
+    """The 5 newly-added Faker-backed types must each produce a non-empty
+    surrogate that's distinct from the original. Catches Faker calls that
+    return None, datetime objects, multi-line strings, etc."""
+    monkeypatch.setattr(surrogate_mod, "config", _fake_config())
+    gen = surrogate_mod.SurrogateGenerator()
+    out = gen.for_match(Match(text=sample_input, entity_type=entity_type))
+    assert isinstance(out, str) and out
+    assert out != sample_input
+    # ADDRESS in particular must not contain newlines — Faker.address()
+    # is multi-line by default and we collapse to single line.
+    assert "\n" not in out
+
+
 def test_zero_or_negative_cap_floored_to_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

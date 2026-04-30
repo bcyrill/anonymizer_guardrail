@@ -270,7 +270,9 @@ podman run --rm -p 8000:8000 \
 
 Or supply your own file. Each entry is `{type, pattern, flags?}`; `extends:`
 inherits another file's patterns (bare filename → bundled lookup, path with
-`/` → on-disk). When a pattern declares one or more capturing groups, the
+`/` → on-disk). Your file's own patterns load **first**, then the inherited
+chain — child-overrides-parent semantics, so a stricter local pattern wins
+over a looser one inherited from default. When a pattern declares one or more capturing groups, the
 first non-None group's span is treated as the entity (lets a labeled
 pattern like `password:\s+(\S+)` anonymize only the value, not the label).
 Patterns without groups still anonymize the full match. All patterns

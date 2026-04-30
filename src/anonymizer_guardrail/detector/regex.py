@@ -240,18 +240,24 @@ def _load_recursive(
     seen = seen | {source}
 
     data = _parse_yaml(text, source)
-    extended: list[tuple[str, re.Pattern[str]]] = []
+    # Order matters because the detector is first-match-wins on overlapping
+    # spans. Conventional inheritance semantics: a file's OWN patterns take
+    # precedence over what it extends (child overrides parent). So we put
+    # local patterns first, then the extended chain. Without this, a loose
+    # default pattern (e.g. PHONE) could shadow a more specific pattern
+    # declared in the extending file (e.g. CPF in the pentest YAML).
+    out: list[tuple[str, re.Pattern[str]]] = []
+    out.extend(_compile_entries(data.get("patterns", []), source))
     for ext_text, ext_source in _resolve_extends(
         data.get("extends"), source, current_dir
     ):
         # `extends:` always resolves either to a bundled file (no on-disk
         # parent dir) or to a path we already absolutised, so children can
         # only use bundled extends themselves.
-        extended.extend(
+        out.extend(
             _load_recursive(ext_text, ext_source, None, seen, depth + 1)
         )
-    extended.extend(_compile_entries(data.get("patterns", []), source))
-    return extended
+    return out
 
 
 def _load_patterns() -> list[tuple[str, re.Pattern[str]]]:

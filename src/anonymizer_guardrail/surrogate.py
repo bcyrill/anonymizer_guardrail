@@ -133,6 +133,19 @@ _GENERATOR_SPEC: dict[str, _FakerGen | None] = {
     "UUID":           lambda f, _o: f.uuid4(),
     "MAC_ADDRESS":    lambda f, _o: f.mac_address(),
     "URL":            lambda f, _o: f.url(),
+    # Faker's address() returns multi-line ("street\ncity, state zip");
+    # collapse to single line so the surrogate doesn't introduce stray
+    # newlines into whatever text we're anonymizing.
+    "ADDRESS":        lambda f, _o: f.address().replace("\n", ", "),
+    "CREDIT_CARD":    lambda f, _o: f.credit_card_number(),
+    # ISO-format date string keeps the substitution unambiguous; Faker's
+    # date_of_birth() returns a datetime.date object that we'd otherwise
+    # have to coerce.
+    "DATE_OF_BIRTH":  lambda f, _o: f.date_of_birth().isoformat(),
+    "IBAN":           lambda f, _o: f.iban(),
+    # Locale-aware: en_US → SSN, pt_BR → CPF, etc. Operators set
+    # FAKER_LOCALE to match their data.
+    "NATIONAL_ID":    lambda f, _o: f.ssn(),
     # Always-opaque types: realism would mislead. Token/path varieties are
     # too broad for a single Faker provider to substitute meaningfully.
     "CREDENTIAL":     None,
