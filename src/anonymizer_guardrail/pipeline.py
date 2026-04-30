@@ -90,7 +90,7 @@ class Pipeline:
             config.llm_max_concurrency,
         )
 
-    def stats(self) -> dict[str, int | str]:
+    def stats(self) -> dict[str, int]:
         """Snapshot of pipeline-internal counters for the /health probe.
         All reads are cheap and lock-free."""
         cache_size, cache_max = self._surrogates.cache_stats()
