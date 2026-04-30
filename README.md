@@ -99,6 +99,7 @@ All knobs are environment variables; sensible defaults baked into
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
 | `SURROGATE_CACHE_MAX_SIZE` | `100000`             | LRU cap on the surrogate cache (cross-request consistency) |
+| `SURROGATE_SALT`  | *(empty → random)*            | blake2b key for surrogate hashes (see below) |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
 | `LLM_TIMEOUT_S`   | `30`                          |                                          |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
@@ -173,6 +174,37 @@ The prompt is loaded once at startup; restart the container to pick up
 edits. A missing/unreadable override path is a hard error rather than a
 silent fall-back to the bundled prompt — if you set the variable, we
 assume you mean it.
+
+### Surrogate salt (privacy hardening)
+
+Surrogate generation uses keyed BLAKE2b under the hood — both the seed for
+Faker and the opaque-token digest. The key is taken from `SURROGATE_SALT`,
+which defaults to a fresh 16-byte random value at process start.
+
+**Why it matters:** without keying, the opaque-token surrogate is literally
+a hash of the original (`[IPV4_ADDRESS_…]`). For low-entropy entity types
+— IPs, phones, MACs, names from a known list — an attacker with access to
+the surrogates (model-provider logs, LiteLLM access logs, anyone reading
+the upstream traffic) can pre-compute hashes for plausible inputs and
+recover the originals offline. The keyed hash defeats this: without the
+salt, candidate hashes don't match.
+
+**Defaults are safe.** If you set nothing, you get a fresh random 128-bit
+salt every restart. Surrogates from before a restart are uncorrelatable
+with surrogates from after.
+
+**Set `SURROGATE_SALT` to a stable string** if you want surrogates to
+remain stable across restarts — useful for log-correlation analysis but
+gives up the brute-force protection if the salt leaks. Pick one per
+deployment; never share between unrelated environments.
+
+```bash
+# Default: process-random salt, strongest privacy.
+podman run anonymizer-guardrail:latest
+
+# Stable surrogates across restarts (operator opted in):
+podman run -e SURROGATE_SALT=$(openssl rand -hex 32) anonymizer-guardrail:latest
+```
 
 ### Disabling Faker
 

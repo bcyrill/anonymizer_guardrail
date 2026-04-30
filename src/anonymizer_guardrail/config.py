@@ -78,6 +78,14 @@ class Config:
     # you have very chatty users; lower (or zero, effectively disabling)
     # if memory is tight and per-request consistency is enough.
     surrogate_cache_max_size: int = _env_int("SURROGATE_CACHE_MAX_SIZE", 100_000)
+    # Secret keying material mixed into the blake2b hashes the surrogate
+    # generator uses (both the Faker seed and the opaque-token digest).
+    # Empty (the default) → a fresh 16-byte random salt is generated each
+    # time the process starts. Set to a fixed string to keep surrogates
+    # stable across restarts (useful for log-correlation analysis, but
+    # weakens privacy: the salt becomes ambient and attackers who learn
+    # it can brute-force low-entropy entities like IPs and phone numbers).
+    surrogate_salt: str = os.getenv("SURROGATE_SALT", "")
     # Hard cap on input size sent to the LLM in one call. Inputs above this
     # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
     # silently truncated — truncating in a guardrail would let everything past

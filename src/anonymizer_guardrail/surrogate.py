@@ -16,11 +16,25 @@ Determinism guarantees, in order of strictness:
     produce a *different* surrogate for the same input. Bounded by
     SURROGATE_CACHE_MAX_SIZE — raise the cap if your conversations are
     long enough to outlive default eviction.
+  * **Across process restarts**: by default surrogates change after a
+    restart because we mix a process-random salt into the blake2b keys.
+    Set SURROGATE_SALT to a fixed value to keep surrogates stable across
+    restarts; see _resolve_salt below for the privacy trade-off.
+
+Privacy rationale for the salt: without it, the opaque-token surrogate
+literally IS a hash of the original (e.g. `[IP_ADDRESS_…]`). For low-
+entropy entity types — IPs, phones, MACs, names from a known list — an
+attacker with access to surrogates (model-provider logs, LiteLLM logs,
+etc.) can brute-force candidate inputs offline and match the hash.
+Mixing in a per-process secret defeats that attack: the attacker would
+need the salt to compute candidate hashes, and the salt never leaves
+process memory unless the operator opts into a stable SURROGATE_SALT.
 """
 
 from __future__ import annotations
 
 import hashlib
+import secrets
 import threading
 from collections import OrderedDict
 from typing import Callable
@@ -30,6 +44,28 @@ from faker import Faker
 from .config import config
 from .detector.base import Match
 
+# blake2b accepts a key up to 64 bytes — anything longer is rejected at
+# hash construction. We truncate to be safe.
+_MAX_BLAKE2B_KEY_LEN = 64
+
+
+def _resolve_salt(raw: str) -> bytes:
+    """Return blake2b key bytes for the surrogate hashes.
+
+    Empty `raw` → fresh 16 bytes from `secrets.token_bytes`. After process
+    restart, the salt is different and surrogates change accordingly,
+    breaking offline brute-force of low-entropy entity types (IPs, phones,
+    MACs, names from a known list).
+
+    Non-empty `raw` → the literal string, UTF-8-encoded and truncated to
+    64 bytes. Stable across restarts; useful when an operator wants to
+    correlate surrogates over time, at the cost of letting an attacker
+    who learns the salt brute-force the same low-entropy entities.
+    """
+    if raw:
+        return raw.encode("utf-8")[:_MAX_BLAKE2B_KEY_LEN]
+    return secrets.token_bytes(16)
+
 
 def _parse_locales(raw: str) -> list[str] | None:
     """Convert FAKER_LOCALE into the form Faker expects (or None for default)."""
@@ -37,24 +73,37 @@ def _parse_locales(raw: str) -> list[str] | None:
     return cleaned or None
 
 
-def _seed_for(text: str, entity_type: str) -> int:
-    """Stable 64-bit seed derived from the original string + type."""
-    h = hashlib.blake2b(f"{entity_type}:{text}".encode(), digest_size=8).digest()
+def _seed_for(text: str, entity_type: str, salt: bytes) -> int:
+    """Stable 64-bit seed derived from the original string + type, keyed by
+    the per-process salt. Same input → same seed within a process; different
+    input or different process (with default random salt) → different seed.
+    """
+    h = hashlib.blake2b(
+        f"{entity_type}:{text}".encode(),
+        key=salt,
+        digest_size=8,
+    ).digest()
     return int.from_bytes(h, "big")
 
 
-def _opaque(prefix: str) -> Callable[[Faker, str], str]:
+def _opaque(prefix: str, salt: bytes) -> Callable[[Faker, str], str]:
     """Generator that emits a non-realistic but deterministic token.
 
     Used for things where realistic surrogates would be misleading (hashes,
     JWTs, raw credentials) — the upstream model doesn't need them to look
-    real, only to be consistent.
+    real, only to be consistent. The blake2b key prevents an attacker with
+    only the surrogate from inverting it via brute-force of plausible
+    inputs (which is otherwise feasible for low-entropy entities).
     """
 
     def gen(_fake: Faker, original: str) -> str:
-        # 8 hex chars from a fresh hash (independent of the seeded Faker so
-        # collisions across types stay unlikely).
-        digest = hashlib.blake2b(original.encode(), digest_size=4).hexdigest().upper()
+        # 8 hex chars from a fresh keyed hash (independent of the seeded
+        # Faker so collisions across types stay unlikely).
+        digest = hashlib.blake2b(
+            original.encode(),
+            key=salt,
+            digest_size=4,
+        ).hexdigest().upper()
         return f"[{prefix}_{digest}]"
 
     return gen
@@ -97,15 +146,16 @@ _GENERATOR_SPEC: dict[str, _FakerGen | None] = {
 }
 
 
-def _build_generators(use_faker: bool) -> dict[str, _FakerGen]:
+def _build_generators(use_faker: bool, salt: bytes) -> dict[str, _FakerGen]:
     """Materialize either the Faker-backed table (USE_FAKER=true) or the
-    all-opaque one (USE_FAKER=false) from the single _GENERATOR_SPEC."""
+    all-opaque one (USE_FAKER=false) from the single _GENERATOR_SPEC.
+    The salt is mixed into every opaque generator's blake2b key."""
     out: dict[str, _FakerGen] = {}
     for etype, faker_fn in _GENERATOR_SPEC.items():
         if use_faker and faker_fn is not None:
             out[etype] = faker_fn
         else:
-            out[etype] = _opaque(etype)
+            out[etype] = _opaque(etype, salt)
     return out
 
 
@@ -145,7 +195,10 @@ class SurrogateGenerator:
         self._lock = threading.Lock()
         self._use_faker = bool(config.use_faker)
         self._locales = _parse_locales(config.faker_locale)
-        self._generators = _build_generators(self._use_faker)
+        # Random per-process key by default; the operator can pin a stable
+        # value via SURROGATE_SALT for log-correlation use cases.
+        self._salt = _resolve_salt(config.surrogate_salt)
+        self._generators = _build_generators(self._use_faker, self._salt)
         self._fake: Faker | None = None
         if self._use_faker:
             # Instantiate once and reuse — Faker construction is ~1–2 ms;
@@ -179,7 +232,7 @@ class SurrogateGenerator:
                 self._cache.move_to_end(key)
                 return cached
 
-            seed = _seed_for(match.text, match.entity_type)
+            seed = _seed_for(match.text, match.entity_type, self._salt)
             gen = self._generators.get(match.entity_type, self._generators["OTHER"])
 
             # Try the natural surrogate first. Salt-retry on collision —

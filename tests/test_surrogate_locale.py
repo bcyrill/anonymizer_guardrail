@@ -20,6 +20,10 @@ def _fake_config(**overrides: Any) -> SimpleNamespace:
         faker_locale="",
         use_faker=True,
         surrogate_cache_max_size=10_000,
+        # Fixed salt for the bulk of tests so cross-instance
+        # determinism assertions hold. Tests that specifically exercise
+        # the random-salt behaviour override this with "".
+        surrogate_salt="test-fixed-salt",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -202,6 +206,88 @@ def test_evicted_surrogate_is_freed_for_collision_set(
     assert ("PERSON", "alice") not in gen._cache
     # The surrogate that "alice" used to hold is now free for re-issue.
     assert s_a not in gen._used_surrogates
+
+
+def test_empty_salt_yields_random_per_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SURROGATE_SALT='' must produce a different surrogate for the same
+    input across instances (each instance generates its own random salt
+    at construction). This is the privacy property: an attacker can't
+    pre-compute hashes without knowing the salt, and the salt rotates
+    on every restart."""
+    monkeypatch.setattr(
+        surrogate_mod, "config", _fake_config(use_faker=False, surrogate_salt="")
+    )
+    g1 = surrogate_mod.SurrogateGenerator()
+    g2 = surrogate_mod.SurrogateGenerator()
+    a = g1.for_match(Match(text="alice", entity_type="PERSON"))
+    b = g2.for_match(Match(text="alice", entity_type="PERSON"))
+    assert a != b, (
+        "with random salts the same input must produce different surrogates "
+        "across instances — otherwise the salt isn't doing its job"
+    )
+
+
+def test_fixed_salt_yields_stable_surrogate_across_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator-supplied fixed SURROGATE_SALT → same input maps to same
+    surrogate across instances/restarts. Documented use case: stable
+    log correlation."""
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, surrogate_salt="my-stable-salt"),
+    )
+    g1 = surrogate_mod.SurrogateGenerator()
+    g2 = surrogate_mod.SurrogateGenerator()
+    a = g1.for_match(Match(text="alice", entity_type="PERSON"))
+    b = g2.for_match(Match(text="alice", entity_type="PERSON"))
+    assert a == b
+
+
+def test_different_fixed_salts_yield_different_surrogates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two operators picking different SURROGATE_SALT values must see
+    disjoint surrogate spaces — useful when a multi-tenant deployment
+    fronts a per-tenant guardrail with a per-tenant salt."""
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, surrogate_salt="salt-A"),
+    )
+    a = surrogate_mod.SurrogateGenerator().for_match(
+        Match(text="alice", entity_type="PERSON")
+    )
+    monkeypatch.setattr(
+        surrogate_mod,
+        "config",
+        _fake_config(use_faker=False, surrogate_salt="salt-B"),
+    )
+    b = surrogate_mod.SurrogateGenerator().for_match(
+        Match(text="alice", entity_type="PERSON")
+    )
+    assert a != b
+
+
+def test_resolve_salt_truncates_oversize_input() -> None:
+    """blake2b rejects keys >64 bytes; _resolve_salt truncates rather
+    than erroring out so an over-eager 100-byte SURROGATE_SALT doesn't
+    crash the boot."""
+    big = "x" * 200
+    out = surrogate_mod._resolve_salt(big)
+    assert len(out) == 64
+
+
+def test_resolve_salt_empty_returns_random_bytes() -> None:
+    """Empty input → 16 random bytes. Two consecutive calls return
+    different values."""
+    a = surrogate_mod._resolve_salt("")
+    b = surrogate_mod._resolve_salt("")
+    assert len(a) == 16
+    assert a != b
 
 
 def test_zero_or_negative_cap_floored_to_one(
