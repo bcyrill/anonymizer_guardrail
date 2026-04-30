@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Push current branch and optionally cut a new vX.Y.Z tag.
 #
-# Triggers the GitHub Actions workflows in .github/workflows/:
+# Pushing the branch does NOT trigger any GitHub Actions workflow on
+# its own — image builds and GitHub Releases are tag-driven only, so
+# day-to-day commits don't churn the container registry. Local testing
+# via scripts/build-image.sh covers the iteration loop.
+#
+# Pushing a tag triggers the workflows in .github/workflows/:
 #   - publish-image.yml  (builds & pushes the container to ghcr.io)
-#   - release.yml        (creates a GitHub Release on tag push)
+#   - release.yml        (creates a GitHub Release; canonical tag only)
 #
 # After the canonical vX.Y.Z tag, the script optionally also pushes
 # flavour-variant tags pointing at the same commit:

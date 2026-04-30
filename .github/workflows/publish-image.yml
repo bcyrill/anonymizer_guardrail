@@ -1,11 +1,15 @@
 name: Publish container image
 
 # Triggers:
-#   - push to main          → slim image, tagged :latest + :sha-XXX
 #   - push of vX.Y.Z        → slim image, tagged :vX.Y.Z (+ semver siblings)
 #   - push of vX.Y.Z+pf     → pf image, tagged :vX.Y.Z-pf
 #   - push of vX.Y.Z+pf-baked → pf-baked image, tagged :vX.Y.Z-pf-baked
 #   - workflow_dispatch     → operator picks the flavour from a dropdown
+#
+# Branch pushes do NOT trigger image builds — most testing happens
+# locally via scripts/build-image.sh and scripts/run_container.sh, and
+# building a fresh image on every commit was producing too much registry
+# churn. Use workflow_dispatch if you need an ad-hoc build off a branch.
 #
 # Each tag publishes ONE flavour. To publish all three for a given
 # version, push three tags pointing at the same commit
@@ -13,7 +17,6 @@ name: Publish container image
 
 on:
   push:
-    branches: [main]
     tags: ['v*.*.*']  # also matches v*.*.*+pf and v*.*.*+pf-baked
   workflow_dispatch:
     inputs:
@@ -115,6 +118,11 @@ jobs:
       # `latest`, via docker/metadata-action's `flavor: suffix=…,onlatest=true`.
       # That gives us :v1.0.0-pf, :latest-pf, :sha-…-pf etc. for the pf
       # flavour, while slim (suffix="") keeps the original :v1.0.0, :latest, …
+      #
+      # `latest=auto` (metadata-action's default) only tags :latest when
+      # the ref is a stable semver — pre-release tags like v1.0.0-rc1
+      # still get :v1.0.0-rc1 but not :latest. Branch refs don't apply
+      # since the workflow no longer triggers on them.
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -123,11 +131,9 @@ jobs:
           flavor: |
             suffix=${{ steps.flavor.outputs.suffix }},onlatest=true
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
