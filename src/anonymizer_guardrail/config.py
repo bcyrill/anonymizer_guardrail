@@ -97,6 +97,16 @@ class Config:
     # Example:
     #   DENYLIST_REGISTRY="legal=/etc/anon/legal-deny.yaml,marketing=/etc/anon/marketing-deny.yaml"
     denylist_registry: str = os.getenv("DENYLIST_REGISTRY", "")
+    # Matching backend for the denylist detector:
+    #   - "regex" (default) — Python `re` alternation. Pure stdlib, fast
+    #                          for low-thousands of entries.
+    #   - "aho"             — Aho-Corasick via pyahocorasick. Sub-linear
+    #                          in pattern count; pays off above ~5k entries
+    #                          or when match latency matters more than
+    #                          install size. Requires the
+    #                          `denylist-aho` optional extra.
+    # Validated at startup; an unknown value crashes loud.
+    denylist_backend: str = os.getenv("DENYLIST_BACKEND", "regex").strip().lower()
     # How the regex detector resolves overlapping matches between patterns:
     #   - "longest"  pick the longest match span (default). Robust against
     #                a child YAML's narrow pattern shadowing a parent's

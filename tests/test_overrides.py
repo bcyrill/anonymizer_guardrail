@@ -383,18 +383,18 @@ def test_denylist_registry_loader_compiles_each_entry(tmp_path) -> None:
     fake_cfg = SimpleNamespace(
         denylist_path="",
         denylist_registry=f"legal={p_legal},marketing={p_mkt}",
+        denylist_backend="regex",
     )
     import unittest.mock
     with unittest.mock.patch.object(deny_mod, "config", fake_cfg):
         registry = deny_mod._load_registry()
     assert set(registry) == {"legal", "marketing"}
-    # Each compiled index has at least one of the two patterns set —
-    # confirms the loader did real work, not just bookkeeping.
-    for name, idx in registry.items():
-        cs, ci, _, _ = idx
-        assert cs is not None or ci is not None, (
-            f"{name} compiled to an empty index"
-        )
+    # Each compiled index is a candidate-generator function — calling it
+    # against a string containing the value should yield one match.
+    for name, candidates_fn in registry.items():
+        sample = f"prefix {('ACME-LEGAL' if name == 'legal' else 'ACME-MKT')} suffix"
+        out = candidates_fn(sample)
+        assert len(out) == 1, f"{name} compiled to an empty/wrong index: {out}"
 
 
 # ── Faker LRU cache bound (OOM safety) ──────────────────────────────────────

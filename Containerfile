@@ -105,6 +105,12 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # pulling a different (possibly CUDA-fattened) build from the default
 # PyPI index.
 #
+# `denylist-aho` (pyahocorasick) is included unconditionally — it's a
+# ~600 KB C extension with prebuilt wheels for every platform that
+# matters, and including it lets operators flip DENYLIST_BACKEND=aho
+# at runtime without rebuilding the image. Direct `pip install` users
+# can still opt out via the regex backend (default) and skip the extra.
+#
 # `--mount=type=cache,target=/root/.cache/pip` keeps the wheel cache
 # across builds (rebuilds with the same pyproject.toml are nearly
 # instant; even after a dep bump, only the changed wheels download).
@@ -114,9 +120,9 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$WITH_PRIVACY_FILTER" = "true" ]; then \
         pip install --index-url "$TORCH_INDEX_URL" torch \
-     && pip install ".[privacy-filter]"; \
+     && pip install ".[privacy-filter,denylist-aho]"; \
     else \
-        pip install .; \
+        pip install ".[denylist-aho]"; \
     fi
 
 # HF cache lives at a known path so operators can mount a named volume

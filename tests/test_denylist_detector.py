@@ -20,14 +20,25 @@ def _fake_config(**overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _detector_with(entries_yaml: str, tmp_path) -> deny_mod.DenylistDetector:
+def _detector_with(
+    entries_yaml: str, tmp_path, *, backend: str | None = None,
+) -> deny_mod.DenylistDetector:
     """Build a detector wired to a tmp YAML file. Avoids touching the
-    module-level _DEFAULT_INDEX so tests don't leak into each other."""
+    module-level _DEFAULT_INDEX so tests don't leak into each other.
+    `backend` defaults to whatever the import-time config picked
+    (regex); the cross-backend equivalence tests below override it."""
     p = tmp_path / "deny.yaml"
     p.write_text(entries_yaml, encoding="utf-8")
     entries = deny_mod._load_entries(str(p), "DENYLIST_PATH")
     detector = deny_mod.DenylistDetector()
-    detector._default_index = deny_mod._build_index(entries)  # type: ignore[attr-defined]
+    if backend is None:
+        detector._default_index = deny_mod._build_index(entries)  # type: ignore[attr-defined]
+    elif backend == "regex":
+        detector._default_index = deny_mod._build_index_regex(entries)  # type: ignore[attr-defined]
+    elif backend == "aho":
+        detector._default_index = deny_mod._build_index_aho(entries)  # type: ignore[attr-defined]
+    else:
+        raise ValueError(f"unknown backend in test helper: {backend!r}")
     return detector
 
 
@@ -349,3 +360,202 @@ async def test_pipeline_uses_denylist_alongside_regex(
     # And the original strings must be gone from the output.
     assert "AcmeCorpInternal" not in modified[0]
     assert "alice@example.com" not in modified[0]
+
+
+# ── Cross-backend equivalence ───────────────────────────────────────────────
+# The Aho-Corasick backend is opt-in (DENYLIST_BACKEND=aho). Wherever its
+# behaviour MUST match the regex backend, parametrize over both so the
+# two paths can't drift silently. The matrix below is the canonical set
+# of behaviours each backend has to honour: basic match, case sensitivity
+# (default + opt-out), word boundaries (default + opt-out), multi-word
+# entries, longest-wins overlap, and clean handling of an empty input.
+
+_BACKENDS = ["regex", "aho"]
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_basic_match(backend: str, tmp_path) -> None:
+    detector = _detector_with(
+        "entries:\n  - type: ORGANIZATION\n    value: Acme\n",
+        tmp_path, backend=backend,
+    )
+    matches = await detector.detect("I work at Acme today")
+    assert [(m.text, m.entity_type) for m in matches] == [("Acme", "ORGANIZATION")]
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_case_sensitive_default(backend: str, tmp_path) -> None:
+    detector = _detector_with(
+        "entries:\n  - type: ORGANIZATION\n    value: Acme\n",
+        tmp_path, backend=backend,
+    )
+    assert await detector.detect("acme corp") == []
+    assert len(await detector.detect("Acme")) == 1
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_case_insensitive(backend: str, tmp_path) -> None:
+    yaml_text = (
+        "entries:\n"
+        "  - type: ORGANIZATION\n"
+        "    value: Acme\n"
+        "    case_sensitive: false\n"
+    )
+    detector = _detector_with(yaml_text, tmp_path, backend=backend)
+    matches = await detector.detect("acme + ACME + Acme")
+    # Source casing is preserved on each match — matters for the surrogate
+    # replacer, which has to find the exact substring back in the text.
+    assert sorted(m.text for m in matches) == ["ACME", "Acme", "acme"]
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_word_boundary_default(backend: str, tmp_path) -> None:
+    detector = _detector_with(
+        "entries:\n  - type: PERSON\n    value: Bob\n",
+        tmp_path, backend=backend,
+    )
+    # Default is word_boundary: true → "Bob" doesn't match inside "Bobby".
+    assert await detector.detect("Bobby works for Robert") == []
+    # But matches at word edges fine.
+    matches = await detector.detect("Bob and Bob's office")
+    assert all(m.text == "Bob" for m in matches)
+    assert len(matches) == 2
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_word_boundary_disabled(backend: str, tmp_path) -> None:
+    yaml_text = (
+        "entries:\n"
+        "  - type: PERSON\n"
+        "    value: Bob\n"
+        "    word_boundary: false\n"
+    )
+    detector = _detector_with(yaml_text, tmp_path, backend=backend)
+    # With word boundaries off, "Bobby" yields one substring match plus
+    # the standalone "Bob".
+    matches = await detector.detect("Bobby and Bob")
+    assert len(matches) == 2
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_longest_wins_overlap(backend: str, tmp_path) -> None:
+    yaml_text = (
+        "entries:\n"
+        "  - type: ORGANIZATION\n"
+        "    value: Acme\n"
+        "  - type: ORGANIZATION\n"
+        "    value: Acme Corp\n"
+    )
+    detector = _detector_with(yaml_text, tmp_path, backend=backend)
+    matches = await detector.detect("I work at Acme Corp downtown")
+    assert [m.text for m in matches] == ["Acme Corp"]
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_multi_word_term(backend: str, tmp_path) -> None:
+    detector = _detector_with(
+        "entries:\n  - type: ORGANIZATION\n    value: Project Aurora\n",
+        tmp_path, backend=backend,
+    )
+    matches = await detector.detect("update on Project Aurora today")
+    assert [m.text for m in matches] == ["Project Aurora"]
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+async def test_xb_empty_input(backend: str, tmp_path) -> None:
+    detector = _detector_with(
+        "entries:\n  - type: PERSON\n    value: Bob\n",
+        tmp_path, backend=backend,
+    )
+    assert await detector.detect("") == []
+
+
+# ── Aho-specific edge cases ─────────────────────────────────────────────────
+# Word boundaries are baked into the regex via `\b` but post-filtered for
+# Aho-Corasick. These tests cover the post-filter directly to make sure
+# the behaviour matches `\b` on values whose edges are non-word chars
+# (where `_wrap_with_boundaries` skips the boundary on the regex side too).
+
+
+def test_aho_word_boundary_helper_skips_non_word_edges() -> None:
+    """A value like ":foo:" has non-word edges, so neither side should
+    enforce a word boundary. Mirrors the regex side's edge handling."""
+    text = "abc :foo: xyz"
+    start = text.index(":foo:")
+    end = start + len(":foo:")
+    assert deny_mod._has_word_boundaries(text, start, end) is True
+
+
+def test_aho_word_boundary_helper_blocks_inside_word() -> None:
+    """`Bob` inside `Bobby` — left edge fine (start of word), right edge
+    fails because `B` is followed by `b` (both word chars)."""
+    text = "Bobby"
+    assert deny_mod._has_word_boundaries(text, 0, 3) is False
+
+
+def test_aho_word_boundary_helper_allows_at_string_boundaries() -> None:
+    text = "Bob"
+    assert deny_mod._has_word_boundaries(text, 0, 3) is True
+
+
+# ── Backend dispatch / failure modes ────────────────────────────────────────
+
+
+def test_invalid_backend_value_crashes_at_import(monkeypatch) -> None:
+    """An unknown DENYLIST_BACKEND value must surface immediately at boot
+    so a typo doesn't ship with a silent regex fallback. Re-import the
+    detector module against a fake config (the real Config dataclass is
+    frozen, so we swap the binding the module reads from)."""
+    import importlib
+    import sys
+    from types import SimpleNamespace
+    import anonymizer_guardrail.config as cfg_mod
+
+    fake_cfg = SimpleNamespace(
+        denylist_path="",
+        denylist_registry="",
+        denylist_backend="bogus",
+    )
+    monkeypatch.setattr(cfg_mod, "config", fake_cfg)
+    sys.modules.pop("anonymizer_guardrail.detector.denylist", None)
+    try:
+        with pytest.raises(RuntimeError, match="Invalid DENYLIST_BACKEND"):
+            importlib.import_module("anonymizer_guardrail.detector.denylist")
+    finally:
+        # Re-import the real module so subsequent tests see the
+        # production-config singleton (and the module-level _DEFAULT_INDEX
+        # is rebuilt against the real config).
+        sys.modules.pop("anonymizer_guardrail.detector.denylist", None)
+        monkeypatch.undo()
+        importlib.import_module("anonymizer_guardrail.detector.denylist")
+
+
+def test_aho_backend_without_pyahocorasick_fails_with_clear_message(
+    monkeypatch,
+) -> None:
+    """Operator opted into DENYLIST_BACKEND=aho but didn't install the
+    extra → the build call must raise a RuntimeError that names the
+    pip extra. Simulated by hiding `ahocorasick` at import time."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "ahocorasick":
+            raise ImportError("simulated: ahocorasick is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(RuntimeError, match="pyahocorasick"):
+        deny_mod._build_index_aho(
+            [{"type": "PERSON", "value": "Alice",
+              "case_sensitive": True, "word_boundary": True}]
+        )
+
+
+def test_aho_empty_entries_returns_no_op_index() -> None:
+    """Building an aho index from zero entries must not construct a
+    half-initialised automaton — it returns the no-op constant just like
+    the regex backend."""
+    fn = deny_mod._build_index_aho([])
+    assert fn is deny_mod._EMPTY_CANDIDATES
+    assert fn("any text") == []

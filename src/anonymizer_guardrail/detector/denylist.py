@@ -24,7 +24,7 @@ import logging
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -212,17 +212,29 @@ def _load_entries(
     return out
 
 
-def _build_index(
-    entries: list[dict[str, Any]],
-) -> tuple[re.Pattern[str] | None, re.Pattern[str] | None, dict[str, str], dict[str, str]]:
-    """Return (case_sensitive_pattern, case_insensitive_pattern,
-    cs_lookup, ci_lookup).
+# A compiled denylist is a callable: text → list of (start, end, value, type)
+# candidates. Both supported backends (regex and Aho-Corasick) materialize
+# into the same shape so `DenylistDetector.detect` runs the same overlap
+# resolution regardless of which one built the index. An empty index
+# (no entries loaded) is `_EMPTY_CANDIDATES` — a no-op constant — rather
+# than None, so callers don't need a "did this load anything?" branch.
+_Candidate = tuple[int, int, str, str]
+_CandidatesFn = Callable[[str], list[_Candidate]]
 
-    The two lookup dicts map matched substrings back to their
-    operator-declared entity type. The case-insensitive lookup is keyed
-    by the lowercased value; at match time we lowercase the matched
-    text before looking it up.
-    """
+
+def _empty_candidates(_text: str) -> list[_Candidate]:
+    return []
+
+
+_EMPTY_CANDIDATES: _CandidatesFn = _empty_candidates
+
+
+# ── Regex backend (default) ────────────────────────────────────────────────
+def _build_index_regex(entries: list[dict[str, Any]]) -> _CandidatesFn:
+    """Compile entries into two re.Patterns (case-sensitive +
+    case-insensitive) closed over a candidate-emitter. Word boundaries
+    are baked into each pattern fragment by `_wrap_with_boundaries`, so
+    nothing else has to know about them at match time."""
     cs_alts: list[_Entry] = []
     ci_alts: list[_Entry] = []
     cs_lookup: dict[str, str] = {}
@@ -243,31 +255,156 @@ def _build_index(
             ci_lookup[e["value"].lower()] = e["type"]
     cs_pattern = _compile_entries(cs_alts, case_sensitive=True)
     ci_pattern = _compile_entries(ci_alts, case_sensitive=False)
-    return cs_pattern, ci_pattern, cs_lookup, ci_lookup
+    if cs_pattern is None and ci_pattern is None:
+        return _EMPTY_CANDIDATES
+
+    def collect(text: str) -> list[_Candidate]:
+        out: list[_Candidate] = []
+        if cs_pattern is not None:
+            for m in cs_pattern.finditer(text):
+                value = m.group(0)
+                etype = cs_lookup.get(value)
+                if etype is None:
+                    # Defensive: a substring matched our pattern but the
+                    # lookup table doesn't know it. Shouldn't happen
+                    # given how we build both from the same entries —
+                    # skip rather than emit an OTHER-typed mystery.
+                    continue
+                out.append((m.start(), m.end(), value, etype))
+        if ci_pattern is not None:
+            for m in ci_pattern.finditer(text):
+                value = m.group(0)
+                etype = ci_lookup.get(value.lower())
+                if etype is None:
+                    continue
+                out.append((m.start(), m.end(), value, etype))
+        return out
+
+    return collect
 
 
-# A complete compiled-and-indexed denylist: the two regex patterns
-# (case-sensitive / case-insensitive — either may be None when no
-# entries of that kind exist) plus the lookup tables that map a matched
-# substring back to its operator-declared entity type.
-_Index = tuple[
-    re.Pattern[str] | None,  # case-sensitive pattern
-    re.Pattern[str] | None,  # case-insensitive pattern
-    dict[str, str],          # case-sensitive lookup (value → type)
-    dict[str, str],          # case-insensitive lookup (lowercased value → type)
-]
+# ── Aho-Corasick backend ───────────────────────────────────────────────────
+def _has_word_boundaries(text: str, start: int, end: int) -> bool:
+    """Mimic `\\b` post-hoc on an Aho-Corasick match span. Only enforce
+    a boundary on a side where the matched value's edge is itself a
+    word character — same rule `_wrap_with_boundaries` uses on the regex
+    side, so behaviour stays identical across backends.
+    """
+    if start < 0 or end > len(text) or start >= end:
+        return False
+    left_in_word = text[start].isalnum() or text[start] == "_"
+    if left_in_word and start > 0:
+        prev = text[start - 1]
+        if prev.isalnum() or prev == "_":
+            return False
+    right_in_word = text[end - 1].isalnum() or text[end - 1] == "_"
+    if right_in_word and end < len(text):
+        nxt = text[end]
+        if nxt.isalnum() or nxt == "_":
+            return False
+    return True
 
 
-def _load_registry() -> dict[str, _Index]:
+def _build_index_aho(entries: list[dict[str, Any]]) -> _CandidatesFn:
+    """Compile entries into two Aho-Corasick automatons (case-sensitive +
+    case-insensitive). The case-insensitive one's keys are lowercased
+    and the matcher runs against `text.lower()`; the original `text` is
+    sliced for the Match so source casing survives.
+
+    Word boundaries can't be expressed in the automaton itself (it's
+    pure literal matching), so each entry's `word_boundary` preference
+    is attached to its payload and applied as a post-filter on the
+    candidate span."""
+    try:
+        import ahocorasick  # noqa: WPS433 — lazy import keeps the module loadable without the extra
+    except ImportError as exc:
+        raise RuntimeError(
+            "DENYLIST_BACKEND=aho requires the `pyahocorasick` package. "
+            "Install with `pip install \"anonymizer-guardrail[denylist-aho]\"` "
+            "or set DENYLIST_BACKEND=regex to fall back to the stdlib backend."
+        ) from exc
+
+    cs_automaton: Any | None = None
+    ci_automaton: Any | None = None
+    for e in entries:
+        # Payload: (entity_type, word_boundary, len_value). The length
+        # is needed because pyahocorasick's iter() returns end-inclusive
+        # offsets only, and we have to recover the start position.
+        payload = (e["type"], e["word_boundary"], len(e["value"]))
+        if e["case_sensitive"]:
+            if cs_automaton is None:
+                cs_automaton = ahocorasick.Automaton()
+            cs_automaton.add_word(e["value"], payload)
+        else:
+            if ci_automaton is None:
+                ci_automaton = ahocorasick.Automaton()
+            ci_automaton.add_word(e["value"].lower(), payload)
+    if cs_automaton is not None:
+        cs_automaton.make_automaton()
+    if ci_automaton is not None:
+        ci_automaton.make_automaton()
+    if cs_automaton is None and ci_automaton is None:
+        return _EMPTY_CANDIDATES
+
+    def collect(text: str) -> list[_Candidate]:
+        out: list[_Candidate] = []
+        if cs_automaton is not None:
+            for end_inclusive, (etype, word_boundary, length) in cs_automaton.iter(text):
+                start = end_inclusive - length + 1
+                end = end_inclusive + 1
+                if word_boundary and not _has_word_boundaries(text, start, end):
+                    continue
+                out.append((start, end, text[start:end], etype))
+        if ci_automaton is not None:
+            lowered = text.lower()
+            for end_inclusive, (etype, word_boundary, length) in ci_automaton.iter(lowered):
+                start = end_inclusive - length + 1
+                end = end_inclusive + 1
+                if word_boundary and not _has_word_boundaries(text, start, end):
+                    continue
+                # Slice the ORIGINAL text so the Match preserves the
+                # caller's casing — the surrogate-replacer needs to find
+                # this exact substring in the source on substitution.
+                out.append((start, end, text[start:end], etype))
+        return out
+
+    return collect
+
+
+# ── Backend dispatch ───────────────────────────────────────────────────────
+_VALID_BACKENDS = frozenset({"regex", "aho"})
+
+if config.denylist_backend not in _VALID_BACKENDS:
+    raise RuntimeError(
+        f"Invalid DENYLIST_BACKEND={config.denylist_backend!r}. "
+        f"Allowed: {', '.join(sorted(_VALID_BACKENDS))}."
+    )
+
+
+def _build_index(entries: list[dict[str, Any]]) -> _CandidatesFn:
+    """Compile entries via the configured backend.
+
+    Backend is read from `config.denylist_backend` (validated at module
+    import). Each call to `_build_index` honours the *current* config —
+    tests that monkeypatch the backend can re-build a registry from
+    scratch and exercise the alternative path without restarting the
+    interpreter.
+    """
+    if config.denylist_backend == "aho":
+        return _build_index_aho(entries)
+    return _build_index_regex(entries)
+
+
+def _load_registry() -> dict[str, _CandidatesFn]:
     """Compile every entry in DENYLIST_REGISTRY at startup.
 
-    Returns a dict mapping registry name → compiled index. Validation
-    is the same as the default path: typos / unreadable files / bad
-    schemas crash boot loudly rather than at first request.
+    Returns a dict mapping registry name → compiled candidates fn.
+    Validation is the same as the default path: typos / unreadable
+    files / bad schemas crash boot loudly rather than at first request.
     """
     raw = config.denylist_registry
     pairs = parse_named_path_registry(raw, "DENYLIST_REGISTRY")
-    out: dict[str, _Index] = {}
+    out: dict[str, _CandidatesFn] = {}
     for name, path in pairs.items():
         entries = _load_entries(path, f"DENYLIST_REGISTRY[{name}]")
         out[name] = _build_index(entries)
@@ -300,19 +437,20 @@ class DenylistDetector:
     name = "denylist"
 
     def __init__(self) -> None:
-        self._default_index: _Index = _DEFAULT_INDEX
-        self._registry: dict[str, _Index] = _REGISTRY
+        self._default_index: _CandidatesFn = _DEFAULT_INDEX
+        self._registry: dict[str, _CandidatesFn] = _REGISTRY
         if not _LOADED_ENTRIES:
             log.info(
                 "Denylist detector loaded with no default entries (DENYLIST_PATH "
                 "is unset or the file has no entries). %d named alternative(s) "
-                "registered.", len(_REGISTRY),
+                "registered. Backend=%s.",
+                len(_REGISTRY), config.denylist_backend,
             )
         else:
             log.info(
                 "Denylist detector ready — %d default entries, %d named "
-                "alternative(s).",
-                len(_LOADED_ENTRIES), len(_REGISTRY),
+                "alternative(s). Backend=%s.",
+                len(_LOADED_ENTRIES), len(_REGISTRY), config.denylist_backend,
             )
 
     async def detect(
@@ -326,7 +464,7 @@ class DenylistDetector:
         regex_patterns / llm_prompt overrides; keeps the request from
         being blocked by a typo in the override.
         """
-        index = self._default_index
+        candidates_fn = self._default_index
         if denylist_name and denylist_name != "default":
             named = self._registry.get(denylist_name)
             if named is None:
@@ -336,32 +474,16 @@ class DenylistDetector:
                     denylist_name, sorted(self._registry) or "<empty>",
                 )
             else:
-                index = named
+                candidates_fn = named
 
-        cs_pattern, ci_pattern, cs_lookup, ci_lookup = index
-        if not text or (cs_pattern is None and ci_pattern is None):
+        if not text:
             return []
-        # Pass 1: gather every candidate match span from both compiled
-        # patterns. Each candidate is (start, end, value, type).
-        candidates: list[tuple[int, int, str, str]] = []
-        if cs_pattern is not None:
-            for m in cs_pattern.finditer(text):
-                value = m.group(0)
-                etype = cs_lookup.get(value)
-                if etype is None:
-                    # Defensive: a substring matched our pattern but the
-                    # lookup table doesn't know it. Shouldn't happen
-                    # given how we build both from the same entries —
-                    # skip rather than emit an OTHER-typed mystery.
-                    continue
-                candidates.append((m.start(), m.end(), value, etype))
-        if ci_pattern is not None:
-            for m in ci_pattern.finditer(text):
-                value = m.group(0)
-                etype = ci_lookup.get(value.lower())
-                if etype is None:
-                    continue
-                candidates.append((m.start(), m.end(), value, etype))
+        # Pass 1: ask the configured backend for every candidate match
+        # span. Both regex and Aho-Corasick backends produce the same
+        # (start, end, value, type) shape; word-boundary filtering is
+        # already applied (baked into the regex pattern, post-filtered
+        # for aho), so we only need to resolve overlaps below.
+        candidates = list(candidates_fn(text))
 
         # Pass 2: greedy longest-first overlap resolution. Mirrors the
         # regex detector's `longest` strategy — same reasoning: when

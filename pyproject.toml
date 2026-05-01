@@ -36,6 +36,12 @@ privacy-filter = [
     "torch>=2.0",
     "transformers>=4.40",
 ]
+# Aho-Corasick backend for the denylist detector. Sub-linear in pattern
+# count, pays off above a few thousand entries. Default backend stays
+# regex (pure stdlib) — install this extra only when DENYLIST_BACKEND=aho.
+denylist-aho = [
+    "pyahocorasick>=2.0",
+]
 
 [project.scripts]
 anonymizer-guardrail = "anonymizer_guardrail.main:app"

@@ -213,6 +213,7 @@ All knobs are environment variables; sensible defaults baked into
 | `REGEX_OVERLAP_STRATEGY` | `longest`              | `longest` (longest match wins on overlapping spans) or `priority` (first pattern in YAML order wins). See *Regex overlap resolution* below. |
 | `DENYLIST_PATH`   | *(empty → no entries)*        | Path to the denylist YAML (literal-string match). Empty means the detector loads as a no-op — useful when `denylist` is included in `DETECTOR_MODE` but the list isn't ready yet. Accepts `bundled:NAME` or a filesystem path. See *Customising the denylist* below. |
 | `DENYLIST_REGISTRY` | *(empty)*                   | Comma-separated `name=path` list of NAMED alternative denylists callers can opt into per-request via `denylist`. See *Per-request overrides → Named alternatives* below. |
+| `DENYLIST_BACKEND` | `regex`                      | `regex` (Python `re` alternation, stdlib only) or `aho` (Aho-Corasick via `pyahocorasick`). The bundled image ships both; for direct `pip install` users, `aho` requires the `denylist-aho` extra. See *Customising the denylist* for when each pays off. |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
 | `SURROGATE_CACHE_MAX_SIZE` | `100000`             | LRU cap on the surrogate cache (cross-request consistency) |
@@ -478,12 +479,31 @@ Behaviour notes:
   `Acme` and `Acme Corp` both appear, `Acme Corp` wins as a single
   span. Across detectors, dedup is by matched text (first detector
   to claim a substring keeps its type).
-- **Performance**: matching is implemented as two compiled
-  alternation regexes (one case-sensitive, one case-insensitive),
-  which is plenty fast up to low-thousands of entries. Larger lists
-  would benefit from a dedicated matcher (`pyahocorasick` or
-  similar); not implemented yet — opt for it once a deployment
-  actually hits the wall.
+- **Performance and backend choice**: two backends ship, controlled
+  by `DENYLIST_BACKEND`:
+
+  - `regex` (default) — two compiled `re` alternations
+    (case-sensitive + case-insensitive). Pure stdlib, fast up to
+    low-thousands of entries; lower constant factor than Aho-Corasick
+    on small lists.
+  - `aho` — Aho-Corasick via [`pyahocorasick`](https://pypi.org/project/pyahocorasick/).
+    Sub-linear in pattern count; flat scan time even when the list has
+    tens of thousands of entries. Word boundaries are post-filtered
+    (Aho-Corasick is pure literal matching), so behaviour matches the
+    regex backend exactly — both paths share the cross-backend test
+    suite.
+
+  Switch with `DENYLIST_BACKEND=aho`. The Containerfile bakes in both
+  so this is a runtime flip, no rebuild needed. Direct `pip install`
+  users opting into aho need the `denylist-aho` extra:
+
+  ```bash
+  pip install "anonymizer-guardrail[denylist-aho]"
+  ```
+
+  An invalid value crashes loud at boot; selecting `aho` without
+  `pyahocorasick` installed raises a `RuntimeError` naming the extra
+  to install.
 - **No path traversal from clients**: the per-request `denylist`
   override accepts only registered names, never paths. See *Named
   alternatives* below.
