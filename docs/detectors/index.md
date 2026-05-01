@@ -57,6 +57,36 @@ A "just see what NER catches" setup:
 DETECTOR_MODE=regex,privacy_filter
 ```
 
+## When detectors disagree — worked example
+
+`DETECTOR_MODE` order resolves type conflicts when two detectors
+flag the same span. Concrete example: input is
+`"contact alice@acme.com"`, both `regex` and `llm` are active.
+
+| Detector | What it returns |
+|---|---|
+| `regex` | `Match(text="alice@acme.com", entity_type="EMAIL_ADDRESS")` |
+| `llm`   | `Match(text="alice@acme.com", entity_type="PERSON")` (the model interprets the email as a personal handle) |
+
+Dedup is keyed on the matched **text**, not on `(text, type)`. Whichever
+detector appears first in `DETECTOR_MODE` keeps its type:
+
+- `DETECTOR_MODE=regex,llm` → `EMAIL_ADDRESS` wins, the LLM's PERSON
+  classification is dropped, and the surrogate is an email-shaped
+  string (`fake.email()`).
+- `DETECTOR_MODE=llm,regex` → `PERSON` wins, surrogate is a personal
+  name (`fake.name()`) — semantically wrong for an email and almost
+  certainly not what you want.
+
+**Practical consequence:** put the deterministic detectors first
+(`regex,denylist,…`) so shape-based classifications win conflicts
+against the more interpretive LLM/NER layers. This is the rationale
+behind the recommended ordering above.
+
+Partial overlaps (regex catches `alice@acme.com`, LLM catches just
+`alice`) are NOT merged — they remain distinct spans because the
+matched-text values differ. Each gets its own surrogate.
+
 ## Common conventions
 
 - Each detector emits `Match(text, entity_type)` records; the

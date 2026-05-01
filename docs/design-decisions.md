@@ -81,3 +81,54 @@ to the detector. We declined this too — the duplication is small and
 the indirection (validator imports criss-crossing the detector/api
 boundary) wasn't a clear win over the status quo. Worth reconsidering
 if the validator set grows substantially.
+
+---
+
+## Surrogate generator dict is rebuilt per-match under `use_faker` overrides
+
+**Considered:** hoisting the `_build_generators(use_faker, salt)` call
+in `surrogate.SurrogateGenerator.for_match` out of the per-match path
+when a `use_faker` override is active. Today, every call to
+`for_match` with a `use_faker` argument invokes
+`_build_generators(...)`, which iterates `_GENERATOR_SPEC`
+(~25 entries) and constructs a fresh dict — sometimes including a
+fresh `_opaque(...)` closure per entry. The default-no-override path
+already reuses `self._generators`, so this only affects the override
+path.
+
+The natural optimisation: at the start of `Pipeline.anonymize`,
+materialise the override-shape generator dict once and pass it down,
+or memoise it on `SurrogateGenerator` keyed by `(use_faker, locale)`.
+Either avoids the per-match rebuild.
+
+**Why we declined:**
+
+- **Wins are tiny.** Closure construction in CPython is on the
+  order of a few hundred nanoseconds; the dict comprehension over
+  25 entries is similar. A request producing 100 matches with a
+  `use_faker` override pays well under 1 ms total — invisible
+  next to the LLM detection round-trip (tens to hundreds of ms).
+- **Per-match call frequency is bounded.** The pipeline already
+  de-duplicates per-request (`if m.text not in
+  original_to_surrogate` in `Pipeline.anonymize`), so distinct
+  inputs determine the call count, not the number of detected
+  spans. Pathological inputs that reach hundreds of unique spans
+  *and* set `use_faker` per request *and* don't fit the
+  same-pattern-many-times shape are rare.
+- **The optimisation adds a layer.** Either a kwarg threading
+  the prebuilt dict down through `for_match`, or a memoisation
+  cache keyed by `(use_faker, locale)` that needs invalidation
+  when `salt` rotates. Both add surface area; the maintenance
+  cost outweighs the runtime cost at our scale.
+
+**When to re-evaluate:**
+
+- Profiling on a real workload shows surrogate generation as a
+  measurable fraction of request time (>5% of p50 or p95).
+- A regex-only deployment (no LLM detection latency to amortize
+  the work against) starts hitting hundreds of distinct spans per
+  request with `use_faker` overrides — the per-match cost is then
+  no longer in the noise.
+- A future detector expands `_GENERATOR_SPEC` substantially — the
+  per-match rebuild scales linearly with that table. At ~100
+  entries the calculus shifts.

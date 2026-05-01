@@ -78,6 +78,32 @@ entries:
   override accepts only registered names, never paths. See
   [per-request overrides → Named alternatives](../per-request-overrides.md#named-alternatives).
 
+## Casing default — read this before authoring a denylist
+
+`case_sensitive` defaults to **`true`** per entry. An entry of
+`AcmeSecret` will match the literal string `AcmeSecret` and **not**
+match `acmesecret`, `ACMESECRET`, or `Acmesecret`.
+
+This bias is "no false positives" rather than "maximum recall":
+
+- Strict default suits **codenames, project IDs, and case-meaningful
+  identifiers** — e.g. `Java` (the language) shouldn't match every
+  capitalisation of `JAVA` (the org you're protecting).
+- Strict default is **risky for PII shapes that humans type
+  inconsistently** — names, domains, customer identifiers. If your
+  denylist is mostly those, every entry should set
+  `case_sensitive: false`.
+
+The safest authoring pattern: decide per entry. The schema example
+below illustrates both modes — the project codename keeps the strict
+default; the employee name opts in to case-insensitive.
+
+If your denylist is overwhelmingly PII (employee names, customer
+names, etc.), consider authoring a small wrapper that loads with
+`case_sensitive: false` as the default for every entry, or move that
+list into a separate `DENYLIST_REGISTRY` entry where you can
+maintain it under that posture.
+
 ## Backend choice
 
 Two backends ship, controlled by `DENYLIST_BACKEND`:

@@ -31,6 +31,50 @@ and are dropped. The other overrides in the same dict still take
 effect, and the request is **not** blocked over a bad override —
 anonymization proceeds with config defaults for whatever was rejected.
 
+## Trust boundary — overrides are a privileged capability
+
+Several overrides can **weaken** anonymization for the request that
+carries them:
+
+- `detector_mode` is a *subset filter* — a caller can disable
+  detectors that the operator configured at boot. A request sending
+  `detector_mode: ["regex"]` against a `regex,llm`-configured
+  guardrail bypasses LLM detection for that call. Useful for narrow
+  test traffic; unsafe for general user input.
+- `regex_patterns`, `llm_prompt`, `denylist` switch which named
+  alternative the matching detector uses. A caller picking a
+  registry entry with a less aggressive pattern set still gets
+  *some* coverage, but a different shape than the deployment
+  default.
+- `use_faker` and `faker_locale` change surrogate *form* but not
+  whether anonymization happens — a caller flipping these can't
+  make originals leak, just changes how surrogates look.
+
+Treat the overrides field as a **trusted-caller capability**, the
+same way you'd treat a header that disables WAF rules. Recommended
+deployment posture:
+
+- **LiteLLM front-end** — keep
+  `additional_provider_specific_params` reachable only from the
+  LiteLLM config (set there as deployment-wide static defaults), and
+  do **not** put `extra_body` into client-allowed parameter lists.
+  LiteLLM's per-key permission model is the place to decide which
+  client virtual-keys may carry overrides.
+- **Direct HTTP exposure** — if the guardrail accepts requests
+  outside LiteLLM, terminate untrusted callers at a proxy that
+  strips `additional_provider_specific_params` from the body, or
+  pin the field to an empty dict before forwarding.
+- **Audit** — bad overrides log a warning naming the offending
+  field (`ignoring invalid override <key>=<value>: <reason>`).
+  Successful overrides aren't logged today; if you need that for an
+  audit trail, that's a logging-layer extension.
+
+Server-side static defaults (the env vars themselves —
+`USE_FAKER`, `DETECTOR_MODE`, etc.) are **not** overrideable by
+clients, only narrowed via the per-request keys above. The lowest
+posture a client can negotiate is "everything the operator
+configured, minus whatever this request opts out of."
+
 ## Defensive limits (anti-OOM)
 
 | Limit | Default | What it bounds |

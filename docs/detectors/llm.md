@@ -125,3 +125,49 @@ response.
 The flag is independent from `PRIVACY_FILTER_FAIL_CLOSED` and
 `GLINER_PII_FAIL_CLOSED` — operators can fail closed on the LLM and
 open on the others, or vice versa.
+
+## Determinism — what to expect
+
+LLM detection is **not deterministic in the way regex / denylist
+are**. Same input + same configuration can produce slightly
+different entity lists across:
+
+- **Model versions.** A provider's silent point-update to the
+  underlying weights (e.g. `gpt-4o-mini-2024-07-18` → a successor
+  alias under the same `gpt-4o-mini` route) shifts what gets
+  flagged.
+- **Backends.** Two endpoints serving "the same" model (a hosted
+  OpenAI-compatible service vs. a local Ollama / vLLM build) will
+  not agree exactly, because tokeniser, sampling implementation,
+  and quantisation all matter.
+- **Re-runs.** Even at `temperature=0`, providers sometimes
+  introduce residual non-determinism — batched-inference effects,
+  GPU non-associativity, etc. The detector pins `temperature: 0`
+  in the request payload to *reduce* variance, not eliminate it.
+
+What this means in practice:
+
+- **Don't rely on the LLM detector alone for shape-anchored PII**
+  (emails, IPs, IBANs, JWTs, CCs, well-known token formats). The
+  regex layer is deterministic and high-precision for those —
+  layer them: `DETECTOR_MODE=regex,denylist,llm`. With regex
+  listed first, type-resolution conflicts go to the
+  shape-classified type, not to the LLM's interpretation.
+- **Don't pin tests to exact LLM output.** The fake-llm test
+  backend (rules-driven) is the way to write deterministic
+  end-to-end tests of the LLM-detector path; real LLMs are too
+  noisy for that. See
+  [`services/fake_llm/README.md`](../../services/fake_llm/README.md).
+- **Pin a model version when you can.** A request for
+  `gpt-4o-mini` is shorthand for "whatever's currently behind that
+  alias" — pin the explicit dated tag in `LLM_MODEL` (e.g.
+  `gpt-4o-mini-2024-07-18`) when the deployment cares about
+  behaviour stability across provider updates.
+
+The hallucination guard (substring-must-be-in-source check, see
+implementation in `_parse_entities`) is the floor against
+LLM-introduced incorrectness: an entity the model returns that
+isn't actually in the input is dropped before it reaches the vault
+or the surrogate generator. That covers "the model invented a
+name"; it doesn't cover "the model missed a name that was there"
+— hence the layered-detection recommendation above.

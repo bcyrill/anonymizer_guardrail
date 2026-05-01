@@ -223,6 +223,48 @@ Volume options compared:
   first pod pays the download; later pods reuse the PVC. Use
   `ReadWriteMany` for shared cache across replicas.
 
+## State and replicas — read this before scaling out
+
+The guardrail keeps two stores in process memory:
+
+- **The vault** — `litellm_call_id → surrogate→original mapping`,
+  written by the pre-call hook and consumed by the matching post-call
+  hook. Without the matching mapping, the post-call hook ships
+  surrogates back to the user instead of restoring originals.
+- **The surrogate cache** — cross-request consistency for
+  multi-turn conversations (same input → same surrogate).
+
+Three production implications fall out of "in-memory":
+
+1. **Pre/post-call hooks must land on the same replica.** Round-trip
+   anonymization breaks the moment a load balancer routes the
+   pre-call to replica A and the post-call to replica B — B has no
+   mapping to restore. Required posture for >1 replica: sticky
+   routing keyed on `litellm_call_id`, OR run a single replica.
+   See [limitations → Single replica](limitations.md#single-replica).
+2. **Restarts lose in-flight round-trips.** A pre-call written
+   before a restart can't be deanonymized by a post-call after the
+   restart. The
+   [`VAULT_TTL_S`](configuration.md#vault) backstop bounds the
+   *other* direction (vault grows when responses don't arrive); the
+   restart-mid-roundtrip case has no fix beyond accepting it.
+3. **Surrogate consistency is per-process.** Replica A and replica
+   B will issue different surrogates for the same original unless
+   you pin a stable [`SURROGATE_SALT`](surrogates.md#surrogate-salt-privacy-hardening).
+   Even then, salt only stabilises the surrogate value, not the LRU
+   cache contents — the *consistency window* (how far back two
+   identical inputs still produce the same surrogate) is bounded by
+   `SURROGATE_CACHE_MAX_SIZE` per replica.
+
+For multi-replica deployments where sticky routing isn't an option,
+swap the `Vault` for a shared backend (Redis is the natural fit).
+The interface is two methods (`put` / `pop`); see
+[`TASKS.md` → Multi-replica support](../TASKS.md) for the design
+sketch when this becomes urgent.
+
+`/health` exposes `vault_size` and `surrogate_cache_size` — see
+[operations](operations.md) for how to monitor them.
+
 ## Smoke test
 
 ```bash
