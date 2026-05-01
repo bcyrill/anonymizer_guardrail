@@ -81,7 +81,11 @@ if ! confirm "Create a new release tag?" n; then
   exit 0
 fi
 
-latest_tag="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1 || true)"
+# Exclude flavour-variant tags (vX.Y.Z+pf, vX.Y.Z+pf-baked) — they
+# share the version of their canonical sibling and break the bump
+# arithmetic below (split on `.` would leave the `+pf` suffix in
+# `pat`, then `$((pat + 1))` blows up under `set -u`).
+latest_tag="$(git tag --list 'v*.*.*' --sort=-v:refname | grep -v '+' | head -n1 || true)"
 if [[ -z "$latest_tag" ]]; then
   say "No existing v*.*.* tag found."
   default_tag="v0.1.0"
