@@ -35,13 +35,51 @@ def test_parse_overrides_accepts_known_keys() -> None:
         "faker_locale": "pt_BR,en_US",
         "detector_mode": ["regex", "llm"],
         "regex_overlap_strategy": "PRIORITY",
+        "regex_patterns": "pentest",
         "llm_model": "gpt-4o-mini",
+        "llm_prompt": "legal",
     })
     assert o.use_faker is False
     assert o.faker_locale == ("pt_BR", "en_US")
     assert o.detector_mode == ("regex", "llm")
     assert o.regex_overlap_strategy == "priority"  # normalized lowercase
+    assert o.regex_patterns == "pentest"
     assert o.llm_model == "gpt-4o-mini"
+    assert o.llm_prompt == "legal"
+
+
+def test_parse_overrides_named_alternatives_strip_whitespace() -> None:
+    """`regex_patterns` and `llm_prompt` accept names — the parser
+    strips surrounding whitespace, mirroring how detector_mode tokens
+    are normalised."""
+    o = parse_overrides({
+        "regex_patterns": "  pentest  ",
+        "llm_prompt": "\tlegal\n",
+    })
+    assert o.regex_patterns == "pentest"
+    assert o.llm_prompt == "legal"
+
+
+def test_parse_overrides_named_alternatives_empty_string_means_default() -> None:
+    """An empty/whitespace name doesn't pin an override — caller will
+    fall through to the configured default."""
+    o = parse_overrides({"regex_patterns": "", "llm_prompt": "   "})
+    assert o.regex_patterns is None
+    assert o.llm_prompt is None
+
+
+def test_parse_overrides_named_alternatives_reject_non_string(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Wrong type → warn + drop. Matches the warn-and-drop policy of
+    the other knobs; the request still proceeds with the default."""
+    caplog.set_level(logging.WARNING)
+    o = parse_overrides({"regex_patterns": 42, "llm_prompt": ["a", "b"]})
+    assert o.regex_patterns is None
+    assert o.llm_prompt is None
+    msgs = " | ".join(r.message for r in caplog.records)
+    assert "regex_patterns" in msgs
+    assert "llm_prompt" in msgs
 
 
 def test_parse_overrides_locale_array_form_normalizes_to_tuple() -> None:
