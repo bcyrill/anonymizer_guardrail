@@ -60,7 +60,9 @@ class Overrides:
     faker_locale: tuple[str, ...] | None = None
     detector_mode: tuple[str, ...] | None = None
     regex_overlap_strategy: str | None = None
+    regex_patterns: str | None = None
     llm_model: str | None = None
+    llm_prompt: str | None = None
 
     @classmethod
     def empty(cls) -> Overrides:
@@ -136,7 +138,9 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
     faker_locale: tuple[str, ...] | None = None
     detector_mode: tuple[str, ...] | None = None
     regex_overlap_strategy: str | None = None
+    regex_patterns: str | None = None
     llm_model: str | None = None
+    llm_prompt: str | None = None
 
     for key, value in raw.items():
         try:
@@ -164,6 +168,21 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
                 stripped = value.strip()
                 if stripped:
                     llm_model = stripped
+            elif key in ("regex_patterns", "llm_prompt"):
+                # Both name a registered alternative (REGEX_PATTERNS_REGISTRY
+                # / LLM_SYSTEM_PROMPT_REGISTRY). The detector resolves the
+                # name against its registry at detect() time; an unknown
+                # name there logs a warning and falls back to the default.
+                # Path traversal is impossible because we never accept a
+                # path here — only a name.
+                if not isinstance(value, str):
+                    raise TypeError(f"expected string, got {type(value).__name__}")
+                stripped = value.strip()
+                if stripped:
+                    if key == "regex_patterns":
+                        regex_patterns = stripped
+                    else:
+                        llm_prompt = stripped
             else:
                 # Unknown key — silently ignore. Other guardrails sharing
                 # the same dict don't apply here (LiteLLM scopes
@@ -181,5 +200,7 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
         faker_locale=faker_locale,
         detector_mode=detector_mode,
         regex_overlap_strategy=regex_overlap_strategy,
+        regex_patterns=regex_patterns,
         llm_model=llm_model,
+        llm_prompt=llm_prompt,
     )

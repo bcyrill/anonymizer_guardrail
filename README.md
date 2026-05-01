@@ -199,7 +199,9 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
+| `LLM_SYSTEM_PROMPT_REGISTRY` | *(empty)*          | Comma-separated `name=path` list of NAMED alternative prompts callers can opt into per-request via `llm_prompt`. See *Per-request overrides → Named alternatives* below. |
 | `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
+| `REGEX_PATTERNS_REGISTRY` | *(empty)*             | Comma-separated `name=path` list of NAMED alternative regex pattern files callers can opt into per-request via `regex_patterns`. See *Per-request overrides → Named alternatives* below. |
 | `REGEX_OVERLAP_STRATEGY` | `longest`              | `longest` (longest match wins on overlapping spans) or `priority` (first pattern in YAML order wins). See *Regex overlap resolution* below. |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
@@ -429,7 +431,9 @@ the deployment-wide default.
 | `faker_locale` | `string` or `string[]` | Override `FAKER_LOCALE`. Accepts `"pt_BR,en_US"` or `["pt_BR", "en_US"]` — first locale is primary, rest are fallbacks. |
 | `detector_mode` | `string` or `string[]` | **Subset filter** over the detectors built at startup. Override naming a detector that wasn't configured logs a warning and is dropped (privacy_filter and llm both need startup-time setup that isn't reversible per call). |
 | `regex_overlap_strategy` | `"longest"` or `"priority"` | Override `REGEX_OVERLAP_STRATEGY` for this call. |
+| `regex_patterns` | `string` | Name of a registered alternative regex pattern set (see *Named alternatives* below). |
 | `llm_model` | `string` | Override `LLM_MODEL` (the alias the LLM detector sends to its backend) for this call. |
+| `llm_prompt` | `string` | Name of a registered alternative LLM detection prompt (see *Named alternatives* below). |
 
 **Validation policy:** unknown keys are silently ignored;
 known-key bad values log a warning and are dropped. The other
@@ -457,6 +461,34 @@ surrogate cache key from `(entity_type, text)` to
 in the cache, each consistent within its bucket. Default-config
 traffic still buckets to the original key shape — no migration cost.
 The surrogate cache itself remains bounded by `SURROGATE_CACHE_MAX_SIZE`.
+
+**Named alternatives (`regex_patterns`, `llm_prompt`):**
+
+`regex_patterns` and `llm_prompt` deliberately accept *names*, not
+paths. Letting callers pass arbitrary paths over the wire would be a
+path-traversal + bypass vector (e.g. an empty YAML disables redaction).
+Operators pre-declare the allowed alternatives via two env vars:
+
+```bash
+REGEX_PATTERNS_REGISTRY="pentest=bundled:regex_pentest.yaml,internal=/etc/anon/internal.yaml"
+LLM_SYSTEM_PROMPT_REGISTRY="pentest=bundled:llm_pentest.md,legal=/etc/anon/legal.md"
+```
+
+Format: comma-separated `name=path` pairs (whitespace around `=` and
+`,` is stripped). Each path uses the same `bundled:NAME` /
+filesystem-path syntax as `REGEX_PATTERNS_PATH` /
+`LLM_SYSTEM_PROMPT_PATH`. Validation:
+
+- All entries are loaded + compiled at startup. Typos / unreadable
+  files / empty prompts crash boot loudly with the offending entry
+  named (`REGEX_PATTERNS_REGISTRY[pentest]=…`).
+- The reserved name `default` is rejected — the default lives in the
+  matching `*_PATH` env var, never in the registry, so adding a
+  registry can never silently change no-override behaviour.
+
+A request referencing an unknown name (e.g. `regex_patterns: "wrong"`)
+logs a warning and falls back to the default pattern set or prompt —
+the request itself isn't blocked.
 
 **Where to set them:**
 

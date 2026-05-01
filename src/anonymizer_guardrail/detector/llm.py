@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from ..registry import parse_named_path_registry
 from ..config import config
 from .base import Match
 
@@ -35,11 +36,11 @@ _BUNDLED_PROMPTS_DIR = "prompts"
 _BUNDLED_PREFIX = "bundled:"
 
 
-def _read_bundled_prompt(name: str) -> str:
+def _read_bundled_prompt(name: str, label: str) -> str:
     """Read a file from the package's bundled prompts/ directory."""
     if not name or "/" in name or "\\" in name:
         raise RuntimeError(
-            f"LLM_SYSTEM_PROMPT_PATH=bundled:{name!r}: name must be a bare "
+            f"{label}=bundled:{name!r}: name must be a bare "
             f"filename (no path separators). Use a filesystem path if you "
             f"want to reference a file outside the bundled prompts/."
         )
@@ -51,16 +52,25 @@ def _read_bundled_prompt(name: str) -> str:
         )
     except (FileNotFoundError, OSError) as exc:
         raise RuntimeError(
-            f"LLM_SYSTEM_PROMPT_PATH=bundled:{name!r} not found in "
-            f"bundled prompts/: {exc}"
+            f"{label}=bundled:{name!r} not found in bundled prompts/: {exc}"
         ) from exc
 
 
-def _load_system_prompt() -> str:
-    """Load the detector's system prompt.
+def _load_system_prompt(
+    override: str | None = None, label: str = "LLM_SYSTEM_PROMPT_PATH"
+) -> str:
+    """Load one system prompt.
 
-    LLM_SYSTEM_PROMPT_PATH wins if set; otherwise we fall back to the
-    bundled default. The override accepts either:
+    `override` is the path/bundled-name string. None (the default)
+    means "read config.llm_system_prompt_path" so callers that haven't
+    been updated for the registry refactor (e.g. tests that monkey-
+    patch config) keep working. Empty string → bundled default.
+    `label` names the source for error messages — defaults to the env
+    var; the registry loader passes a per-entry label so a typo in
+    `LLM_SYSTEM_PROMPT_REGISTRY="legal=…"` reports the entry name, not
+    the global env var.
+
+    The override accepts either:
       * a filesystem path (absolute or relative)
       * `bundled:<name>` — a bare filename in the package's prompts/ dir,
         which insulates the env var from the Python version embedded in
@@ -71,11 +81,15 @@ def _load_system_prompt() -> str:
     no-instructions LLM would happily return `{"entities": []}` for every
     input, which is a silent regex-only fallback masquerading as success.
     """
-    override = config.llm_system_prompt_path.strip()
+    if override is None:
+        override = config.llm_system_prompt_path
+    override = override.strip()
     if override:
         if override.startswith(_BUNDLED_PREFIX):
-            text = _read_bundled_prompt(override[len(_BUNDLED_PREFIX):].strip())
-            source = f"LLM_SYSTEM_PROMPT_PATH={override!r}"
+            text = _read_bundled_prompt(
+                override[len(_BUNDLED_PREFIX):].strip(), label,
+            )
+            source = f"{label}={override!r}"
         else:
             path = Path(override)
             try:
@@ -85,9 +99,9 @@ def _load_system_prompt() -> str:
                 # this path expects their prompt to be used. Crashing at import
                 # surfaces the typo immediately instead of after the first call.
                 raise RuntimeError(
-                    f"LLM_SYSTEM_PROMPT_PATH={override!r} could not be read: {exc}"
+                    f"{label}={override!r} could not be read: {exc}"
                 ) from exc
-            source = f"LLM_SYSTEM_PROMPT_PATH={override!r}"
+            source = f"{label}={override!r}"
     else:
         # Anchor at the parent package so `prompts/` doesn't need __init__.py.
         text = (
@@ -106,7 +120,23 @@ def _load_system_prompt() -> str:
     return text
 
 
+def _load_system_prompt_registry() -> dict[str, str]:
+    """Compile every entry in LLM_SYSTEM_PROMPT_REGISTRY at startup.
+
+    Returns a dict mapping registry name → prompt text. Same validation
+    as the default path: typos / unreadable files / empty prompts crash
+    boot loudly.
+    """
+    raw = config.llm_system_prompt_registry
+    pairs = parse_named_path_registry(raw, "LLM_SYSTEM_PROMPT_REGISTRY")
+    return {
+        name: _load_system_prompt(path, f"LLM_SYSTEM_PROMPT_REGISTRY[{name}]")
+        for name, path in pairs.items()
+    }
+
+
 _SYSTEM_PROMPT = _load_system_prompt()
+_SYSTEM_PROMPT_REGISTRY = _load_system_prompt_registry()
 
 
 def _strip_thinking(raw: str) -> str:
@@ -178,6 +208,7 @@ class LLMDetector:
         *,
         api_key: str | None = None,
         model: str | None = None,
+        prompt_name: str | None = None,
     ) -> list[Match]:
         if not text or not text.strip():
             return []
@@ -192,6 +223,23 @@ class LLMDetector:
         # detection model without rebuilding the LLMDetector. Falls
         # back to whatever was configured at startup.
         effective_model = (model or self.model).strip() or self.model
+
+        # `prompt_name` selects a NAMED alternative system prompt from
+        # LLM_SYSTEM_PROMPT_REGISTRY. None / "default" → the
+        # configured default prompt. Unknown name → log a warning and
+        # fall back to the default (don't block the request over a
+        # typo in the override).
+        effective_prompt = _SYSTEM_PROMPT
+        if prompt_name and prompt_name != "default":
+            named = _SYSTEM_PROMPT_REGISTRY.get(prompt_name)
+            if named is None:
+                log.warning(
+                    "Override llm_prompt=%r isn't in LLM_SYSTEM_PROMPT_REGISTRY "
+                    "(known: %s); falling back to the default prompt.",
+                    prompt_name, sorted(_SYSTEM_PROMPT_REGISTRY) or "<empty>",
+                )
+            else:
+                effective_prompt = named
 
         # Refuse oversized inputs rather than truncating. Truncation would
         # silently let everything past the cap through unscanned — the
@@ -212,7 +260,7 @@ class LLMDetector:
         payload: dict[str, Any] = {
             "model": effective_model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": effective_prompt},
                 {"role": "user", "content": text},
             ],
             "temperature": 0,

@@ -19,8 +19,13 @@ from typing import Any
 
 import yaml
 
+import logging
+
+from ..registry import parse_named_path_registry
 from ..config import config
 from .base import Match
+
+log = logging.getLogger("anonymizer.regex")
 
 # Map YAML flag names → re module flags. Restricted to the subset that's
 # meaningful for detection (Python's UNICODE/LOCALE etc. are intentionally
@@ -136,24 +141,35 @@ def _resolve_extends(
 _BUNDLED_PREFIX = "bundled:"
 
 
-def _read_root_patterns_yaml() -> tuple[str, str, Path | None]:
-    """Return (yaml_text, source_label, file_dir) for the root config.
+def _read_root_patterns_yaml(
+    override: str | None = None,
+    label: str = "REGEX_PATTERNS_PATH",
+) -> tuple[str, str, Path | None]:
+    """Return (yaml_text, source_label, file_dir) for one root patterns file.
+
+    `override` is the path/bundled-name string. None (the default) means
+    "read from config.regex_patterns_path" so callers that haven't been
+    updated for the registry refactor (e.g. tests that monkey-patch
+    config) keep working. Empty string is treated the same as None →
+    bundled default. `label` is used in error messages.
 
     file_dir is the parent directory if the source is on-disk, else None
-    (used to resolve relative `extends:` paths). The override env var
-    accepts either:
+    (used to resolve relative `extends:` paths). The override accepts
+    either:
       * a filesystem path (absolute or relative)
       * `bundled:<name>` — a bare filename in the package's patterns/ dir,
         which insulates the env var from the Python version embedded in
         the site-packages path.
     """
-    override = config.regex_patterns_path.strip()
+    if override is None:
+        override = config.regex_patterns_path
+    override = override.strip()
     if override:
         if override.startswith(_BUNDLED_PREFIX):
             name = override[len(_BUNDLED_PREFIX):].strip()
             if not name or "/" in name or "\\" in name:
                 raise RuntimeError(
-                    f"REGEX_PATTERNS_PATH=bundled:{name!r}: name must be a "
+                    f"{label}=bundled:{name!r}: name must be a "
                     f"bare filename (no path separators). Use a filesystem "
                     f"path if you want a file outside the bundled patterns/."
                 )
@@ -161,7 +177,7 @@ def _read_root_patterns_yaml() -> tuple[str, str, Path | None]:
                 text = _read_bundled(f"{_BUNDLED_PATTERNS_DIR}/{name}")
             except (FileNotFoundError, OSError) as exc:
                 raise RuntimeError(
-                    f"REGEX_PATTERNS_PATH=bundled:{name!r} not found in "
+                    f"{label}=bundled:{name!r} not found in "
                     f"bundled patterns/: {exc}"
                 ) from exc
             # No on-disk parent → child `extends:` directives must use
@@ -175,7 +191,7 @@ def _read_root_patterns_yaml() -> tuple[str, str, Path | None]:
             # purpose; silently using a different pattern set would be a
             # nasty source of "why isn't my secret being redacted".
             raise RuntimeError(
-                f"REGEX_PATTERNS_PATH={override!r} could not be read: {exc}"
+                f"{label}={override!r} could not be read: {exc}"
             ) from exc
         return text, str(path), path.parent
     return (
@@ -260,8 +276,11 @@ def _load_recursive(
     return out
 
 
-def _load_patterns() -> list[tuple[str, re.Pattern[str]]]:
-    text, source, current_dir = _read_root_patterns_yaml()
+def _load_patterns(
+    path: str | None = None, label: str = "REGEX_PATTERNS_PATH"
+) -> list[tuple[str, re.Pattern[str]]]:
+    """Load + compile one pattern file. None → read config.regex_patterns_path."""
+    text, source, current_dir = _read_root_patterns_yaml(path, label)
     compiled = _load_recursive(text, source, current_dir, set(), depth=0)
     if not compiled:
         # An empty pattern set is almost certainly a mistake (typo'd top-level
@@ -271,7 +290,23 @@ def _load_patterns() -> list[tuple[str, re.Pattern[str]]]:
     return compiled
 
 
+def _load_patterns_registry() -> dict[str, list[tuple[str, re.Pattern[str]]]]:
+    """Compile every entry in REGEX_PATTERNS_REGISTRY at startup.
+
+    Returns a dict mapping registry name → compiled pattern list.
+    Validation is the same as the default path: typos / unreadable
+    files / missing patterns crash boot loudly.
+    """
+    raw = config.regex_patterns_registry
+    pairs = parse_named_path_registry(raw, "REGEX_PATTERNS_REGISTRY")
+    out: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
+    for name, path in pairs.items():
+        out[name] = _load_patterns(path, f"REGEX_PATTERNS_REGISTRY[{name}]")
+    return out
+
+
 _COMPILED_PATTERNS = _load_patterns()
+_COMPILED_PATTERNS_REGISTRY = _load_patterns_registry()
 
 _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
 if config.regex_overlap_strategy not in _VALID_OVERLAP_STRATEGIES:
@@ -288,9 +323,19 @@ class RegexDetector:
 
     def __init__(self) -> None:
         self._compiled: list[tuple[str, re.Pattern[str]]] = _COMPILED_PATTERNS
+        # Named alternatives loaded from REGEX_PATTERNS_REGISTRY at
+        # startup. Empty when the registry env var isn't set; per-call
+        # patterns_name overrides resolve against this dict.
+        self._registry: dict[str, list[tuple[str, re.Pattern[str]]]] = (
+            _COMPILED_PATTERNS_REGISTRY
+        )
 
     async def detect(
-        self, text: str, *, overlap_strategy: str | None = None
+        self,
+        text: str,
+        *,
+        overlap_strategy: str | None = None,
+        patterns_name: str | None = None,
     ) -> list[Match]:
         """Run every compiled pattern and return the resolved match list.
 
@@ -298,6 +343,12 @@ class RegexDetector:
         config.regex_overlap_strategy". Validated up front so a typo
         from a per-request override surfaces as a clear error rather
         than silently behaving like the default.
+
+        `patterns_name` selects a NAMED alternative pattern set from
+        REGEX_PATTERNS_REGISTRY. None / "default" → the global default
+        (REGEX_PATTERNS_PATH or bundled). Unknown name → log a warning
+        and fall back to the default — keeps the request from being
+        blocked by a typo in the override.
         """
         if not text:
             return []
@@ -307,6 +358,18 @@ class RegexDetector:
                 f"Invalid overlap_strategy={strategy!r}. "
                 f"Allowed: {', '.join(sorted(_VALID_OVERLAP_STRATEGIES))}."
             )
+
+        compiled = self._compiled
+        if patterns_name and patterns_name != "default":
+            named = self._registry.get(patterns_name)
+            if named is None:
+                log.warning(
+                    "Override regex_patterns=%r isn't in REGEX_PATTERNS_REGISTRY "
+                    "(known: %s); falling back to the default pattern set.",
+                    patterns_name, sorted(self._registry) or "<empty>",
+                )
+            else:
+                compiled = named
 
         # Pass 1: walk every pattern and collect every non-empty candidate.
         # Both strategies pay the same regex cost — Python's re engine
@@ -320,7 +383,7 @@ class RegexDetector:
         # without groups → full match. This lets two patterns hit the
         # same line as long as their *value* spans don't overlap.
         candidates: list[tuple[int, int, str, str]] = []  # (start, end, value, type)
-        for entity_type, pattern in self._compiled:
+        for entity_type, pattern in compiled:
             for m in pattern.finditer(text):
                 # Capture-group priority:
                 # 1. Named group "entity" (explicit designation)

@@ -58,11 +58,29 @@ class Config:
     # can override to tweak detection behaviour for their domain without
     # rebuilding the image.
     llm_system_prompt_path: str = os.getenv("LLM_SYSTEM_PROMPT_PATH", "")
+    # Optional registry of NAMED alternative LLM prompts that callers can
+    # opt into per-request via additional_provider_specific_params.llm_prompt.
+    # Format: comma-separated `name=path` pairs, same syntax style as
+    # DETECTOR_MODE / FAKER_LOCALE. Each path uses the same `bundled:NAME` /
+    # filesystem-path conventions as LLM_SYSTEM_PROMPT_PATH. Entries are
+    # validated at startup. Names referenced from a request that aren't in
+    # this registry log a warning and fall back to the default prompt
+    # (LLM_SYSTEM_PROMPT_PATH). The registry deliberately doesn't contain
+    # a "default" entry — that's reserved for LLM_SYSTEM_PROMPT_PATH so
+    # configuring a registry doesn't change the no-override behaviour.
+    # Example:
+    #   LLM_SYSTEM_PROMPT_REGISTRY="pentest=bundled:llm_pentest.md,legal=/etc/anon/legal.md"
+    llm_system_prompt_registry: str = os.getenv("LLM_SYSTEM_PROMPT_REGISTRY", "")
     # Path to the YAML file defining the regex detector's patterns. If unset,
     # the bundled default (patterns/regex_default.yaml) is used. Pre-built
     # alternatives also ship with the package (e.g. patterns/regex_pentest.yaml)
     # — point this at any of them or at your own file.
     regex_patterns_path: str = os.getenv("REGEX_PATTERNS_PATH", "")
+    # Same registry mechanism for regex pattern files. See
+    # llm_system_prompt_registry above for the format and semantics.
+    # Example:
+    #   REGEX_PATTERNS_REGISTRY="pentest=bundled:regex_pentest.yaml,internal=/etc/anon/internal.yaml"
+    regex_patterns_registry: str = os.getenv("REGEX_PATTERNS_REGISTRY", "")
     # How the regex detector resolves overlapping matches between patterns:
     #   - "longest"  pick the longest match span (default). Robust against
     #                a child YAML's narrow pattern shadowing a parent's

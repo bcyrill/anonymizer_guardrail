@@ -234,12 +234,15 @@ class Pipeline:
                                 text,
                                 api_key=api_key,
                                 model=overrides.llm_model,
+                                prompt_name=overrides.llm_prompt,
                             )
                         finally:
                             self._llm_in_flight -= 1
                 if isinstance(det, RegexDetector):
                     return await det.detect(
-                        text, overlap_strategy=overrides.regex_overlap_strategy,
+                        text,
+                        overlap_strategy=overrides.regex_overlap_strategy,
+                        patterns_name=overrides.regex_patterns,
                     )
                 return await det.detect(text)
             except LLMUnavailableError as exc:

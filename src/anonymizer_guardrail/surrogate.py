@@ -252,21 +252,32 @@ class SurrogateGenerator:
         # value via SURROGATE_SALT for log-correlation use cases.
         self._salt = _resolve_salt(config.surrogate_salt)
         self._generators = _build_generators(self._use_faker, self._salt)
+        # Always instantiate a default Faker — even when config.use_faker
+        # is False — so a per-request `use_faker=true` override has a
+        # working instance to fall back on without needing a different
+        # locale. Construction is ~1–2 ms (one-time at startup) and
+        # negligible memory; the saved code path is "the override always
+        # works, regardless of config default."
+        # An invalid FAKER_LOCALE fails loud at boot only when the
+        # operator actually asked for Faker mode. Under USE_FAKER=false
+        # the locale was never the operator's stated intent, so we log
+        # and leave self._fake unset; per-request use_faker=true
+        # overrides will fall back to opaque output for that call.
         self._fake: Faker | None = None
-        if self._use_faker:
-            # Instantiate once and reuse — Faker construction is ~1–2 ms;
-            # `seed_instance` on an existing instance is ~0.15 ms. With a
-            # cache that dedupes by (text, type), this only matters when a
-            # request brings many unique entities, but it's a free win.
-            # An invalid locale also fails here at boot with a clear message
-            # rather than at first request with a confusing AttributeError.
-            try:
-                self._fake = Faker(self._locales)
-            except (AttributeError, ValueError, ModuleNotFoundError) as exc:
+        try:
+            self._fake = Faker(self._locales)
+        except (AttributeError, ValueError, ModuleNotFoundError) as exc:
+            if self._use_faker:
                 raise RuntimeError(
                     f"FAKER_LOCALE={config.faker_locale!r} is not a valid Faker "
                     f"locale: {exc}. See https://faker.readthedocs.io/ for the list."
                 ) from exc
+            log.warning(
+                "FAKER_LOCALE=%r is not a valid Faker locale (%s). USE_FAKER "
+                "is false so this is non-fatal at startup, but per-request "
+                "use_faker=true overrides won't be able to fall back to it.",
+                config.faker_locale, exc,
+            )
         # Cache of Faker instances keyed by locale tuple, populated on
         # demand by per-request overrides. The default instance lives
         # in self._fake (above); this OrderedDict only holds the

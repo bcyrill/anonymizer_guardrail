@@ -53,6 +53,56 @@ litellm_settings:
         # redacts headers to "[present]" unless they're on this allowlist.
         # extra_headers: [authorization]
 
+        # ── Per-request override defaults ──────────────────────────────────
+        # `additional_provider_specific_params` is forwarded verbatim to our
+        # guardrail. Use it to set deployment-wide defaults that any single
+        # request can still override via client-side `extra_body` (see the
+        # client usage example at the bottom of this file).
+        #
+        # Recognised keys (each maps to the matching env var on the
+        # anonymizer service; client-side override wins, then static config
+        # below, then the env-var-configured default in the container):
+        #
+        #   use_faker                bool. False forces opaque [TYPE_…] tokens.
+        #   faker_locale             string ("pt_BR,en_US") or list (["pt_BR", "en_US"]).
+        #                            Capped at 3 locales per call (see README).
+        #   detector_mode            string or list. Subset of the configured
+        #                            detectors (regex, privacy_filter, llm).
+        #                            Capped at 3 entries.
+        #   regex_overlap_strategy   "longest" (default) or "priority".
+        #   regex_patterns           NAME of a registered alternative regex
+        #                            pattern set. Names are pre-declared
+        #                            server-side via REGEX_PATTERNS_REGISTRY
+        #                            (the request never gets to pass a path
+        #                            directly — that would be a bypass
+        #                            vector). Unknown name → warn + fallback.
+        #   llm_model                string. Model alias the LLM detector
+        #                            sends to its backend (overrides LLM_MODEL).
+        #   llm_prompt               NAME of a registered alternative LLM
+        #                            detection prompt — same path-safety
+        #                            policy as regex_patterns. Pre-declared
+        #                            server-side via LLM_SYSTEM_PROMPT_REGISTRY.
+        #
+        # Bad values for known keys log a warning and are dropped — the
+        # request still proceeds with the next-most-specific value.
+        # additional_provider_specific_params:
+        #   use_faker: false
+        #   regex_overlap_strategy: longest
+
+# To use the named-alternatives mechanism, pre-declare the allowed paths
+# server-side (in the env passed to the anonymizer container, NOT here).
+# Both env vars take comma-separated `name=path` pairs:
+#
+#   REGEX_PATTERNS_REGISTRY="pentest=bundled:regex_pentest.yaml,internal=/etc/anon/internal.yaml"
+#   LLM_SYSTEM_PROMPT_REGISTRY="pentest=bundled:llm_pentest.md,legal=/etc/anon/legal.md"
+#
+# Then per-request callers reference them by name only — never path —
+# so an attacker can't redirect detection to /etc/passwd or to an
+# empty file that disables redaction. Unknown names log a warning and
+# fall back to the default. The reserved name "default" is rejected
+# in the registry; the default always comes from REGEX_PATTERNS_PATH /
+# LLM_SYSTEM_PROMPT_PATH.
+
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 
@@ -60,8 +110,34 @@ general_settings:
 #
 #   from openai import OpenAI
 #   client = OpenAI(base_url="http://litellm:4000", api_key="<master_key>")
+#
+#   # Basic — just opt into anonymization:
 #   client.chat.completions.create(
 #       model="gpt-4o-mini",
 #       messages=[{"role": "user", "content": "..."}],
-#       guardrails=["anonymizer"],   # ← opts into anonymization
+#       guardrails=["anonymizer"],
+#   )
+#
+#   # Per-request overrides via the dynamic-guardrail form. extra_body for
+#   # this guardrail is merged into additional_provider_specific_params and
+#   # forwarded to our service. See the README "Per-request overrides"
+#   # section for the full key list and validation rules.
+#   client.chat.completions.create(
+#       model="gpt-4o-mini",
+#       messages=[{"role": "user", "content": "Hi alice@corp.example."}],
+#       guardrails=[
+#           {"anonymizer": {"extra_body": {
+#               "use_faker": True,
+#               "faker_locale": "ja_JP",
+#               # detector_mode subsets the configured detectors:
+#               "detector_mode": ["regex", "llm"],
+#               "regex_overlap_strategy": "longest",
+#               "llm_model": "gpt-4o",
+#               # Reference NAMED alternatives the operator pre-declared
+#               # in REGEX_PATTERNS_REGISTRY / LLM_SYSTEM_PROMPT_REGISTRY.
+#               # The request only sends names — never paths.
+#               "regex_patterns": "pentest",
+#               "llm_prompt": "legal",
+#           }}}
+#       ],
 #   )
