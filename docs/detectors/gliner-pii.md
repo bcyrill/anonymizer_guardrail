@@ -34,6 +34,40 @@ crashes loud at boot.
 | `GLINER_PII_THRESHOLD` | *(empty → server default)* | Confidence cutoff (0..1) sent with every request. Empty = use the gliner-pii-service's `DEFAULT_THRESHOLD`. |
 | `GLINER_PII_MAX_CONCURRENCY` | `10` | Semaphore on in-flight gliner-pii calls. Independent of `LLM_MAX_CONCURRENCY` and `PRIVACY_FILTER_MAX_CONCURRENCY`. Surfaced as `gliner_pii_in_flight`/`gliner_pii_max_concurrency` on `/health`. |
 
+## Per-request overrides
+
+Two gliner-specific keys can be passed in
+`additional_provider_specific_params` (see
+[per-request overrides](../per-request-overrides.md) for the general
+shape):
+
+| Override key | Type | Effect |
+|---|---|---|
+| `gliner_labels` | `string` (comma-separated) or `string[]` | Override `GLINER_PII_LABELS` for this call. Empty / missing → fall back to `GLINER_PII_LABELS`, then to the service's `DEFAULT_LABELS`. Capped at 50 entries (anything larger logs a warning and falls back). |
+| `gliner_threshold` | `number` in `[0, 1]` | Override `GLINER_PII_THRESHOLD` for this call. Out-of-range / non-number values warn and fall back. JSON booleans are explicitly rejected (Python's `bool` would otherwise slip through as `0`/`1`). |
+
+Why per-request rather than a deployment-wide setting: the
+differentiator of GLiNER over a fixed token-classification model is
+*zero-shot labels* — the entity-type vocabulary is an input to the
+model. Per-request overrides let one deployment serve multiple routes
+with different vocabularies (one route asks for medical labels,
+another for finance labels) without redeploying or running multiple
+gliner-pii-service containers.
+
+```python
+# Ask the gliner detector to look for HIPAA-flavoured PII on this one call:
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[...],
+    guardrails=[
+        {"anonymizer": {"extra_body": {
+            "gliner_labels": ["person", "date_of_birth", "medical_record_number", "address"],
+            "gliner_threshold": 0.6,
+        }}}
+    ],
+)
+```
+
 ## Picking labels and threshold
 
 The label list is the model's only steering knob. A few patterns:
