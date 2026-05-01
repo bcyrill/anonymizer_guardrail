@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}/.."
 
-c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'; c_rst=$'\033[0m'
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'; c_bld=$'\033[1m'; c_rst=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s%s%s\n' "$c_ylw" "$*" "$c_rst"; }
 err()  { printf '%s%s%s\n' "$c_red" "$*" "$c_rst" >&2; }
@@ -60,7 +60,10 @@ Without -t, prompts interactively.
                                    with a YAML rules file, for driving
                                    the guardrail's LLM detector
                                    deterministically (see fake-llm/)
-  -T, --tag TAG       Override the default image tag for this build.
+                        all        build all four flavours in sequence
+                                   (uses the default tag for each — pass
+                                   -T separately if you want overrides)
+  -T, --tag TAG       Override the default image tag (single-flavour only).
   -h, --help          Show this help.
 
 Anything after \`--\` is passed straight through to the build engine,
@@ -98,73 +101,116 @@ if [[ -z "$TYPE" ]]; then
   say "  ${c_grn}2)${c_rst} pf         privacy-filter, runtime download"
   say "  ${c_grn}3)${c_rst} pf-baked   privacy-filter + model baked in"
   say "  ${c_grn}4)${c_rst} fake-llm   companion test backend ${c_dim}(deterministic LLM)${c_rst}"
+  say "  ${c_grn}a)${c_rst} all        build all four flavours in sequence"
   say ""
-  read -r -p "Choose [1-4, default 1]: " choice || true
+  read -r -p "Choose [1-4/a, default 1]: " choice || true
   case "${choice:-1}" in
-    1) TYPE="slim" ;;
-    2) TYPE="pf" ;;
-    3) TYPE="pf-baked" ;;
-    4) TYPE="fake-llm" ;;
+    1)   TYPE="slim" ;;
+    2)   TYPE="pf" ;;
+    3)   TYPE="pf-baked" ;;
+    4)   TYPE="fake-llm" ;;
+    a|A) TYPE="all" ;;
     *) err "Invalid choice."; exit 1 ;;
   esac
 fi
 
-# ── Resolve flavour to build-args, Containerfile, context, tag ───────────────
-# Most flavours build the main guardrail image from the repo root
-# Containerfile. fake-llm is a separate companion image with its own
-# Containerfile and a self-contained build context under fake-llm/.
-CONTAINERFILE="Containerfile"
-BUILD_CONTEXT="."
-case "$TYPE" in
-  slim)
-    BUILD_ARGS=()
-    DEFAULT_TAG="$TAG_SLIM"
-    ;;
-  pf|privacy-filter)
-    BUILD_ARGS=(--build-arg WITH_PRIVACY_FILTER=true)
-    DEFAULT_TAG="$TAG_PF"
-    TYPE="pf"
-    ;;
-  pf-baked|privacy-filter-baked)
-    BUILD_ARGS=(
-      --build-arg WITH_PRIVACY_FILTER=true
-      --build-arg BAKE_PRIVACY_FILTER_MODEL=true
-    )
-    DEFAULT_TAG="$TAG_PF_BAKED"
-    TYPE="pf-baked"
-    ;;
-  fake-llm)
-    BUILD_ARGS=()
-    DEFAULT_TAG="$TAG_FAKE_LLM"
-    CONTAINERFILE="fake-llm/Containerfile"
-    BUILD_CONTEXT="fake-llm"
-    ;;
-  *)
-    err "Unknown type '${TYPE}'. Valid: slim, pf, pf-baked, fake-llm."
+# Expand "all" into a build list; otherwise use the single requested flavour.
+if [[ "$TYPE" == "all" ]]; then
+  if [[ -n "$TAG_OVERRIDE" ]]; then
+    err "-T/--tag isn't supported with --type all (each flavour uses its own default tag)."
     exit 1
-    ;;
-esac
+  fi
+  BUILD_LIST=(slim pf pf-baked fake-llm)
+else
+  BUILD_LIST=("$TYPE")
+fi
 
-TAG="${TAG_OVERRIDE:-$DEFAULT_TAG}"
+# ── Per-flavour resolver: maps a flavour name to build-args, Containerfile,
+# build context, and default tag. Sets globals that build_one consumes.
+# Most flavours build the main guardrail image from the repo root
+# Containerfile; fake-llm is a separate companion image with its own
+# Containerfile and a self-contained build context under fake-llm/.
+resolve_flavour() {
+  CONTAINERFILE="Containerfile"
+  BUILD_CONTEXT="."
+  case "$1" in
+    slim)
+      BUILD_ARGS=()
+      DEFAULT_TAG="$TAG_SLIM"
+      RESOLVED_TYPE="slim"
+      ;;
+    pf|privacy-filter)
+      BUILD_ARGS=(--build-arg WITH_PRIVACY_FILTER=true)
+      DEFAULT_TAG="$TAG_PF"
+      RESOLVED_TYPE="pf"
+      ;;
+    pf-baked|privacy-filter-baked)
+      BUILD_ARGS=(
+        --build-arg WITH_PRIVACY_FILTER=true
+        --build-arg BAKE_PRIVACY_FILTER_MODEL=true
+      )
+      DEFAULT_TAG="$TAG_PF_BAKED"
+      RESOLVED_TYPE="pf-baked"
+      ;;
+    fake-llm)
+      BUILD_ARGS=()
+      DEFAULT_TAG="$TAG_FAKE_LLM"
+      CONTAINERFILE="fake-llm/Containerfile"
+      BUILD_CONTEXT="fake-llm"
+      RESOLVED_TYPE="fake-llm"
+      ;;
+    *)
+      err "Unknown type '$1'. Valid: slim, pf, pf-baked, fake-llm, all."
+      exit 1
+      ;;
+  esac
+  TAG="${TAG_OVERRIDE:-$DEFAULT_TAG}"
+}
+
+# Run a single build. Honors EXTRA_ARGS (passthrough after `--`).
+build_one() {
+  resolve_flavour "$1"
+  say ""
+  say "${c_bld}── Building ${RESOLVED_TYPE} → ${TAG} ──${c_rst}"
+  say "${c_dim}${ENGINE} build -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f ${CONTAINERFILE} ${BUILD_CONTEXT}${c_rst}"
+  "$ENGINE" build -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f "$CONTAINERFILE" "$BUILD_CONTEXT"
+  ok "Built ${TAG}."
+}
+
+# ── Plan output ──────────────────────────────────────────────────────────────
+# Pre-resolve each requested flavour so the plan can list final tags.
+declare -a PLAN_TAGS=()
+for f in "${BUILD_LIST[@]}"; do
+  resolve_flavour "$f"
+  PLAN_TAGS+=("${RESOLVED_TYPE} → ${TAG}")
+done
 
 say ""
 say "Engine:    ${c_grn}${ENGINE}${c_rst}"
-say "Flavour:   ${c_grn}${TYPE}${c_rst}"
-say "Tag:       ${c_grn}${TAG}${c_rst}"
-if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
-  say "Build args: ${c_dim}${BUILD_ARGS[*]}${c_rst}"
+if [[ ${#BUILD_LIST[@]} -eq 1 ]]; then
+  say "Flavour:   ${c_grn}${PLAN_TAGS[0]}${c_rst}"
+else
+  say "Flavours:"
+  for entry in "${PLAN_TAGS[@]}"; do
+    say "  ${c_grn}${entry}${c_rst}"
+  done
 fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   say "Passthrough: ${c_dim}${EXTRA_ARGS[*]}${c_rst}"
 fi
 say ""
 
-if [[ "$TYPE" == "pf-baked" ]]; then
-  warn "This build downloads the openai/privacy-filter model at"
-  warn "build time. Network access is required and the build will take"
-  warn "several minutes the first time (subsequent builds use the layer cache)."
-  say ""
-fi
+# pf-baked downloads the model at build time — call it out whether
+# selected directly or pulled in via "all".
+for f in "${BUILD_LIST[@]}"; do
+  if [[ "$f" == "pf-baked" || "$f" == "privacy-filter-baked" ]]; then
+    warn "The pf-baked build downloads the openai/privacy-filter model at"
+    warn "build time. Network access is required and the build will take"
+    warn "several minutes the first time (subsequent builds use the layer cache)."
+    say ""
+    break
+  fi
+done
 
 read -r -p "Proceed? [Y/n] " reply || true
 reply="${reply:-y}"
@@ -173,12 +219,25 @@ if [[ ! "$reply" =~ ^[Yy]$ ]]; then
   exit 0
 fi
 
-say ""
-say "${c_dim}Running: ${ENGINE} build -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f ${CONTAINERFILE} ${BUILD_CONTEXT}${c_rst}"
-"$ENGINE" build -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f "$CONTAINERFILE" "$BUILD_CONTEXT"
+# ── Build each flavour. Bail on the first failure. ──────────────────────────
+for f in "${BUILD_LIST[@]}"; do
+  build_one "$f"
+done
 
-say ""
-ok "Built ${TAG}."
+# Restore the final flavour's resolved state for the post-build hint
+# below (single-flavour case). For "all" we'll skip the per-flavour
+# hint and just summarize.
+if [[ ${#BUILD_LIST[@]} -gt 1 ]]; then
+  say ""
+  ok "Built ${#BUILD_LIST[@]} images."
+  say ""
+  say "${c_dim}Try them via:${c_rst}"
+  say "  scripts/menu.sh                       ${c_dim}# interactive picker${c_rst}"
+  say "  scripts/cli.sh --preset uuid-debug    ${c_dim}# slim + fake-llm${c_rst}"
+  say "  scripts/cli.sh --preset pentest       ${c_dim}# pf + fake-llm + pentest config${c_rst}"
+  exit 0
+fi
+TYPE="$RESOLVED_TYPE"
 
 # ── Post-build run hint, tailored to the flavour ─────────────────────────────
 say ""
