@@ -73,17 +73,59 @@ response = client.chat.completions.create(
 The label list is the model's only steering knob. A few patterns:
 
 - **Broad PII coverage** — start with a comprehensive set
-  (`person,email,phone,address,ssn,credit_card,iban,date_of_birth,medical_record_number`)
+  (`first_name,last_name,email,phone_number,street_address,ssn,credit_debit_card,date_of_birth,medical_record_number`)
   and trim based on false-positive review.
 - **Compliance-driven** — pick the exact labels a regulation cares
-  about (HIPAA → medical record numbers, dates of birth, names; PCI →
-  card numbers; GDPR → broad PII).
+  about (HIPAA → `medical_record_number`, `health_plan_beneficiary_number`,
+  `date_of_birth`, `first_name`, `last_name`; PCI → `credit_debit_card`,
+  `cvv`; GDPR → broad PII).
 - **Domain-specific** — for legal, finance, healthcare etc., add
   domain labels alongside the standard ones.
 
 Threshold trades recall for precision. The default 0.5 is a reasonable
 middle ground; lower for a long-tail of edge cases, higher when noise
 is more costly than misses.
+
+### Labels the model was trained on
+
+The [model card](https://huggingface.co/nvidia/gliner-PII) states the
+detector was fine-tuned on
+[`nvidia/Nemotron-PII`](https://huggingface.co/datasets/nvidia/Nemotron-PII)
+with **"55+ entity types"**. The training dataset's `spans.label`
+field is the authoritative list — broadly:
+
+| Category | Labels |
+|---|---|
+| Names & demographics | `first_name`, `last_name`, `user_name`, `age`, `gender`, `race_ethnicity`, `sexuality`, `religious_belief`, `political_view`, `language`, `education_level`, `employment_status`, `occupation` |
+| Contact | `email`, `phone_number`, `fax_number` |
+| Location | `street_address`, `city`, `county`, `state`, `country`, `postcode`, `coordinate` |
+| Dates & times | `date`, `time`, `date_time`, `date_of_birth` |
+| Financial | `account_number`, `bank_routing_number`, `swift_bic`, `credit_debit_card`, `cvv`, `pin` |
+| Government / personal IDs | `ssn`, `national_id`, `tax_id`, `customer_id`, `employee_id`, `unique_id`, `biometric_identifier`, `certificate_license_number` |
+| Health | `medical_record_number`, `health_plan_beneficiary_number`, `blood_type` |
+| Tech & network | `url`, `ipv4`, `ipv6`, `mac_address`, `http_cookie`, `password`, `api_key`, `device_identifier` |
+| Vehicle | `license_plate`, `vehicle_identifier` |
+| Organisation | `company_name` |
+
+Two practical notes:
+
+1. **Label strings are case-sensitive and the wording matters.** The
+   model learned the underscored snake_case forms above (`phone_number`,
+   not `phone` or `phone number`). Asking for a different phrasing of
+   the same concept can give measurably different results — when in
+   doubt, copy the label verbatim from the table.
+2. **GLiNER is architecturally zero-shot**, so the model accepts
+   arbitrary labels at inference (`["chemical_compound",
+   "sports_team"]` won't error). But quality is highest on labels in
+   the training distribution; off-distribution labels are best-effort.
+   For non-PII zero-shot NER, the upstream `urchade/gliner_large-v2.1`
+   base model is a better starting point than this PII fine-tune.
+
+The label-to-`ENTITY_TYPES` mapping in
+`src/anonymizer_guardrail/detector/remote_gliner_pii.py:_LABEL_TO_ENTITY_TYPE`
+covers the most common labels; anything unmapped passes through as
+`OTHER` and gets an opaque-token surrogate. Add a row to the map when
+you start using a new label so the surrogates use the right shape.
 
 ## Selecting the backend
 
