@@ -378,12 +378,28 @@ class Pipeline:
         if not texts:
             return [], {}
 
-        per_text_matches = await asyncio.gather(
-            *[
-                self._detect_one(t, api_key=api_key, overrides=overrides)
-                for t in texts
-            ]
-        )
+        # Same TaskGroup-not-gather rationale as `_detect_one` one level
+        # down: when one text trips fail-closed (e.g. the LLM detector
+        # times out), TaskGroup cancels the in-flight sibling text-tasks
+        # AND every detector call inside them. asyncio.gather would
+        # propagate the exception immediately but leak the in-flight
+        # work, burning compute and pinning detector concurrency slots
+        # for the duration of the doomed request. The except* unwrap
+        # re-raises the first matching typed exception so main.py's
+        # typed-error handler matches — it wouldn't catch the
+        # BaseExceptionGroup TaskGroup raises by default.
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(
+                        self._detect_one(t, api_key=api_key, overrides=overrides)
+                    )
+                    for t in texts
+                ]
+        except* TYPED_UNAVAILABLE_ERRORS as eg:
+            raise eg.exceptions[0] from None
+
+        per_text_matches = [t.result() for t in tasks]
 
         # Build one process-wide mapping (original → surrogate) so the same
         # entity gets the same surrogate across all texts in this request.
