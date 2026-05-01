@@ -198,9 +198,9 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_API_BASE`    | `http://litellm:4000/v1`      | OpenAI-compatible endpoint               |
 | `LLM_API_KEY`     | *(empty)*                     | Bearer token if the endpoint needs one   |
 | `LLM_USE_FORWARDED_KEY` | `false`                 | Use the caller's Authorization header (see below) |
-| `LLM_SYSTEM_PROMPT_PATH` | *(empty)*              | Override the bundled detection prompt    |
+| `LLM_SYSTEM_PROMPT_PATH` | *(empty → bundled `llm_default.md`)* | Override the bundled detection prompt |
 | `LLM_SYSTEM_PROMPT_REGISTRY` | *(empty)*          | Comma-separated `name=path` list of NAMED alternative prompts callers can opt into per-request via `llm_prompt`. See *Per-request overrides → Named alternatives* below. |
-| `REGEX_PATTERNS_PATH` | *(empty)*                 | Override the bundled regex patterns YAML |
+| `REGEX_PATTERNS_PATH` | *(empty → bundled `regex_default.yaml`)* | Override the bundled regex patterns YAML |
 | `REGEX_PATTERNS_REGISTRY` | *(empty)*             | Comma-separated `name=path` list of NAMED alternative regex pattern files callers can opt into per-request via `regex_patterns`. See *Per-request overrides → Named alternatives* below. |
 | `REGEX_OVERLAP_STRATEGY` | `longest`              | `longest` (longest match wins on overlapping spans) or `priority` (first pattern in YAML order wins). See *Regex overlap resolution* below. |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
@@ -209,7 +209,7 @@ All knobs are environment variables; sensible defaults baked into
 | `SURROGATE_FAKER_LRU_MAX` | `32`                  | LRU cap on per-locale Faker instances built for `faker_locale` overrides. Bounds memory against callers cycling distinct locale tuples. See *Per-request overrides* below. |
 | `SURROGATE_SALT`  | *(empty → random)*            | blake2b key for surrogate hashes (see below) |
 | `LLM_MODEL`       | `anonymize`                   | Model alias used for detection           |
-| `LLM_TIMEOUT_S`   | `30`                          |                                          |
+| `LLM_TIMEOUT_S`   | `30`                          | Per-call timeout (seconds) on LLM detector HTTP requests |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
 | `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
