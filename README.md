@@ -54,6 +54,94 @@ substitutions across multi-turn conversations.
 Opaque tokens are still used for things where realism would be misleading
 (`HASH`, `JWT`, `CREDENTIAL`, `TOKEN`, `AWS_ACCESS_KEY`).
 
+## State and lifecycle
+
+The service holds two separate in-memory stores. They serve different
+purposes and have different eviction strategies — worth keeping
+straight when reasoning about correctness, restarts, and capacity.
+
+### Vault (per-request mapping)
+
+The vault is what makes round-trip deanonymization work. When a
+`request` call comes in with a `litellm_call_id`, the
+surrogate→original mapping for that request is stored under that ID.
+When the matching `response` call arrives, the mapping is *popped*
+(read + deleted in one step) so the upstream model's reply can be
+restored verbatim.
+
+- **Lifecycle:** written on `input_type=request`, popped on
+  `input_type=response`. One-shot per `litellm_call_id`.
+- **Expiry:** entries older than `VAULT_TTL_S` (default 600s) are
+  evicted lazily — checked on every read. There's no background
+  sweeper. The TTL is a backstop for the case where LiteLLM crashes
+  or aborts before issuing the matching `response` call (without it
+  the vault would grow without bound).
+- **Scope:** in-memory in the guardrail process. Not shared across
+  replicas, not persisted across restarts (see *Limitations*).
+- **Skipped when `call_id` is missing.** A request without
+  `litellm_call_id` is still anonymized, but no mapping is stored —
+  the response side has nothing to restore against. Surfaces in the
+  log as `"Anonymized N entities but no call_id was provided —
+  deanonymization will not work for this request"`.
+
+### Surrogate cache (cross-call consistency)
+
+The surrogate generator memoizes `(entity_type, original_text) →
+surrogate` so the same input always yields the same surrogate —
+within one request *and* across many. This is what lets an upstream
+model see a stable view of a given email/hostname/UUID over a
+multi-turn conversation, even though each turn is a separate
+LiteLLM call (and therefore a separate vault entry).
+
+- **Lifecycle:** populated by every detected match. Outlives the
+  surrounding request/response cycle — that's the whole point.
+- **Eviction:** LRU at `SURROGATE_CACHE_MAX_SIZE` entries (default
+  100 000). No time-based expiry; entries stay until newer ones
+  push them out.
+- **Scope:** same as the vault — in-memory, per-process, not shared.
+- **Determinism across restart:** every surrogate is derived from a
+  keyed BLAKE2b hash of the original. The key is `SURROGATE_SALT`.
+  - Default (random salt per process start): same input → same
+    surrogate **within** a process; the cache speeds it up but the
+    derivation is itself deterministic. After a restart the salt
+    changes, so old surrogates are no longer reproducible.
+  - With `SURROGATE_SALT` set to a stable string: same input → same
+    surrogate forever. Useful for log-correlation. See
+    [Surrogate salt](#surrogate-salt-privacy-hardening) for the
+    privacy trade-off.
+- **Collision handling:** if two distinct originals would produce
+  the same surrogate, the generator salts and retries. After a
+  small number of failed attempts it falls back to a guaranteed-
+  unique opaque token (bounds the worst-case; effectively never
+  happens in practice).
+
+### Observability
+
+`/health` returns live counters for both stores so operators can
+monitor pressure or leak without inspecting the process:
+
+```json
+{
+  "status": "ok",
+  "detector_mode": "regex,llm",
+  "vault_size": 3,
+  "surrogate_cache_size": 1421,
+  "surrogate_cache_max": 100000,
+  "llm_in_flight": 0,
+  "llm_max_concurrency": 10
+}
+```
+
+- `vault_size` is the number of *open* round-trips — requests that
+  came in but whose responses haven't arrived yet. A steady-state
+  value near zero is healthy. A monotonically growing value points
+  at LiteLLM losing the response side, which the TTL eventually
+  catches up with.
+- `surrogate_cache_size` near `surrogate_cache_max` for sustained
+  periods means LRU eviction is firing — the oldest cross-request
+  consistency invariants are quietly being lost. Bump
+  `SURROGATE_CACHE_MAX_SIZE` if that matters for your traffic shape.
+
 ## Wiring it into LiteLLM
 
 A working `config.yaml` snippet (see `litellm.config.example.yaml` for the
