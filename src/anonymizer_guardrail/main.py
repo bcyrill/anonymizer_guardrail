@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from .api import GuardrailRequest, GuardrailResponse, parse_overrides
 from .config import config
 from .detector.llm import LLMUnavailableError
+from .detector.remote_gliner_pii import GlinerPIIUnavailableError
 from .detector.remote_privacy_filter import PrivacyFilterUnavailableError
 from .pipeline import Pipeline
 
@@ -177,6 +178,19 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             action="BLOCKED",
             blocked_reason=(
                 "Anonymization privacy-filter is unreachable; request "
+                "blocked to prevent unredacted data from reaching the "
+                "upstream model."
+            ),
+        )
+    except GlinerPIIUnavailableError as exc:
+        # Reached only when gliner_pii_fail_closed=True. Same risk shape
+        # as the other detector outages — silent coverage downgrade is
+        # exactly what fail-closed exists to prevent.
+        log.error("Blocking request — gliner-pii detector unavailable: %s", exc)
+        return GuardrailResponse(
+            action="BLOCKED",
+            blocked_reason=(
+                "Anonymization gliner-pii is unreachable; request "
                 "blocked to prevent unredacted data from reaching the "
                 "upstream model."
             ),

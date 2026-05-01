@@ -66,6 +66,34 @@ class Config:
     # Whitespace tolerated; duplicates collapsed; unknown names warn-and-skip.
     detector_mode: str = os.getenv("DETECTOR_MODE", "regex,llm").lower()
 
+    # Faker locale(s) used by the surrogate generator. Empty → Faker's own
+    # default (en_US). Single locale ("pt_BR") or comma-separated list
+    # ("pt_BR,en_US") with the first one preferred and others used as
+    # fallback for providers the primary doesn't implement. Invalid
+    # locales fail at startup, not at first request.
+    faker_locale: str = os.getenv("FAKER_LOCALE", "")
+    # When false, every surrogate is an opaque deterministic placeholder
+    # (e.g. `[PERSON_7F3A2B]`) instead of a realistic Faker substitute.
+    # Useful when the upstream model misinterprets realistic surrogates as
+    # real data, or when realism would mislead a downstream tool. Faker is
+    # not even instantiated when disabled.
+    use_faker: bool = _env_bool("USE_FAKER", True)
+    # Cap on the surrogate generator's process-wide LRU cache. Each entry is
+    # ~150–300 bytes (entity type + original text + surrogate + bookkeeping),
+    # so 100k entries ≈ 30 MB worst case. The cache backs cross-request
+    # surrogate consistency for multi-turn conversations — set higher if
+    # you have very chatty users; lower (or zero, effectively disabling)
+    # if memory is tight and per-request consistency is enough.
+    surrogate_cache_max_size: int = _env_int("SURROGATE_CACHE_MAX_SIZE", 100_000)
+    # Secret keying material mixed into the blake2b hashes the surrogate
+    # generator uses (both the Faker seed and the opaque-token digest).
+    # Empty (the default) → a fresh 16-byte random salt is generated each
+    # time the process starts. Set to a fixed string to keep surrogates
+    # stable across restarts (useful for log-correlation analysis, but
+    # weakens privacy: the salt becomes ambient and attackers who learn
+    # it can brute-force low-entropy entities like IPs and phone numbers).
+    surrogate_salt: str = os.getenv("SURROGATE_SALT", "")
+
     # ── LLM detector ───────────────────────────────────────────────────────────
     # OpenAI-compatible endpoint. When pointed at LiteLLM, ensure the model used
     # here does NOT have this guardrail attached (otherwise → infinite recursion).
@@ -97,6 +125,27 @@ class Config:
     # Example:
     #   LLM_SYSTEM_PROMPT_REGISTRY="pentest=bundled:llm_pentest.md,legal=/etc/anon/legal.md"
     llm_system_prompt_registry: str = os.getenv("LLM_SYSTEM_PROMPT_REGISTRY", "")
+    # Hard cap on input size sent to the LLM in one call. Inputs above this
+    # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
+    # silently truncated — truncating in a guardrail would let everything past
+    # this length through unscanned. Default is generous (~50K tokens), well
+    # within typical small-model context windows; tune to your model.
+    llm_max_chars: int = _env_int("LLM_MAX_CHARS", 200_000)
+    # Max number of concurrent LLM calls.
+    llm_max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
+    # If the LLM detector errors out, do we proceed with regex-only results
+    # (fail_open) or block the request (fail_closed)? LiteLLM has its own
+    # `unreachable_fallback` for when WE are down; this controls our internal
+    # behaviour when our LLM dependency is down. Independent from
+    # `privacy_filter_fail_closed` (above) — operators can fail closed on
+    # one detector and open on the other.
+    # Backward compat: `FAIL_CLOSED` was the old name for this env var,
+    # before the privacy-filter detector got its own fail-mode flag. The
+    # default-resolver below honours `FAIL_CLOSED` with a deprecation
+    # warning if the new name is unset.
+    llm_fail_closed: bool = _llm_fail_closed_default()
+
+    # ── Regex detector ───────────────────────────────────────────────────────────
     # Path to the YAML file defining the regex detector's patterns. If unset,
     # the bundled default (patterns/regex_default.yaml) is used. Pre-built
     # alternatives also ship with the package (e.g. patterns/regex_pentest.yaml)
@@ -107,6 +156,20 @@ class Config:
     # Example:
     #   REGEX_PATTERNS_REGISTRY="pentest=bundled:regex_pentest.yaml,internal=/etc/anon/internal.yaml"
     regex_patterns_registry: str = os.getenv("REGEX_PATTERNS_REGISTRY", "")
+    # How the regex detector resolves overlapping matches between patterns:
+    #   - "longest"  pick the longest match span (default). Robust against
+    #                a child YAML's narrow pattern shadowing a parent's
+    #                wider pattern — e.g. the pentest set's
+    #                `\b\d{12}\b` (AWS Account ID) matching the trailing
+    #                group of a UUID and squeezing out the UUID pattern.
+    #   - "priority" first pattern in YAML order wins. Useful when an
+    #                operator deliberately orders patterns most-specific-
+    #                first and wants that ordering to be load-bearing.
+    # Validated at startup; a typo crashes loudly rather than silently
+    # falling through to a default.
+    regex_overlap_strategy: str = os.getenv("REGEX_OVERLAP_STRATEGY", "longest").lower()
+
+    # ── Denylist detector ───────────────────────────────────────────────────────────
     # Path to the YAML file defining the denylist detector's literal-string
     # entries. If unset, the detector still loads under DETECTOR_MODE=denylist
     # but matches nothing — useful for boot order independence (operator
@@ -133,54 +196,6 @@ class Config:
     #                          `denylist-aho` optional extra.
     # Validated at startup; an unknown value crashes loud.
     denylist_backend: str = os.getenv("DENYLIST_BACKEND", "regex").strip().lower()
-    # How the regex detector resolves overlapping matches between patterns:
-    #   - "longest"  pick the longest match span (default). Robust against
-    #                a child YAML's narrow pattern shadowing a parent's
-    #                wider pattern — e.g. the pentest set's
-    #                `\b\d{12}\b` (AWS Account ID) matching the trailing
-    #                group of a UUID and squeezing out the UUID pattern.
-    #   - "priority" first pattern in YAML order wins. Useful when an
-    #                operator deliberately orders patterns most-specific-
-    #                first and wants that ordering to be load-bearing.
-    # Validated at startup; a typo crashes loudly rather than silently
-    # falling through to a default.
-    regex_overlap_strategy: str = os.getenv("REGEX_OVERLAP_STRATEGY", "longest").lower()
-    # Faker locale(s) used by the surrogate generator. Empty → Faker's own
-    # default (en_US). Single locale ("pt_BR") or comma-separated list
-    # ("pt_BR,en_US") with the first one preferred and others used as
-    # fallback for providers the primary doesn't implement. Invalid
-    # locales fail at startup, not at first request.
-    faker_locale: str = os.getenv("FAKER_LOCALE", "")
-    # When false, every surrogate is an opaque deterministic placeholder
-    # (e.g. `[PERSON_7F3A2B]`) instead of a realistic Faker substitute.
-    # Useful when the upstream model misinterprets realistic surrogates as
-    # real data, or when realism would mislead a downstream tool. Faker is
-    # not even instantiated when disabled.
-    use_faker: bool = _env_bool("USE_FAKER", True)
-    # Cap on the surrogate generator's process-wide LRU cache. Each entry is
-    # ~150–300 bytes (entity type + original text + surrogate + bookkeeping),
-    # so 100k entries ≈ 30 MB worst case. The cache backs cross-request
-    # surrogate consistency for multi-turn conversations — set higher if
-    # you have very chatty users; lower (or zero, effectively disabling)
-    # if memory is tight and per-request consistency is enough.
-    surrogate_cache_max_size: int = _env_int("SURROGATE_CACHE_MAX_SIZE", 100_000)
-    # Secret keying material mixed into the blake2b hashes the surrogate
-    # generator uses (both the Faker seed and the opaque-token digest).
-    # Empty (the default) → a fresh 16-byte random salt is generated each
-    # time the process starts. Set to a fixed string to keep surrogates
-    # stable across restarts (useful for log-correlation analysis, but
-    # weakens privacy: the salt becomes ambient and attackers who learn
-    # it can brute-force low-entropy entities like IPs and phone numbers).
-    surrogate_salt: str = os.getenv("SURROGATE_SALT", "")
-    # Hard cap on input size sent to the LLM in one call. Inputs above this
-    # are REFUSED (LLMUnavailableError → FAIL_CLOSED policy applies), never
-    # silently truncated — truncating in a guardrail would let everything past
-    # this length through unscanned. Default is generous (~50K tokens), well
-    # within typical small-model context windows; tune to your model.
-    llm_max_chars: int = _env_int("LLM_MAX_CHARS", 200_000)
-
-    # Max number of concurrent LLM calls.
-    llm_max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
 
     # ── Privacy-filter detector (in-process vs remote) ─────────────────────────
     # Empty (default) → DETECTOR_MODE=privacy_filter loads the model
@@ -205,7 +220,6 @@ class Config:
     # path (CPU/GPU contention in-process; thundering-herd over HTTP for
     # the remote service). Per-process semaphore caps that fan-out.
     privacy_filter_max_concurrency: int = _env_int("PRIVACY_FILTER_MAX_CONCURRENCY", 10)
-
     # Failure mode for the privacy_filter detector — mirrors FAIL_CLOSED
     # (which governs the LLM detector). When the privacy_filter service
     # is unreachable, times out, or returns non-200:
@@ -223,6 +237,51 @@ class Config:
     # PrivacyFilterUnavailableError when this is true.
     privacy_filter_fail_closed: bool = _env_bool("PRIVACY_FILTER_FAIL_CLOSED", True)
 
+    # ── GLiNER-PII detector (remote only) ──────────────────────────────────────
+    # Companion to the privacy_filter detector but built around NVIDIA's
+    # nvidia/gliner-pii model — the differentiator is *zero-shot labels*
+    # (the entity-type vocabulary is an input to the model, not baked
+    # into the architecture). Only a remote variant exists today; the
+    # in-process path would pull the gliner library + ~570M weights
+    # into the guardrail image, which we'd rather avoid until the
+    # detector has earned its keep on real traffic.
+    #
+    # Empty (default) → DETECTOR_MODE=gliner_pii is rejected at boot
+    # with a clear error: there's no in-process fallback, so an empty
+    # URL means "this detector isn't deployable in this process."
+    # Set to an HTTP URL → the detector posts to {URL}/detect on every
+    # request. The standalone gliner-pii-service container (see
+    # services/gliner_pii/) is the canonical other end.
+    gliner_pii_url: str = os.getenv("GLINER_PII_URL", "").strip()
+    # Per-call timeout on the remote detector's HTTP requests. Inference
+    # latency ranges ~10–50 ms on CPU and <5 ms on GPU per the model
+    # card; the default leaves plenty of headroom for first-request
+    # load, queueing, and slow networks.
+    gliner_pii_timeout_s: int = _env_int("GLINER_PII_TIMEOUT_S", 30)
+    # Failure mode when the remote service is unreachable, times out,
+    # or returns non-200. Independent of LLM_FAIL_CLOSED and
+    # PRIVACY_FILTER_FAIL_CLOSED — operators can fail closed on one
+    # detector and open on another without coupling.
+    gliner_pii_fail_closed: bool = _env_bool("GLINER_PII_FAIL_CLOSED", True)
+    # Default zero-shot label list to send with every request. Empty
+    # falls back to whatever the gliner-pii-service has configured as
+    # *its* DEFAULT_LABELS, which keeps both ends decoupled — operators
+    # can tune the vocabulary on either side. Set this client-side
+    # when you want different labels per guardrail deployment without
+    # redeploying the inference service.
+    # Format: comma-separated lowercase snake_case labels, e.g.
+    #   "person,email,phone_number,ssn,credit_card,medical_record_number"
+    gliner_pii_labels: str = os.getenv("GLINER_PII_LABELS", "")
+    # Confidence cutoff sent with every request. Empty → use whatever
+    # the gliner-pii-service has configured as its DEFAULT_THRESHOLD.
+    # 0..1; lower values produce more candidates with lower precision.
+    gliner_pii_threshold: str = os.getenv("GLINER_PII_THRESHOLD", "")
+    # Max number of concurrent gliner-pii calls. Same rationale as
+    # PRIVACY_FILTER_MAX_CONCURRENCY: a chatty request with N texts
+    # fans out to N HTTP calls in parallel, which the inference service
+    # has finite worker capacity to absorb.
+    gliner_pii_max_concurrency: int = _env_int("GLINER_PII_MAX_CONCURRENCY", 10)
+
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     vault_ttl_s: int = _env_int("VAULT_TTL_S", 600)
     # Hard cap on vault entries. TTL-only eviction fires lazily on put(), so a
@@ -234,19 +293,5 @@ class Config:
     # Raise if your traffic legitimately holds many in-flight call_ids
     # simultaneously (very chatty conversations, long-running streams).
     vault_max_entries: int = _env_int("VAULT_MAX_ENTRIES", 10_000)
-
-    # ── Failure mode ───────────────────────────────────────────────────────────
-    # If the LLM detector errors out, do we proceed with regex-only results
-    # (fail_open) or block the request (fail_closed)? LiteLLM has its own
-    # `unreachable_fallback` for when WE are down; this controls our internal
-    # behaviour when our LLM dependency is down. Independent from
-    # `privacy_filter_fail_closed` (above) — operators can fail closed on
-    # one detector and open on the other.
-    # Backward compat: `FAIL_CLOSED` was the old name for this env var,
-    # before the privacy-filter detector got its own fail-mode flag. The
-    # default-resolver below honours `FAIL_CLOSED` with a deprecation
-    # warning if the new name is unset.
-    llm_fail_closed: bool = _llm_fail_closed_default()
-
 
 config = Config()

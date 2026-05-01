@@ -42,6 +42,11 @@ DENYLIST_PATH=""
 DENYLIST_BACKEND=""              # empty → server default (regex)
 PRIVACY_FILTER_URL=""
 PRIVACY_FILTER_BACKEND=""        # empty | service | external
+GLINER_PII_URL=""
+GLINER_PII_BACKEND=""            # empty | service | external
+GLINER_PII_LABELS=""             # empty → server's DEFAULT_LABELS apply
+GLINER_PII_THRESHOLD=""          # empty → server's DEFAULT_THRESHOLD applies
+GLINER_PII_FAIL_CLOSED=true
 LLM_USE_FORWARDED_KEY=false
 LLM_FAIL_CLOSED=true
 PRIVACY_FILTER_FAIL_CLOSED=true
@@ -92,10 +97,11 @@ ws_pick_detector_mode() {
   # (pf / pf-baked) OR when the operator pointed at a remote
   # privacy-filter service (PRIVACY_FILTER_URL set on the slim image).
   local cur=",${DETECTOR_MODE},"
-  local has_regex=off has_denylist=off has_pf=off has_llm=off
+  local has_regex=off has_denylist=off has_pf=off has_gliner=off has_llm=off
   [[ "$cur" == *",regex,"*          ]] && has_regex=on
   [[ "$cur" == *",denylist,"*       ]] && has_denylist=on
   [[ "$cur" == *",privacy_filter,"* ]] && has_pf=on
+  [[ "$cur" == *",gliner_pii,"*     ]] && has_gliner=on
   [[ "$cur" == *",llm,"*            ]] && has_llm=on
 
   local opts=()
@@ -107,17 +113,22 @@ ws_pick_detector_mode() {
   # detector can take over. The launch-time validation catches the
   # slim+no-URL combination with a clear pointer.
   opts+=("privacy_filter" "Privacy-Filter" "$has_pf")
+  # `gliner_pii` is remote-only — there's no in-process variant in any
+  # guardrail image, so the operator must point at a gliner-pii-service
+  # via Detectors → GLiNER-PII. Same launch-time validation catches
+  # the no-URL case.
+  opts+=("gliner_pii" "GLiNER-PII (experimental)" "$has_gliner")
   opts+=("llm"     "LLM"             "$has_llm")
 
   local selected
   selected=$(dialog --title "Enabled detectors" --no-tags \
     --separate-output --checklist \
-    "Space toggles a detector. The order of type-resolution priority is regex → denylist → privacy_filter → llm." \
-    14 72 5 "${opts[@]}" 3>&1 1>&2 2>&3) || return 1
+    "Space toggles a detector. The order of type-resolution priority is regex → denylist → privacy_filter → gliner_pii → llm." \
+    16 72 6 "${opts[@]}" 3>&1 1>&2 2>&3) || return 1
 
   # Build the comma-separated list in canonical priority order.
   local mode=""
-  for d in regex denylist privacy_filter llm; do
+  for d in regex denylist privacy_filter gliner_pii llm; do
     if printf '%s\n' "$selected" | grep -qx "$d"; then
       [[ -z "$mode" ]] && mode="$d" || mode="${mode},${d}"
     fi
@@ -139,6 +150,16 @@ ws_pick_detector_mode() {
         && -z "$PRIVACY_FILTER_BACKEND" ]]; then
     PRIVACY_FILTER_BACKEND="service"
     [[ -z "$PRIVACY_FILTER_URL" ]] && PRIVACY_FILTER_URL="$PF_SERVICE_URL_LOCAL"
+  fi
+
+  # gliner_pii has no in-process variant on ANY flavour, so the same
+  # auto-default-to-service pattern applies whenever it gets ticked
+  # without a backend already chosen. Saves the operator one drill-in
+  # to reach a launchable state.
+  if [[ ",${DETECTOR_MODE}," == *",gliner_pii,"* \
+        && -z "$GLINER_PII_BACKEND" ]]; then
+    GLINER_PII_BACKEND="service"
+    [[ -z "$GLINER_PII_URL" ]] && GLINER_PII_URL="$GLINER_PII_URL_LOCAL"
   fi
 }
 
@@ -459,6 +480,96 @@ ws_pick_privacy_filter_url() {
   PRIVACY_FILTER_URL="$r"
 }
 
+ws_pick_gliner_pii_backend() {
+  # gliner_pii has no in-process variant — the choice is between
+  # auto-starting a local container (`service`) or pointing at one
+  # the operator already has running (`external`). Both feed
+  # GLINER_PII_URL to the guardrail; the difference is who manages
+  # the inference container's lifecycle.
+  local on_service=off on_external=off
+  case "$GLINER_PII_BACKEND" in
+    service)  on_service=on  ;;
+    external) on_external=on ;;
+    *)        on_service=on  ;;     # default: auto-start
+  esac
+
+  local r
+  r=$(dialog --title "GLiNER-PII backend" --no-tags --radiolist \
+    "Where the gliner_pii detector runs (no in-process variant exists)" 12 76 2 \
+    "service"  "service  — auto-start a local gliner-pii-service container" "$on_service" \
+    "external" "external — operator-supplied URL"                            "$on_external" \
+    3>&1 1>&2 2>&3) || return 1
+  case "$r" in
+    service)
+      GLINER_PII_BACKEND="service"
+      [[ -z "$GLINER_PII_URL" ]] && GLINER_PII_URL="$GLINER_PII_URL_LOCAL"
+      ;;
+    external)
+      GLINER_PII_BACKEND="external"
+      ws_pick_gliner_pii_url || return 1
+      if [[ -z "$GLINER_PII_URL" ]]; then
+        dialog --title "URL required" --msgbox \
+          "External backend needs a URL. Reverting to service." 8 60
+        GLINER_PII_BACKEND="service"
+        GLINER_PII_URL="$GLINER_PII_URL_LOCAL"
+      fi
+      ;;
+  esac
+}
+
+ws_pick_gliner_pii_url() {
+  local r
+  r=$(dialog --title "GLiNER-PII URL" --inputbox \
+    "GLINER_PII_URL — base URL of a gliner-pii-service. Example: http://gliner-pii-service:8002" \
+    10 70 "$GLINER_PII_URL" \
+    3>&1 1>&2 2>&3) || return 1
+  GLINER_PII_URL="$r"
+}
+
+ws_pick_gliner_pii_labels() {
+  # Empty = "use whatever DEFAULT_LABELS the gliner-pii-service has
+  # configured." Setting this client-side overrides the server-side
+  # default, which is useful when one inference container serves
+  # several guardrail deployments with different vocabularies.
+  local r
+  r=$(dialog --title "GLiNER-PII labels" --inputbox \
+    "GLINER_PII_LABELS — comma-separated zero-shot labels (e.g. 'person,email,ssn,credit_card'). Empty = use the gliner-pii-service's DEFAULT_LABELS." \
+    11 70 "$GLINER_PII_LABELS" \
+    3>&1 1>&2 2>&3) || return 1
+  # Trim spaces so commas don't inherit incidental whitespace from
+  # paste sources.
+  GLINER_PII_LABELS="$(printf '%s' "$r" | sed 's/ *, */,/g; s/^ *//; s/ *$//')"
+}
+
+ws_pick_gliner_pii_threshold() {
+  local r
+  r=$(dialog --title "GLiNER-PII threshold" --inputbox \
+    "GLINER_PII_THRESHOLD — confidence cutoff (0..1). Empty = use the gliner-pii-service's DEFAULT_THRESHOLD (0.5)." \
+    10 70 "$GLINER_PII_THRESHOLD" \
+    3>&1 1>&2 2>&3) || return 1
+  # Validate at edit time so the operator gets immediate feedback
+  # rather than a confusing failure at boot. Empty is allowed
+  # (server default applies).
+  if [[ -n "$r" ]]; then
+    if ! awk -v v="$r" 'BEGIN { exit !(v ~ /^[0-9]+(\.[0-9]+)?$/ && v+0 >= 0 && v+0 <= 1) }' </dev/null; then
+      dialog --title "Invalid threshold" --msgbox \
+        "Threshold must be a number in [0, 1]. Got: $r" 8 60
+      return 1
+    fi
+  fi
+  GLINER_PII_THRESHOLD="$r"
+}
+
+ws_toggle_gliner_pii_fail_closed() {
+  if dialog --title "GLiNER-PII fail-closed" --yesno \
+       "Block requests when the gliner_pii detector errors (GLINER_PII_FAIL_CLOSED=true)?\n\nNo → degrade to no gliner_pii matches and proceed with the other detectors." \
+       11 70; then
+    GLINER_PII_FAIL_CLOSED=true
+  else
+    GLINER_PII_FAIL_CLOSED=false
+  fi
+}
+
 ws_toggle_forwarded_key() {
   if dialog --title "Forward LLM key" --defaultno --yesno \
        "Send the caller's Authorization header to the detection LLM (LLM_USE_FORWARDED_KEY=true)?\n\nOnly meaningful with a custom backend that authenticates against a per-user virtual key (e.g. LiteLLM with extra_headers: [authorization])." \
@@ -580,6 +691,39 @@ privacy_filter_backend_label() {
   esac
 }
 
+gliner_pii_url_label() {
+  if [[ -z "$GLINER_PII_URL" ]]; then
+    echo "(unset — required)"
+  else
+    echo "$GLINER_PII_URL"
+  fi
+}
+
+gliner_pii_backend_label() {
+  case "$GLINER_PII_BACKEND" in
+    "")       echo "(unset — pick service or external)" ;;
+    service)  echo "service (auto-start gliner-pii-service)" ;;
+    external) echo "external (operator-supplied URL)" ;;
+    *)        echo "$GLINER_PII_BACKEND" ;;
+  esac
+}
+
+gliner_pii_labels_label() {
+  if [[ -z "$GLINER_PII_LABELS" ]]; then
+    echo "(server default)"
+  else
+    echo "$GLINER_PII_LABELS"
+  fi
+}
+
+gliner_pii_threshold_label() {
+  if [[ -z "$GLINER_PII_THRESHOLD" ]]; then
+    echo "(server default — 0.5)"
+  else
+    echo "$GLINER_PII_THRESHOLD"
+  fi
+}
+
 # ── Sub-menus (menuconfig-style) ────────────────────────────────────────────
 # Each submenu is its own loop. `Cancel` (or Esc) returns to the
 # parent menu — same convention as `make menuconfig`. Submenus only
@@ -691,6 +835,42 @@ submenu_privacy_filter() {
   done
 }
 
+submenu_gliner_pii() {
+  while true; do
+    local items=()
+    items+=("backend"   "$(fmt_row "Backend            $(gliner_pii_backend_label)")")
+    # URL row only when external (operator-supplied) or already set;
+    # for service-backend it's auto-derived from the canonical
+    # container name and not editable.
+    if [[ "$GLINER_PII_BACKEND" == "external" || -n "$GLINER_PII_URL" ]]; then
+      items+=("url" "$(fmt_row "Service URL        $(gliner_pii_url_label)")")
+    fi
+    items+=("labels"    "$(fmt_row "Labels             $(gliner_pii_labels_label)")")
+    items+=("threshold" "$(fmt_row "Threshold          $(gliner_pii_threshold_label)")")
+    local fc_disp="closed (block on gliner_pii error)"
+    [[ "$GLINER_PII_FAIL_CLOSED" == "false" ]] && fc_disp="open (degrade to no gliner matches)"
+    items+=("failmode" "$(fmt_row "Fail mode          $fc_disp")")
+
+    local choice rc=0
+    choice=$(dialog --title "Detectors → GLiNER-PII" --no-tags --clear \
+      --ok-label "Edit" --cancel-label "Back" \
+      --menu "" 15 78 7 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
+
+    case "$rc" in
+      0)
+        case "$choice" in
+          backend)   ws_pick_gliner_pii_backend ;;
+          url)       ws_pick_gliner_pii_url ;;
+          labels)    ws_pick_gliner_pii_labels ;;
+          threshold) ws_pick_gliner_pii_threshold ;;
+          failmode)  ws_toggle_gliner_pii_fail_closed ;;
+        esac
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 submenu_llm() {
   while true; do
     local items=()
@@ -753,6 +933,9 @@ submenu_detectors() {
     if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" ]]; then
       items+=("pf_sub" "$(fmt_row "Privacy-filter     →")")
     fi
+    if [[ "$DETECTOR_HAS_GLINER_PII" == "true" ]]; then
+      items+=("gliner_sub" "$(fmt_row "GLiNER-PII         →")")
+    fi
     if [[ "$DETECTOR_HAS_LLM" == "true" ]]; then
       items+=("llm_sub"   "$(fmt_row "LLM options        →")")
     fi
@@ -760,7 +943,7 @@ submenu_detectors() {
     local choice rc=0
     choice=$(dialog --title "Detectors" --no-tags --clear \
       --ok-label "Open" --cancel-label "Back" \
-      --menu "" 16 78 8 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
+      --menu "" 18 78 9 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
 
     case "$rc" in
       0)
@@ -769,6 +952,7 @@ submenu_detectors() {
           regex_sub)    submenu_regex ;;
           denylist_sub) submenu_denylist ;;
           pf_sub)       submenu_privacy_filter ;;
+          gliner_sub)   submenu_gliner_pii ;;
           llm_sub)      submenu_llm ;;
         esac
         ;;
@@ -867,6 +1051,19 @@ if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" \
   exec "$0"   # restart the menu so the operator can fix it
 fi
 
+# ── gliner_pii always requires a remote backend ────────────────────────────
+# Unlike privacy_filter, there is no in-process variant in any
+# guardrail flavour — gliner_pii is remote-only. The detector's
+# factory crashes loud at boot with the same message, but blocking
+# at the menu instead saves the operator a container start cycle.
+if [[ "$DETECTOR_HAS_GLINER_PII" == "true" \
+      && ( -z "$GLINER_PII_BACKEND" || -z "$GLINER_PII_URL" ) ]]; then
+  dialog --title "GLiNER-PII backend required" --msgbox \
+    "DETECTOR_MODE includes 'gliner_pii' but no service URL is configured.\n\nThe gliner_pii detector is remote-only — there's no in-process variant.\n\nOpen Detectors → GLiNER-PII and pick:\n  • service  → auto-start a gliner-pii-service container\n  • external → talk to a service you supply via URL" \
+    14 72
+  exec "$0"
+fi
+
 # ── Image must exist ─────────────────────────────────────────────────────────
 if ! image_exists "$IMAGE"; then
   if dialog --title "Image not found" --yesno \
@@ -919,6 +1116,12 @@ fi
 if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" \
       && "$PRIVACY_FILTER_BACKEND" == "service" ]]; then
   start_privacy_filter
+fi
+
+# ── Auto-start gliner-pii-service if needed ─────────────────────────────────
+if [[ "$DETECTOR_HAS_GLINER_PII" == "true" \
+      && "$GLINER_PII_BACKEND" == "service" ]]; then
+  start_gliner_pii
 fi
 
 print_plan

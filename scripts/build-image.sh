@@ -44,6 +44,10 @@ TAG_PF_SERVICE="${TAG_PF_SERVICE:-privacy-filter-service:cpu}"
 TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked-cpu}"
 TAG_PF_SERVICE_CU130="${TAG_PF_SERVICE_CU130:-privacy-filter-service:cu130}"
 TAG_PF_SERVICE_BAKED_CU130="${TAG_PF_SERVICE_BAKED_CU130:-privacy-filter-service:baked-cu130}"
+TAG_GLINER_SERVICE="${TAG_GLINER_SERVICE:-gliner-pii-service:cpu}"
+TAG_GLINER_SERVICE_BAKED="${TAG_GLINER_SERVICE_BAKED:-gliner-pii-service:baked-cpu}"
+TAG_GLINER_SERVICE_CU130="${TAG_GLINER_SERVICE_CU130:-gliner-pii-service:cu130}"
+TAG_GLINER_SERVICE_BAKED_CU130="${TAG_GLINER_SERVICE_BAKED_CU130:-gliner-pii-service:baked-cu130}"
 
 usage() {
   cat <<EOF
@@ -70,6 +74,13 @@ Without -t, prompts interactively.
                                           nvidia GPU at run time)
                         pf-service-baked-cu130  pf-service + model baked in,
                                           CUDA 13.0 torch wheels
+                        gliner-service          nvidia/gliner-pii inference
+                                          service (experimental — not yet
+                                          wired into the guardrail)
+                        gliner-service-baked    gliner-service + model baked in
+                        gliner-service-cu130    gliner-service with CUDA 13.0
+                        gliner-service-baked-cu130  gliner-service + model
+                                          baked in, CUDA 13.0
                         fake-llm          companion test backend — an OpenAI-
                                           compatible Chat Completions server
                                           with a YAML rules file, for driving
@@ -93,6 +104,10 @@ Environment overrides:
   TAG_PF_SERVICE_BAKED        Default tag for pf-service-baked (current: ${TAG_PF_SERVICE_BAKED})
   TAG_PF_SERVICE_CU130        Default tag for pf-service-cu130 (current: ${TAG_PF_SERVICE_CU130})
   TAG_PF_SERVICE_BAKED_CU130  Default tag for pf-service-baked-cu130 (current: ${TAG_PF_SERVICE_BAKED_CU130})
+  TAG_GLINER_SERVICE          Default tag for gliner-service (current: ${TAG_GLINER_SERVICE})
+  TAG_GLINER_SERVICE_BAKED    Default tag for gliner-service-baked (current: ${TAG_GLINER_SERVICE_BAKED})
+  TAG_GLINER_SERVICE_CU130    Default tag for gliner-service-cu130 (current: ${TAG_GLINER_SERVICE_CU130})
+  TAG_GLINER_SERVICE_BAKED_CU130  Default tag for gliner-service-baked-cu130 (current: ${TAG_GLINER_SERVICE_BAKED_CU130})
   TAG_FAKE_LLM                Default tag for fake-llm (current: ${TAG_FAKE_LLM})
 EOF
 }
@@ -116,17 +131,21 @@ if [[ -z "$TYPE" ]]; then
   say ""
   say "Which image flavour do you want to build?"
   say ""
-  say "  ${c_grn}1)${c_rst} slim                    without privacy-filter"
-  say "  ${c_grn}2)${c_rst} pf                      privacy-filter, runtime download"
-  say "  ${c_grn}3)${c_rst} pf-baked                privacy-filter + model baked in"
-  say "  ${c_grn}4)${c_rst} pf-service              privacy-filter inference service ${c_dim}(CPU)${c_rst}"
-  say "  ${c_grn}5)${c_rst} pf-service-baked        pf-service + model baked in ${c_dim}(CPU)${c_rst}"
-  say "  ${c_grn}6)${c_rst} pf-service-cu130        pf-service with CUDA 13.0 torch ${c_dim}(needs GPU at runtime)${c_rst}"
-  say "  ${c_grn}7)${c_rst} pf-service-baked-cu130  pf-service + model baked in, CUDA 13.0"
-  say "  ${c_grn}8)${c_rst} fake-llm                companion test backend ${c_dim}(deterministic LLM)${c_rst}"
-  say "  ${c_grn}a)${c_rst} all                     build every CPU flavour in sequence ${c_dim}(skips CUDA)${c_rst}"
+  say "  ${c_grn} 1)${c_rst} slim                       without privacy-filter"
+  say "  ${c_grn} 2)${c_rst} pf                         privacy-filter, runtime download"
+  say "  ${c_grn} 3)${c_rst} pf-baked                   privacy-filter + model baked in"
+  say "  ${c_grn} 4)${c_rst} pf-service                 privacy-filter inference service ${c_dim}(CPU)${c_rst}"
+  say "  ${c_grn} 5)${c_rst} pf-service-baked           pf-service + model baked in ${c_dim}(CPU)${c_rst}"
+  say "  ${c_grn} 6)${c_rst} pf-service-cu130           pf-service with CUDA 13.0 torch ${c_dim}(needs GPU at runtime)${c_rst}"
+  say "  ${c_grn} 7)${c_rst} pf-service-baked-cu130     pf-service + model baked in, CUDA 13.0"
+  say "  ${c_grn} 8)${c_rst} gliner-service             nvidia/gliner-pii service ${c_dim}(CPU; experimental)${c_rst}"
+  say "  ${c_grn} 9)${c_rst} gliner-service-baked       gliner-service + model baked in ${c_dim}(CPU)${c_rst}"
+  say "  ${c_grn}10)${c_rst} gliner-service-cu130       gliner-service with CUDA 13.0"
+  say "  ${c_grn}11)${c_rst} gliner-service-baked-cu130 gliner-service + model baked in, CUDA 13.0"
+  say "  ${c_grn}12)${c_rst} fake-llm                   companion test backend ${c_dim}(deterministic LLM)${c_rst}"
+  say "  ${c_grn} a)${c_rst} all                        build every CPU non-experimental flavour ${c_dim}(skips CUDA + gliner)${c_rst}"
   say ""
-  read -r -p "Choose [1-8/a, default 1]: " choice || true
+  read -r -p "Choose [1-12/a, default 1]: " choice || true
   case "${choice:-1}" in
     1)   TYPE="slim" ;;
     2)   TYPE="pf" ;;
@@ -135,7 +154,11 @@ if [[ -z "$TYPE" ]]; then
     5)   TYPE="pf-service-baked" ;;
     6)   TYPE="pf-service-cu130" ;;
     7)   TYPE="pf-service-baked-cu130" ;;
-    8)   TYPE="fake-llm" ;;
+    8)   TYPE="gliner-service" ;;
+    9)   TYPE="gliner-service-baked" ;;
+    10)  TYPE="gliner-service-cu130" ;;
+    11)  TYPE="gliner-service-baked-cu130" ;;
+    12)  TYPE="fake-llm" ;;
     a|A) TYPE="all" ;;
     *) err "Invalid choice."; exit 1 ;;
   esac
@@ -225,9 +248,45 @@ resolve_flavour() {
       BUILD_CONTEXT="services/privacy_filter"
       RESOLVED_TYPE="pf-service-baked-cu130"
       ;;
+    # Companion service for nvidia/gliner-pii. Same four-variant grid
+    # as pf-service (CPU/CUDA × runtime/baked). Experimental — not yet
+    # wired into the guardrail's detector pipeline; built locally for
+    # model evaluation.
+    gliner-service|gliner-pii-service)
+      BUILD_ARGS=()
+      DEFAULT_TAG="$TAG_GLINER_SERVICE"
+      CONTAINERFILE="services/gliner_pii/Containerfile"
+      BUILD_CONTEXT="services/gliner_pii"
+      RESOLVED_TYPE="gliner-service"
+      ;;
+    gliner-service-baked|gliner-pii-service-baked)
+      BUILD_ARGS=(--build-arg BAKE_MODEL=true)
+      DEFAULT_TAG="$TAG_GLINER_SERVICE_BAKED"
+      CONTAINERFILE="services/gliner_pii/Containerfile"
+      BUILD_CONTEXT="services/gliner_pii"
+      RESOLVED_TYPE="gliner-service-baked"
+      ;;
+    gliner-service-cu130|gliner-pii-service-cu130)
+      BUILD_ARGS=(--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130)
+      DEFAULT_TAG="$TAG_GLINER_SERVICE_CU130"
+      CONTAINERFILE="services/gliner_pii/Containerfile"
+      BUILD_CONTEXT="services/gliner_pii"
+      RESOLVED_TYPE="gliner-service-cu130"
+      ;;
+    gliner-service-baked-cu130|gliner-pii-service-baked-cu130)
+      BUILD_ARGS=(
+        --build-arg BAKE_MODEL=true
+        --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+      )
+      DEFAULT_TAG="$TAG_GLINER_SERVICE_BAKED_CU130"
+      CONTAINERFILE="services/gliner_pii/Containerfile"
+      BUILD_CONTEXT="services/gliner_pii"
+      RESOLVED_TYPE="gliner-service-baked-cu130"
+      ;;
     *)
       err "Unknown type '$1'. Valid: slim, pf, pf-baked,"
       err "  pf-service, pf-service-baked, pf-service-cu130, pf-service-baked-cu130,"
+      err "  gliner-service, gliner-service-baked, gliner-service-cu130, gliner-service-baked-cu130,"
       err "  fake-llm, all."
       exit 1
       ;;
@@ -279,10 +338,11 @@ say ""
 # call it out whether selected directly or pulled in via "all".
 for f in "${BUILD_LIST[@]}"; do
   case "$f" in
-    pf-baked|privacy-filter-baked|pf-service-baked|privacy-filter-service-baked|pf-service-baked-cu130|privacy-filter-service-baked-cu130)
-      warn "This build downloads the openai/privacy-filter model at build"
-      warn "time. Network access is required and the build will take"
-      warn "several minutes the first time (subsequent builds use the layer cache)."
+    pf-baked|privacy-filter-baked|pf-service-baked|privacy-filter-service-baked|pf-service-baked-cu130|privacy-filter-service-baked-cu130|gliner-service-baked|gliner-pii-service-baked|gliner-service-baked-cu130|gliner-pii-service-baked-cu130)
+      warn "This build downloads the model at build time (openai/privacy-filter"
+      warn "or nvidia/gliner-pii depending on flavour). Network access is required"
+      warn "and the build will take several minutes the first time (subsequent"
+      warn "builds use the layer cache)."
       say ""
       break
       ;;
@@ -374,6 +434,40 @@ case "$TYPE" in
     say ""
     say "  ${c_dim}# Self-contained CUDA build. Needs an nvidia GPU at run time.${c_rst}"
     say "  ${c_dim}# With docker, use --gpus all instead of --device.${c_rst}"
+    ;;
+  gliner-service)
+    say "  # Create a named volume so the model download survives recreates."
+    say "  ${ENGINE} volume create gliner-hf-cache"
+    say "  ${ENGINE} run --rm -p 8002:8002 \\"
+    say "      -v gliner-hf-cache:/app/.cache/huggingface \\"
+    say "      ${TAG}"
+    say ""
+    say "  ${c_dim}# Probe it:${c_rst}"
+    say "  ${c_dim}# curl -s http://localhost:8002/detect -H 'Content-Type: application/json' \\\\${c_rst}"
+    say "  ${c_dim}#   -d '{\"text\": \"alice@example.com\", \"labels\": [\"email\"]}'${c_rst}"
+    ;;
+  gliner-service-baked)
+    say "  ${ENGINE} run --rm -p 8002:8002 ${TAG}"
+    say ""
+    say "  ${c_dim}# Self-contained — no runtime download.${c_rst}"
+    ;;
+  gliner-service-cu130)
+    say "  # Create a named volume so the model download survives recreates."
+    say "  ${ENGINE} volume create gliner-hf-cache"
+    say "  ${ENGINE} run --rm -p 8002:8002 \\"
+    say "      --device nvidia.com/gpu=all \\"
+    say "      -v gliner-hf-cache:/app/.cache/huggingface \\"
+    say "      ${TAG}"
+    say ""
+    say "  ${c_dim}# CUDA wheels in image; needs an nvidia GPU + nvidia-container-toolkit${c_rst}"
+    say "  ${c_dim}# at run time. With docker, use --gpus all instead of --device.${c_rst}"
+    ;;
+  gliner-service-baked-cu130)
+    say "  ${ENGINE} run --rm -p 8002:8002 \\"
+    say "      --device nvidia.com/gpu=all \\"
+    say "      ${TAG}"
+    say ""
+    say "  ${c_dim}# Self-contained CUDA build. Needs an nvidia GPU at run time.${c_rst}"
     ;;
   fake-llm)
     say "  ${c_dim}# fake-llm is auto-started by scripts/cli.sh when you${c_rst}"

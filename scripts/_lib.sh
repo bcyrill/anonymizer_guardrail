@@ -50,6 +50,25 @@
 #                                  external → use PRIVACY_FILTER_URL verbatim;
 #                                             nothing is auto-started
 #                                  empty    → no remote backend (in-process)
+#   GLINER_PII_URL               — empty | http(s) URL of a gliner-pii-service.
+#                                  Required when DETECTOR_MODE has gliner_pii;
+#                                  there's no in-process variant.
+#   GLINER_PII_BACKEND           — empty | service | external
+#                                  service  → auto-start a local
+#                                             gliner-pii-service container;
+#                                             URL defaults to
+#                                             http://gliner-pii-service:8002
+#                                  external → use GLINER_PII_URL verbatim;
+#                                             nothing is auto-started
+#                                  empty    → DETECTOR_MODE doesn't have
+#                                             gliner_pii (no remote needed)
+#   GLINER_PII_LABELS            — empty | comma-separated label list
+#                                  (server-side default applies when empty)
+#   GLINER_PII_THRESHOLD         — empty | float string
+#                                  (server-side default applies when empty)
+#   GLINER_PII_FAIL_CLOSED       — true | false (default true).
+#                                  Independent from LLM_FAIL_CLOSED and
+#                                  PRIVACY_FILTER_FAIL_CLOSED.
 #   EXTRA_ARGS                   — array of extra args for `podman run`
 
 # ── Color helpers ────────────────────────────────────────────────────────────
@@ -66,6 +85,12 @@ TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
 TAG_FAKE_LLM="${TAG_FAKE_LLM:-fake-llm:latest}"
 TAG_PF_SERVICE="${TAG_PF_SERVICE:-privacy-filter-service:latest}"
 TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked}"
+# gliner-pii-service: launcher only knows about the CPU pair. CUDA
+# variants exist but require a GPU at run time; operators who built one
+# can override TAG_GLINER_SERVICE via env to point the launcher at it
+# instead of one of the CPU defaults.
+TAG_GLINER_SERVICE="${TAG_GLINER_SERVICE:-gliner-pii-service:cpu}"
+TAG_GLINER_SERVICE_BAKED="${TAG_GLINER_SERVICE_BAKED:-gliner-pii-service:baked-cpu}"
 
 # Shared HF cache volume — used by both the in-process pf / pf-baked
 # guardrail and the standalone privacy-filter-service. Both mount it at
@@ -77,15 +102,23 @@ TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked}"
 # rare in dev / test. Operators wanting isolation can set HF_VOLUME to
 # a different name.
 HF_VOLUME="${HF_VOLUME:-anonymizer-hf-cache}"
+# Separate cache volume for gliner-pii — the model is distinct from
+# openai/privacy-filter so there's no benefit to sharing, and keeping
+# them apart avoids a six-letter substring of confusion when an
+# operator wants to wipe one without touching the other.
+GLINER_HF_VOLUME="${GLINER_HF_VOLUME:-gliner-hf-cache}"
 SHARED_NETWORK="${SHARED_NETWORK:-anonymizer-net}"
 
 CONTAINER_NAME_DEFAULT="anonymizer-guardrail"
 CONTAINER_NAME_FAKE_LLM="fake-llm"
 CONTAINER_NAME_PF_SERVICE="privacy-filter-service"
-# Canonical URL the launcher hands to the guardrail when auto-starting
-# the service. Operators who prefer an external service set their own
-# URL via --privacy-filter-url and the auto-start path is skipped.
+CONTAINER_NAME_GLINER_PII_SERVICE="gliner-pii-service"
+# Canonical URLs the launcher hands to the guardrail when auto-starting
+# the matching service. Operators who prefer an external service set
+# their own URL via --privacy-filter-url / --gliner-pii-url and the
+# auto-start path is skipped.
 PF_SERVICE_URL_LOCAL="http://${CONTAINER_NAME_PF_SERVICE}:8001"
+GLINER_PII_URL_LOCAL="http://${CONTAINER_NAME_GLINER_PII_SERVICE}:8002"
 
 # ── Engine detection ─────────────────────────────────────────────────────────
 detect_engine() {
@@ -163,10 +196,12 @@ resolve_predicates() {
   DETECTOR_HAS_REGEX=false
   DETECTOR_HAS_DENYLIST=false
   DETECTOR_HAS_PRIVACY_FILTER=false
+  DETECTOR_HAS_GLINER_PII=false
   [[ ",${DETECTOR_MODE}," == *",llm,"*            ]] && DETECTOR_HAS_LLM=true
   [[ ",${DETECTOR_MODE}," == *",regex,"*          ]] && DETECTOR_HAS_REGEX=true
   [[ ",${DETECTOR_MODE}," == *",denylist,"*       ]] && DETECTOR_HAS_DENYLIST=true
   [[ ",${DETECTOR_MODE}," == *",privacy_filter,"* ]] && DETECTOR_HAS_PRIVACY_FILTER=true
+  [[ ",${DETECTOR_MODE}," == *",gliner_pii,"*     ]] && DETECTOR_HAS_GLINER_PII=true
   return 0
 }
 
@@ -376,11 +411,142 @@ cleanup_privacy_filter() {
   fi
 }
 
+# ── gliner-pii-service lifecycle ────────────────────────────────────────────
+# Identical pattern to start_privacy_filter / cleanup_privacy_filter,
+# pointed at the gliner-pii-service container (different image, different
+# port, different cache volume). Operators who pick the `service` backend
+# get the container auto-started; `external` skips this entirely and
+# uses GLINER_PII_URL verbatim.
+
+GUARDRAIL_STARTED_GLINER_PII=false
+# Same generous timeout rationale as PF: cold runtime-download images
+# can take several minutes to fetch the ~570M model. Override via env
+# when an upstream HF mirror is unusually slow.
+GLINER_PII_READY_TIMEOUT_S="${GLINER_PII_READY_TIMEOUT_S:-300}"
+
+# Pick whichever gliner-pii-service image is actually built. Returns 0 +
+# sets GLINER_SERVICE_TAG when one is found; returns 1 when neither is
+# built. Mirrors _pick_pf_service_image — prefers the baked variant
+# because it avoids the runtime download.
+_pick_gliner_service_image() {
+  if image_exists "$TAG_GLINER_SERVICE_BAKED"; then
+    GLINER_SERVICE_TAG="$TAG_GLINER_SERVICE_BAKED"
+    GLINER_SERVICE_TAG_KIND="baked"
+    return 0
+  fi
+  if image_exists "$TAG_GLINER_SERVICE"; then
+    GLINER_SERVICE_TAG="$TAG_GLINER_SERVICE"
+    GLINER_SERVICE_TAG_KIND="runtime-download"
+    return 0
+  fi
+  return 1
+}
+
+start_gliner_pii() {
+  ensure_shared_network
+
+  if container_exists "$CONTAINER_NAME_GLINER_PII_SERVICE"; then
+    if container_running "$CONTAINER_NAME_GLINER_PII_SERVICE"; then
+      ok "gliner-pii-service container already running — reusing it (will NOT stop on exit)."
+      return 0
+    fi
+    warn "gliner-pii-service container exists but isn't running — removing."
+    "$ENGINE" rm -f "$CONTAINER_NAME_GLINER_PII_SERVICE" >/dev/null
+  fi
+
+  if ! _pick_gliner_service_image; then
+    err "No gliner-pii-service image found."
+    err "Build it with:  scripts/build-image.sh -t gliner-service"
+    err "                scripts/build-image.sh -t gliner-service-baked  (recommended for repeat use)"
+    exit 1
+  fi
+
+  # Persistent cache volume for the runtime-download flavour. Baked
+  # images already have the weights so the volume mount is a no-op
+  # there. We use a SEPARATE volume from the privacy-filter cache
+  # (different model, different download) — keeps `volume rm` of one
+  # from accidentally wiping the other.
+  local gliner_volume_args=()
+  local volume_was_present=true
+  if [[ "$GLINER_SERVICE_TAG_KIND" == "runtime-download" ]]; then
+    if ! volume_exists "$GLINER_HF_VOLUME"; then
+      say "Creating named volume \"${GLINER_HF_VOLUME}\" for the gliner-pii HF cache..."
+      "$ENGINE" volume create "$GLINER_HF_VOLUME" >/dev/null
+      volume_was_present=false
+    fi
+    gliner_volume_args=(-v "${GLINER_HF_VOLUME}:/app/.cache/huggingface")
+  fi
+
+  say "Starting gliner-pii-service (${GLINER_SERVICE_TAG_KIND}) on network \"${SHARED_NETWORK}\" (port 8002)..."
+  if [[ "$GLINER_SERVICE_TAG_KIND" == "runtime-download" && "$volume_was_present" == "false" ]]; then
+    warn "First run: model will be fetched from HuggingFace into volume \"${GLINER_HF_VOLUME}\"."
+    warn "This can take several minutes on a slow connection."
+  fi
+
+  # Pass through the operator-side defaults so the service uses them
+  # for requests that don't supply per-call overrides. Keeps the
+  # client and server in sync without separate configuration.
+  local gliner_env_args=()
+  [[ -n "${GLINER_PII_LABELS:-}" ]] && \
+    gliner_env_args+=(-e "DEFAULT_LABELS=${GLINER_PII_LABELS}")
+  [[ -n "${GLINER_PII_THRESHOLD:-}" ]] && \
+    gliner_env_args+=(-e "DEFAULT_THRESHOLD=${GLINER_PII_THRESHOLD}")
+
+  "$ENGINE" run -d --rm \
+    --name "$CONTAINER_NAME_GLINER_PII_SERVICE" \
+    --network "$SHARED_NETWORK" \
+    -p 8002:8002 \
+    -e "LOG_LEVEL=${LOG_LEVEL_CHOICE:-info}" \
+    "${gliner_env_args[@]}" \
+    "${gliner_volume_args[@]}" \
+    "$GLINER_SERVICE_TAG" >/dev/null
+
+  GUARDRAIL_STARTED_GLINER_PII=true
+
+  # Probe /health from inside the container — same readiness pattern
+  # the PF service uses, since the gliner service mirrors that
+  # endpoint shape (`{"status":"loading"}` until the model is loaded,
+  # then `"ok"`).
+  say "Waiting for gliner-pii-service to be ready (timeout: ${GLINER_PII_READY_TIMEOUT_S}s)..."
+  local i deadline now
+  deadline=$(( $(date +%s) + GLINER_PII_READY_TIMEOUT_S ))
+  local last_progress=$(date +%s)
+  while true; do
+    now=$(date +%s)
+    if [[ $now -ge $deadline ]]; then
+      err "gliner-pii-service did not become ready within ${GLINER_PII_READY_TIMEOUT_S}s."
+      err "Check: ${ENGINE} logs ${CONTAINER_NAME_GLINER_PII_SERVICE}"
+      exit 1
+    fi
+    if "$ENGINE" exec "$CONTAINER_NAME_GLINER_PII_SERVICE" \
+         python3 -c "import json, urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2); d=json.load(r); exit(0 if d.get('status')=='ok' else 1)" \
+         >/dev/null 2>&1; then
+      ok "gliner-pii-service is ready."
+      return 0
+    fi
+    if (( now - last_progress >= 20 )); then
+      say "  …still loading (elapsed: $(( now - (deadline - GLINER_PII_READY_TIMEOUT_S) ))s)"
+      last_progress=$now
+    fi
+    sleep 1
+  done
+}
+
+# EXIT-trap target. No-op when we didn't start the service ourselves.
+cleanup_gliner_pii() {
+  if [[ "${GUARDRAIL_STARTED_GLINER_PII:-false}" == "true" ]]; then
+    say ""
+    say "Stopping auto-started gliner-pii-service..."
+    "$ENGINE" stop "$CONTAINER_NAME_GLINER_PII_SERVICE" >/dev/null 2>&1 || true
+  fi
+}
+
 # Combined cleanup invoked by the EXIT trap. We can only set ONE trap
 # target on EXIT, so funnel both teardowns through this single function.
 cleanup_aux_services() {
   cleanup_fake_llm
   cleanup_privacy_filter
+  cleanup_gliner_pii
 }
 
 # ── Run-arg composition ──────────────────────────────────────────────────────
@@ -427,9 +593,15 @@ build_run_args() {
   fi
 
   # The guardrail joins the shared network whenever an auto-started
-  # service (fake-llm OR privacy-filter-service) is in use, so the
-  # service hostnames resolve. Idempotent if both are on — set once.
+  # service (fake-llm OR privacy-filter-service OR gliner-pii-service)
+  # is in use, so the service hostnames resolve. Idempotent if more
+  # than one is on — set once.
   if [[ "${PRIVACY_FILTER_BACKEND:-}" == "service" ]]; then
+    if [[ ${#RUN_NETWORK_ARGS[@]} -eq 0 ]]; then
+      RUN_NETWORK_ARGS=(--network "$SHARED_NETWORK")
+    fi
+  fi
+  if [[ "${GLINER_PII_BACKEND:-}" == "service" ]]; then
     if [[ ${#RUN_NETWORK_ARGS[@]} -eq 0 ]]; then
       RUN_NETWORK_ARGS=(--network "$SHARED_NETWORK")
     fi
@@ -502,6 +674,25 @@ build_run_args() {
     RUN_PRIVACY_FILTER_URL_ARGS=(-e "PRIVACY_FILTER_URL=${PRIVACY_FILTER_URL}")
   fi
 
+  # GLiNER-PII — same shape as PF, but the URL is mandatory whenever
+  # gliner_pii is in DETECTOR_MODE (no in-process variant). Labels
+  # and threshold are optional; empty values let the service's
+  # DEFAULT_LABELS / DEFAULT_THRESHOLD apply.
+  RUN_GLINER_PII_ARGS=()
+  if [[ -n "${GLINER_PII_URL:-}" ]]; then
+    RUN_GLINER_PII_ARGS+=(-e "GLINER_PII_URL=${GLINER_PII_URL}")
+  fi
+  if [[ -n "${GLINER_PII_LABELS:-}" ]]; then
+    RUN_GLINER_PII_ARGS+=(-e "GLINER_PII_LABELS=${GLINER_PII_LABELS}")
+  fi
+  if [[ -n "${GLINER_PII_THRESHOLD:-}" ]]; then
+    RUN_GLINER_PII_ARGS+=(-e "GLINER_PII_THRESHOLD=${GLINER_PII_THRESHOLD}")
+  fi
+  RUN_GLINER_PII_FAIL_CLOSED_ARGS=()
+  if [[ "${GLINER_PII_FAIL_CLOSED:-true}" == "false" ]]; then
+    RUN_GLINER_PII_FAIL_CLOSED_ARGS=(-e "GLINER_PII_FAIL_CLOSED=false")
+  fi
+
   RUN_LOG_LEVEL_ARGS=(-e "LOG_LEVEL=${LOG_LEVEL_CHOICE:-info}")
 }
 
@@ -557,6 +748,25 @@ print_plan() {
         ;;
     esac
   fi
+  if [[ "${DETECTOR_HAS_GLINER_PII:-false}" == "true" ]]; then
+    case "${GLINER_PII_BACKEND:-}" in
+      service)
+        say "GLiNER svc:  ${c_grn}service${c_rst} ${c_dim}(auto-started on ${SHARED_NETWORK} → ${GLINER_PII_URL})${c_rst}"
+        ;;
+      external)
+        say "GLiNER svc:  ${c_grn}external${c_rst} ${c_dim}(${GLINER_PII_URL})${c_rst}"
+        ;;
+      *)
+        say "GLiNER URL:  ${c_ylw}unset${c_rst} ${c_dim}(gliner_pii will fail at boot — pick service or external)${c_rst}"
+        ;;
+    esac
+    if [[ -n "${GLINER_PII_LABELS:-}" ]]; then
+      say "GLiNER labels: ${c_grn}${GLINER_PII_LABELS}${c_rst}"
+    fi
+    if [[ -n "${GLINER_PII_THRESHOLD:-}" ]]; then
+      say "GLiNER thr:    ${c_grn}${GLINER_PII_THRESHOLD}${c_rst}"
+    fi
+  fi
   if [[ -n "${LLM_SYSTEM_PROMPT_PATH:-}" ]]; then
     say "LLM prompt:  ${c_grn}${LLM_SYSTEM_PROMPT_PATH}${c_rst}"
   fi
@@ -568,6 +778,10 @@ print_plan() {
   fi
   if [[ "${PRIVACY_FILTER_FAIL_CLOSED:-true}" == "false" ]]; then
     say "PF fail:     ${c_ylw}open${c_rst} ${c_dim}(privacy_filter errors degrade to no PF matches)${c_rst}"
+  fi
+  if [[ "${DETECTOR_HAS_GLINER_PII:-false}" == "true" \
+        && "${GLINER_PII_FAIL_CLOSED:-true}" == "false" ]]; then
+    say "GLiNER fail: ${c_ylw}open${c_rst} ${c_dim}(gliner_pii errors degrade to no gliner matches)${c_rst}"
   fi
   if [[ -n "${SURROGATE_SALT:-}" ]]; then
     say "Salt:        ${c_grn}set${c_rst} ${c_dim}(stable surrogates across restarts)${c_rst}"
@@ -606,6 +820,8 @@ run_guardrail() {
     "${RUN_REGEX_PATTERNS_ARGS[@]}" \
     "${RUN_DENYLIST_ARGS[@]}" \
     "${RUN_PRIVACY_FILTER_URL_ARGS[@]}" \
+    "${RUN_GLINER_PII_ARGS[@]}" \
+    "${RUN_GLINER_PII_FAIL_CLOSED_ARGS[@]}" \
     "${RUN_LLM_ARGS[@]}" \
     "${RUN_LLM_PROMPT_ARGS[@]}" \
     "${RUN_FORWARDED_KEY_ARGS[@]}" \

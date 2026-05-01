@@ -39,6 +39,11 @@ DENYLIST_PATH=""                 # empty | bundled:NAME | filesystem path
 DENYLIST_BACKEND=""              # empty (server default) | regex | aho
 PRIVACY_FILTER_URL=""            # empty (in-process) | http(s) URL
 PRIVACY_FILTER_BACKEND=""        # empty | service | external
+GLINER_PII_URL=""                # empty | http(s) URL
+GLINER_PII_BACKEND=""            # empty | service | external
+GLINER_PII_LABELS=""             # empty → server's DEFAULT_LABELS
+GLINER_PII_THRESHOLD=""          # empty → server's DEFAULT_THRESHOLD
+GLINER_PII_FAIL_CLOSED=true
 LLM_USE_FORWARDED_KEY=false
 LLM_FAIL_CLOSED=true
 PRIVACY_FILTER_FAIL_CLOSED=true
@@ -56,8 +61,11 @@ Flag-driven launcher. For interactive use, see scripts/menu.sh.
 Required (unless --preset supplies them):
   -t, --type TYPE          slim | pf | pf-baked
   -d, --detector-mode M    Comma-separated list. Tokens: regex, denylist,
-                           privacy_filter, llm. Order = type-resolution
-                           priority. Example: regex,denylist,llm.
+                           privacy_filter, gliner_pii, llm. Order =
+                           type-resolution priority. Example:
+                           regex,denylist,llm. (gliner_pii requires
+                           GLINER_PII_URL passed via \`-- -e ...\`;
+                           the launcher doesn't auto-start its service yet.)
 
 LLM detector (only when DETECTOR_MODE includes \`llm\`):
   --llm-backend B          fake-llm | custom
@@ -88,6 +96,25 @@ Detector / runtime tuning:
                            and points the guardrail at it. \`external\`
                            uses the URL provided via --privacy-filter-url
                            and starts nothing locally.
+  --gliner-pii-url URL     GLINER_PII_URL — base URL of a gliner-pii-service
+                           (the gliner_pii detector is remote-only — there
+                           is no in-process variant). Required whenever
+                           DETECTOR_MODE includes \`gliner_pii\`.
+                           Example: http://gliner-pii-service:8002
+  --gliner-pii-backend B   service | external. Same shape as
+                           --privacy-filter-backend: \`service\` auto-starts
+                           a local gliner-pii-service container; \`external\`
+                           uses the URL provided via --gliner-pii-url and
+                           starts nothing locally.
+  --gliner-pii-labels L    GLINER_PII_LABELS — comma-separated zero-shot
+                           labels sent to the gliner_pii detector with
+                           every request. Empty → use the gliner-pii-service's
+                           DEFAULT_LABELS. Example: person,email,ssn
+  --gliner-pii-threshold T GLINER_PII_THRESHOLD — confidence cutoff (0..1).
+                           Empty → use the gliner-pii-service's DEFAULT_THRESHOLD.
+  --gliner-pii-fail-open   Set GLINER_PII_FAIL_CLOSED=false (gliner_pii errors
+                           degrade to no gliner matches; default is fail-closed).
+                           Independent from --llm-fail-open / --privacy-filter-fail-open.
   --llm-prompt P           LLM_SYSTEM_PROMPT_PATH override.
                            Examples: bundled:llm_pentest.md | /etc/anonymizer/prompt.md
   --forward-llm-key        Set LLM_USE_FORWARDED_KEY=true (custom backend
@@ -202,6 +229,12 @@ while [[ $# -gt 0 ]]; do
     --denylist-backend)      need_val "$@"; DENYLIST_BACKEND="$2"; shift 2 ;;
     --privacy-filter-url)    need_val "$@"; PRIVACY_FILTER_URL="$2"; PRIVACY_FILTER_BACKEND="${PRIVACY_FILTER_BACKEND:-external}"; shift 2 ;;
     --privacy-filter-backend) need_val "$@"; PRIVACY_FILTER_BACKEND="$2"; shift 2 ;;
+    --gliner-pii-url)        need_val "$@"; GLINER_PII_URL="$2"; GLINER_PII_BACKEND="${GLINER_PII_BACKEND:-external}"; shift 2 ;;
+    --gliner-pii-backend)    need_val "$@"; GLINER_PII_BACKEND="$2"; shift 2 ;;
+    --gliner-pii-labels)     need_val "$@"; GLINER_PII_LABELS="$2"; shift 2 ;;
+    --gliner-pii-threshold)  need_val "$@"; GLINER_PII_THRESHOLD="$2"; shift 2 ;;
+    --gliner-pii-fail-open)   GLINER_PII_FAIL_CLOSED=false; shift ;;
+    --gliner-pii-fail-closed) GLINER_PII_FAIL_CLOSED=true;  shift ;;
     --llm-prompt)            need_val "$@"; LLM_SYSTEM_PROMPT_PATH="$2"; shift 2 ;;
     --forward-llm-key)       LLM_USE_FORWARDED_KEY=true; shift ;;
     --no-forward-llm-key)    LLM_USE_FORWARDED_KEY=false; shift ;;
@@ -258,6 +291,10 @@ case "${PRIVACY_FILTER_BACKEND:-}" in
   ""|service|external) ;;
   *) err "Invalid --privacy-filter-backend '${PRIVACY_FILTER_BACKEND}'. Use 'service' or 'external'."; exit 1 ;;
 esac
+case "${GLINER_PII_BACKEND:-}" in
+  ""|service|external) ;;
+  *) err "Invalid --gliner-pii-backend '${GLINER_PII_BACKEND}'. Use 'service' or 'external'."; exit 1 ;;
+esac
 
 # `service` backend → auto-start the local container, point URL at it.
 # An explicit --privacy-filter-url override still wins (operator may
@@ -267,6 +304,14 @@ if [[ "$PRIVACY_FILTER_BACKEND" == "service" && -z "$PRIVACY_FILTER_URL" ]]; the
 fi
 if [[ "$PRIVACY_FILTER_BACKEND" == "external" && -z "$PRIVACY_FILTER_URL" ]]; then
   err "--privacy-filter-backend external requires --privacy-filter-url."
+  exit 1
+fi
+# Same shape for gliner-pii.
+if [[ "$GLINER_PII_BACKEND" == "service" && -z "$GLINER_PII_URL" ]]; then
+  GLINER_PII_URL="$GLINER_PII_URL_LOCAL"
+fi
+if [[ "$GLINER_PII_BACKEND" == "external" && -z "$GLINER_PII_URL" ]]; then
+  err "--gliner-pii-backend external requires --gliner-pii-url."
   exit 1
 fi
 
@@ -286,6 +331,18 @@ if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" \
   err "torch + the model, so the in-process detector can't load."
   err "Either pass --privacy-filter-url URL (remote service) or"
   err "switch to --type pf / pf-baked."
+  exit 1
+fi
+
+# gliner_pii is remote-only on EVERY flavour — there is no in-process
+# variant. The detector's factory crashes loud at boot; blocking here
+# saves a container start cycle.
+if [[ "$DETECTOR_HAS_GLINER_PII" == "true" && -z "$GLINER_PII_URL" ]]; then
+  err "DETECTOR_MODE includes 'gliner_pii' but --gliner-pii-url is unset."
+  err "The gliner_pii detector is remote-only — pass --gliner-pii-backend"
+  err "service to auto-start a local gliner-pii-service container, or"
+  err "--gliner-pii-backend external --gliner-pii-url URL for one you"
+  err "already have running."
   exit 1
 fi
 
@@ -355,6 +412,12 @@ fi
 if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" \
       && "$PRIVACY_FILTER_BACKEND" == "service" ]]; then
   start_privacy_filter
+fi
+
+# ── Auto-start gliner-pii-service if needed ─────────────────────────────────
+if [[ "$DETECTOR_HAS_GLINER_PII" == "true" \
+      && "$GLINER_PII_BACKEND" == "service" ]]; then
+  start_gliner_pii
 fi
 
 print_plan

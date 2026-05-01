@@ -239,3 +239,158 @@ limit.
 
 - Not a per-tenant rate limit. That's a separate concern (and probably
   belongs in LiteLLM, not the guardrail).
+
+---
+
+## Per-request `gliner_labels` / `gliner_threshold` overrides
+
+**What:** plumb `gliner_labels` (list[str]) and `gliner_threshold`
+(float) through `additional_provider_specific_params` so the
+RemoteGlinerPIIDetector can override its configured defaults on a
+per-call basis. Same shape as the existing per-request overrides
+(`use_faker`, `detector_mode`, `regex_overlap_strategy`, `llm_model`,
+`llm_prompt`, `regex_patterns`, `denylist`).
+
+**Why:** the differentiator of GLiNER over a fixed token-classification
+model is *zero-shot labels* — the entity-type vocabulary is an input
+to the model. Letting callers pick labels per request is what unlocks
+the "different vocab per use case" story (one route asks for medical
+labels, another for finance labels, no redeploy). Today the labels
+are pinned to whatever the operator configured server-side.
+
+**Why deferred:** the gliner_pii detector is brand-new and being
+evaluated locally first. Adding per-request overrides before the
+basic path is validated is premature — the override surface is the
+kind of thing that's easier to design right once we know how
+operators actually use the detector.
+
+**Sketch:**
+
+1. Add `gliner_labels` (tuple[str, ...] | None) and `gliner_threshold`
+   (float | None) fields to `Overrides` in `src/anonymizer_guardrail/api.py`.
+2. Extend `parse_overrides` to accept both keys with the same warn-and-
+   ignore policy on bad types. Reuse `_parse_locale`-style normalization
+   for the labels list (string OR list, comma-split when string).
+3. Cap `gliner_labels` at a defensive max length (e.g. 50) — same
+   shape as `_MAX_LOCALE_CHAIN`, prevents an oversized list from
+   blowing up the model's input.
+4. Pass `overrides.gliner_labels` and `overrides.gliner_threshold`
+   into `RemoteGlinerPIIDetector.detect()` as kwargs (mirror how
+   `LLMDetector.detect` takes `model` and `prompt_name`).
+5. In `Pipeline._run`, plumb the overrides into the gliner branch
+   (mirror the LLM branch which passes `model` / `prompt_name`).
+6. Update the README's *Per-request overrides* section.
+
+**Concrete trigger:** the day a deployment surfaces with two routes
+that legitimately want different label vocabularies, or once the
+detector earns its keep on real traffic and operators ask for the
+flexibility.
+
+**Non-goals:**
+
+- Don't add a *per-request URL* override — labels and threshold are
+  cheap to vary; pointing at a different inference service per
+  request is a deployment-shape question that doesn't belong in the
+  request body.
+
+---
+
+## Detector registration API
+
+**What:** replace the per-detector hand-wiring in `Pipeline`,
+`config.py`, `_lib.sh`, `menu.sh`, and `cli.sh` with a single
+`DetectorSpec` descriptor each detector registers, plus an iterator
+that the centralized files consume. Adding a detector should be "drop
+a file under `detector/`, append to a registry list" — not "touch
+seven places".
+
+**Why:** every new detector currently requires edits in a fan-out of
+files:
+
+  * `config.py`         — env-var fields
+  * `pipeline.py`       — factory entry, semaphore, in-flight counter,
+                          `_run` branch, exception handler, TaskGroup
+                          `except*` clause, `stats()` keys, log line
+  * `main.py`           — typed exception → BLOCKED handler
+  * `_lib.sh`           — `DETECTOR_HAS_*` predicate, env-var globals
+                          docs, optional auto-start lifecycle, env-var
+                          passthroughs in `build_run_args`, plan rows,
+                          run command wiring
+  * `menu.sh`           — checklist entry, submenu, labels/dialogs,
+                          backend-selection, validation
+  * `cli.sh`            — flags, validation, auto-start hook
+  * Tests               — fixtures for the new detector + pipeline tests
+
+The fan-out is the actual cost of "adding a detector"; the file
+location of the detector itself is incidental. Centralizing the wiring
+into a registry collapses most of these edits into one descriptor.
+
+**Why deferred:** the abstraction needs to be wide enough to fit every
+detector's quirks without becoming a leaky superset:
+
+  * regex carries overlap strategy + per-call `patterns_name` override
+  * llm carries per-call `api_key` + `model` + `prompt_name`
+  * denylist carries per-call `denylist_name`
+  * privacy_filter has both in-process and remote variants under one
+    DETECTOR_MODE token, picked by URL presence
+  * gliner_pii is remote-only, with per-call `labels` + `threshold`
+    override (planned, see *Per-request gliner_labels* above)
+  * privacy_filter and gliner_pii have an auto-start lifecycle in the
+    launcher; regex / denylist don't
+
+Designing the descriptor before we have enough datapoints risks
+either (a) a too-narrow abstraction that breaks the next detector
+or (b) an over-general one that's worse than the hand-wiring it
+replaced. Wait until a 4th or 5th external detector lands so the
+shape is forced by real variety, not anticipated.
+
+**Sketch:**
+
+1. Define `DetectorSpec` (dataclass) carrying:
+   * `name` — DETECTOR_MODE token
+   * `factory` — `() -> Detector`, may raise at boot
+   * `config_class` — owns its `*_url`, `*_fail_closed`,
+     `*_max_concurrency`, etc. fields; merged into `Config` via
+     composition
+   * `pipeline_hooks` — exposes the semaphore name, in-flight counter
+     name, typed unavailable-error class, fail-closed field name,
+     and a `prepare_kwargs(overrides) -> dict` for per-call args
+   * `launcher` — optional auto-start metadata
+     (`container_name`, `image_tag`, `port`, `health_endpoint`,
+     `start_timeout_s`, env-var passthrough list)
+   * `endpoint_block_reason` — string template for `main.py`'s
+     BLOCKED response when the typed error fires
+2. Detectors live where they live (flat files for now; can be
+   packagized later if any one outgrows ~500 lines). Each module
+   exposes a `SPEC = DetectorSpec(...)` constant.
+3. `src/anonymizer_guardrail/detector/__init__.py` enumerates the
+   modules and re-exports `REGISTERED_SPECS`.
+4. `Pipeline.__init__` iterates `REGISTERED_SPECS` to set up
+   semaphores, in-flight counters, the `_DETECTOR_FACTORIES` dict,
+   the `stats()` payload, and the log line. `_run` dispatches via
+   `spec.pipeline_hooks` instead of `isinstance` chains.
+5. `main.py`'s exception handlers iterate `REGISTERED_SPECS` to
+   register `(error_class → blocked_reason)` mappings.
+6. `_lib.sh` reads a generated env-var passthrough table (or has
+   each spec's launcher block emit its own `RUN_*_ARGS` array).
+   Same for the auto-start dispatch.
+7. `menu.sh` / `cli.sh` enumerate `REGISTERED_SPECS` to build the
+   checklist + submenus + flags. Detector-specific dialogs stay
+   per-spec but get wired up generically.
+8. Tests gain a `register_test_detector` helper for pipeline-level
+   tests that don't need a real detector.
+
+**Concrete trigger:** the moment we add a detector that the existing
+hand-wiring doesn't fit cleanly (e.g. one that needs a different
+auth model, a streaming response, or a different fail-mode shape).
+Or when the per-detector edit list crosses ~10 files.
+
+**Non-goals:**
+
+- Not a *plugin* system. We're not loading detectors from third-party
+  packages via entry points — that's premature for a project that
+  ships its own detector set. The registry stays an in-tree
+  enumeration; entry-point support can be layered on later if the
+  use case appears.
+- Not a refactor of `Match` / `Detector` Protocol / `_dedup`. The
+  shared types stay. This is wiring-level cleanup only.

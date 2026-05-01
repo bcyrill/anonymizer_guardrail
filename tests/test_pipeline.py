@@ -97,6 +97,33 @@ def _patch_pf_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
     monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
 
 
+def _patch_gliner_pii_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
+    """Same shim for gliner_pii_fail_closed."""
+    from types import SimpleNamespace
+    from anonymizer_guardrail import pipeline as pipeline_mod
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["gliner_pii_fail_closed"] = value
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+
+def _gliner_detector_that_raises(exc_factory):
+    """A bare RemoteGlinerPIIDetector instance whose detect() raises
+    whatever exc_factory returns. Bypasses the real httpx wiring."""
+    from anonymizer_guardrail.detector.remote_gliner_pii import (
+        RemoteGlinerPIIDetector,
+    )
+
+    bad = RemoteGlinerPIIDetector.__new__(RemoteGlinerPIIDetector)
+    bad.name = "gliner_pii"
+
+    async def boom(*_args, **_kwargs):
+        raise exc_factory()
+
+    bad.detect = boom  # type: ignore[method-assign]
+    return bad
+
+
 def _pf_detector_that_raises(exc_factory):
     """A bare RemotePrivacyFilterDetector instance whose detect() raises
     whatever exc_factory returns. Bypasses the real httpx wiring."""
@@ -271,11 +298,14 @@ async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
         "llm_max_concurrency",
         "pf_in_flight",
         "pf_max_concurrency",
+        "gliner_pii_in_flight",
+        "gliner_pii_max_concurrency",
     }
     assert expected_keys.issubset(s.keys())
     assert s["vault_size"] == 0
     assert s["llm_in_flight"] == 0
     assert s["pf_in_flight"] == 0
+    assert s["gliner_pii_in_flight"] == 0
     assert s["surrogate_cache_max"] >= 1
 
     # Anonymize a request — surrogate cache should grow, vault should fill.
@@ -348,6 +378,104 @@ async def test_pf_in_flight_increments_around_detect(
     finish.set()
     await task
     assert p.stats()["pf_in_flight"] == 0
+
+
+async def test_gliner_pii_in_flight_increments_around_detect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLiNER-PII counter mirrors the LLM and PF ones. Confirms the
+    semaphore wrap is around the detect() call (not just declared
+    next to the field)."""
+    _patch_gliner_pii_fail_closed(monkeypatch, False)
+    p = Pipeline()
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    from anonymizer_guardrail.detector.remote_gliner_pii import (
+        RemoteGlinerPIIDetector,
+    )
+    bad = RemoteGlinerPIIDetector.__new__(RemoteGlinerPIIDetector)
+    bad.name = "gliner_pii"
+
+    async def slow_detect(*_args, **_kwargs):
+        started.set()
+        await finish.wait()
+        return []
+
+    bad.detect = slow_detect  # type: ignore[method-assign]
+    p._detectors = [bad]
+
+    task = asyncio.create_task(p.anonymize(["x"], call_id="gliner-inflight"))
+    await started.wait()
+    assert p.stats()["gliner_pii_in_flight"] == 1
+    finish.set()
+    await task
+    assert p.stats()["gliner_pii_in_flight"] == 0
+
+
+async def test_gliner_pii_unavailable_propagates_under_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLINER_PII_FAIL_CLOSED=true → a GlinerPIIUnavailableError inside
+    the detector propagates so main.py returns BLOCKED. Same risk shape
+    as the PF and LLM detectors — silent coverage downgrade is exactly
+    what fail-closed exists to prevent."""
+    from anonymizer_guardrail.detector.remote_gliner_pii import (
+        GlinerPIIUnavailableError,
+    )
+
+    _patch_gliner_pii_fail_closed(monkeypatch, True)
+
+    p = Pipeline()
+    p._detectors = [_gliner_detector_that_raises(
+        lambda: GlinerPIIUnavailableError("service unreachable")
+    )]
+
+    with pytest.raises(GlinerPIIUnavailableError, match="service unreachable"):
+        await p.anonymize(["alice"], call_id="gliner-fail-closed")
+
+
+async def test_gliner_pii_unavailable_swallowed_under_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLINER_PII_FAIL_CLOSED=false → log + degrade to no gliner matches.
+    The request still goes through (covered by other detectors)."""
+    from anonymizer_guardrail.detector.remote_gliner_pii import (
+        GlinerPIIUnavailableError,
+    )
+
+    _patch_gliner_pii_fail_closed(monkeypatch, False)
+
+    p = Pipeline()
+    p._detectors = [_gliner_detector_that_raises(
+        lambda: GlinerPIIUnavailableError("service unreachable")
+    )]
+
+    modified, mapping = await p.anonymize(["alice"], call_id="gliner-fail-open")
+    assert mapping == {}
+    assert modified == ["alice"]
+
+
+async def test_unexpected_gliner_pii_failure_routes_through_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-GlinerPIIUnavailable crash inside the detector must still
+    route through GLINER_PII_FAIL_CLOSED — same asymmetry the LLM and
+    PF detectors have. Otherwise a programmer error would silently
+    drop coverage in fail-closed mode."""
+    from anonymizer_guardrail.detector.remote_gliner_pii import (
+        GlinerPIIUnavailableError,
+    )
+
+    _patch_gliner_pii_fail_closed(monkeypatch, True)
+
+    p = Pipeline()
+    p._detectors = [_gliner_detector_that_raises(
+        lambda: RuntimeError("unexpected explosion")
+    )]
+
+    with pytest.raises(GlinerPIIUnavailableError, match="Unexpected failure"):
+        await p.anonymize(["alice"], call_id="gliner-unexpected-fail")
 
 
 def test_detector_mode_parses_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:

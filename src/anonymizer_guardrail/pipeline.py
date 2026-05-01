@@ -24,6 +24,10 @@ from .detector.denylist import DenylistDetector
 from .detector.llm import LLMDetector, LLMUnavailableError
 from .detector.privacy_filter import PrivacyFilterDetector
 from .detector.regex import RegexDetector
+from .detector.remote_gliner_pii import (
+    GlinerPIIUnavailableError,
+    RemoteGlinerPIIDetector,
+)
 from .detector.remote_privacy_filter import (
     PrivacyFilterUnavailableError,
     RemotePrivacyFilterDetector,
@@ -52,6 +56,25 @@ def _privacy_filter_factory() -> Detector:
     return PrivacyFilterDetector()
 
 
+def _gliner_pii_factory() -> Detector:
+    """Construct the gliner-pii detector, requiring GLINER_PII_URL.
+
+    Unlike privacy_filter, there is no in-process fallback — the
+    gliner library + ~570M weights would defeat the slim guardrail.
+    An empty URL therefore raises at construction time so an operator
+    who set DETECTOR_MODE=...,gliner_pii without setting GLINER_PII_URL
+    sees a clear error at boot rather than the request-time confusion
+    of a silently-skipped detector.
+    """
+    if not config.gliner_pii_url:
+        raise RuntimeError(
+            "DETECTOR_MODE includes 'gliner_pii' but GLINER_PII_URL is unset. "
+            "Deploy the gliner-pii-service container (see services/gliner_pii/) "
+            "and set GLINER_PII_URL=http://<host>:<port>."
+        )
+    return RemoteGlinerPIIDetector()
+
+
 _DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
     "regex":          RegexDetector,
     "llm":            LLMDetector,
@@ -62,6 +85,10 @@ _DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
     # Dispatches between in-process (torch in this container) and
     # remote (HTTP to a privacy-filter-service) at instantiation time.
     "privacy_filter": _privacy_filter_factory,
+    # Remote-only — no in-process variant. Crashes loud at boot if the
+    # URL isn't set, since silently skipping it would mislead operators
+    # who deliberately enabled it in DETECTOR_MODE.
+    "gliner_pii":     _gliner_pii_factory,
 }
 
 
@@ -155,6 +182,12 @@ class Pipeline:
         # the service's safe concurrency. Independent semaphore so a
         # saturated PF queue doesn't reduce LLM headroom (or vice versa).
         self._pf_semaphore = asyncio.Semaphore(config.privacy_filter_max_concurrency)
+        # GLiNER-PII gets the same independent semaphore for the same
+        # reason — its inference service has finite worker capacity and
+        # a chatty request shouldn't be able to drown it. Sharing a
+        # semaphore with PF would couple their failure modes (a slow
+        # PF queue would starve gliner of slots), which we don't want.
+        self._gliner_pii_semaphore = asyncio.Semaphore(config.gliner_pii_max_concurrency)
         # In-flight call counters. We increment/decrement around the
         # detect() call rather than reading Semaphore._value (private)
         # because the asyncio.Semaphore API doesn't expose a stable
@@ -162,16 +195,20 @@ class Pipeline:
         # plain int mutation is safe between await points.
         self._llm_in_flight = 0
         self._pf_in_flight = 0
+        self._gliner_pii_in_flight = 0
         log.info(
             "Pipeline ready — detectors=[%s], vault_ttl=%ds, "
-            "llm_fail_closed=%s, pf_fail_closed=%s, "
-            "llm_max_concurrency=%d, pf_max_concurrency=%d",
+            "llm_fail_closed=%s, pf_fail_closed=%s, gliner_pii_fail_closed=%s, "
+            "llm_max_concurrency=%d, pf_max_concurrency=%d, "
+            "gliner_pii_max_concurrency=%d",
             ", ".join(d.name for d in self._detectors),
             config.vault_ttl_s,
             config.llm_fail_closed,
             config.privacy_filter_fail_closed,
+            config.gliner_pii_fail_closed,
             config.llm_max_concurrency,
             config.privacy_filter_max_concurrency,
+            config.gliner_pii_max_concurrency,
         )
 
     def stats(self) -> dict[str, int]:
@@ -186,6 +223,8 @@ class Pipeline:
             "llm_max_concurrency": config.llm_max_concurrency,
             "pf_in_flight": self._pf_in_flight,
             "pf_max_concurrency": config.privacy_filter_max_concurrency,
+            "gliner_pii_in_flight": self._gliner_pii_in_flight,
+            "gliner_pii_max_concurrency": config.gliner_pii_max_concurrency,
         }
 
     @property
@@ -301,6 +340,17 @@ class Pipeline:
                             return await det.detect(text)
                         finally:
                             self._pf_in_flight -= 1
+                # GLiNER-PII gets the same treatment as remote PF for
+                # the same reason — its inference service has finite
+                # worker capacity that a chatty request shouldn't be
+                # able to drown.
+                if isinstance(det, RemoteGlinerPIIDetector):
+                    async with self._gliner_pii_semaphore:
+                        self._gliner_pii_in_flight += 1
+                        try:
+                            return await det.detect(text)
+                        finally:
+                            self._gliner_pii_in_flight -= 1
                 return await det.detect(text)
             except LLMUnavailableError as exc:
                 if config.llm_fail_closed:
@@ -312,6 +362,13 @@ class Pipeline:
                     raise
                 log.warning(
                     "Privacy-filter detector unavailable, proceeding fail-open: %s", exc,
+                )
+                return []
+            except GlinerPIIUnavailableError as exc:
+                if config.gliner_pii_fail_closed:
+                    raise
+                log.warning(
+                    "GLiNER-PII detector unavailable, proceeding fail-open: %s", exc,
                 )
                 return []
             except Exception as exc:  # defensive: a buggy detector shouldn't kill us
@@ -344,6 +401,18 @@ class Pipeline:
                         f"Unexpected failure in privacy-filter detector "
                         f"({type(exc).__name__}): {exc}"
                     ) from exc
+                # Same asymmetry for the gliner-pii detector. Operator
+                # who set GLINER_PII_FAIL_CLOSED=true wants to BLOCK on
+                # any unexpected crash from the remote service path,
+                # not silently degrade.
+                if (
+                    isinstance(det, RemoteGlinerPIIDetector)
+                    and config.gliner_pii_fail_closed
+                ):
+                    raise GlinerPIIUnavailableError(
+                        f"Unexpected failure in gliner-pii detector "
+                        f"({type(exc).__name__}): {exc}"
+                    ) from exc
                 return []
 
         # TaskGroup (vs asyncio.gather) cancels in-flight sibling tasks
@@ -366,6 +435,8 @@ class Pipeline:
         except* LLMUnavailableError as eg:
             raise eg.exceptions[0] from None
         except* PrivacyFilterUnavailableError as eg:
+            raise eg.exceptions[0] from None
+        except* GlinerPIIUnavailableError as eg:
             raise eg.exceptions[0] from None
 
         results = [t.result() for t in tasks]
