@@ -10,10 +10,16 @@ so future LiteLLM additions don't break us.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+)
 
 from .detector import REGISTERED_SPECS
 
@@ -56,29 +62,6 @@ class GuardrailResponse(BaseModel):
 # types log a warning and are ignored — we don't BLOCK over a single
 # bad override since the rest of the request is still anonymizable.
 
-@dataclass(frozen=True)
-class Overrides:
-    use_faker: bool | None = None
-    faker_locale: tuple[str, ...] | None = None
-    detector_mode: tuple[str, ...] | None = None
-    regex_overlap_strategy: str | None = None
-    regex_patterns: str | None = None
-    llm_model: str | None = None
-    llm_prompt: str | None = None
-    denylist: str | None = None
-    # Per-request zero-shot vocabulary for the gliner_pii detector.
-    # Tuple (frozen) so Overrides stays hashable; the detector
-    # converts back to a list when building the request body.
-    gliner_labels: tuple[str, ...] | None = None
-    # Per-request confidence cutoff for gliner_pii (0..1). None →
-    # detector falls back to its configured default.
-    gliner_threshold: float | None = None
-
-    @classmethod
-    def empty(cls) -> Overrides:
-        return cls()
-
-
 _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
 
 # Defensive caps on parsed override values. The detector_mode cap is
@@ -98,87 +81,152 @@ _MAX_DETECTOR_LIST = len(REGISTERED_SPECS)
 _MAX_GLINER_LABELS = 50
 
 
-def _parse_locale(value: Any) -> tuple[str, ...] | None:
-    """Accept either ``"pt_BR,en_US"`` (string) or ``["pt_BR", "en_US"]``
-    (array) and normalize to a tuple. Empty input → None."""
-    if isinstance(value, str):
-        parts = [s.strip() for s in value.split(",") if s.strip()]
-    elif isinstance(value, (list, tuple)):
-        parts = []
-        for item in value:
-            if not isinstance(item, str):
-                raise TypeError(f"locale list item must be string, got {type(item).__name__}")
-            s = item.strip()
-            if s:
-                parts.append(s)
-    else:
-        raise TypeError(f"expected string or list, got {type(value).__name__}")
-    if len(parts) > _MAX_LOCALE_CHAIN:
-        raise ValueError(
-            f"locale chain length {len(parts)} exceeds cap of {_MAX_LOCALE_CHAIN}"
-        )
-    return tuple(parts) if parts else None
+def _csv_or_list(max_len: int):
+    """Build a BeforeValidator that accepts ``"a,b,c"`` or ``["a","b","c"]``
+    and normalizes to a tuple of stripped non-empty strings, capped at
+    ``max_len``. Empty input → ``None`` (the field's default).
+
+    Each comma-or-list field has its own cap, so we close over it here
+    rather than push the cap into a single generic validator.
+    """
+    def _validate(v: Any) -> tuple[str, ...] | None:
+        if isinstance(v, str):
+            parts = [s.strip() for s in v.split(",") if s.strip()]
+        elif isinstance(v, (list, tuple)):
+            parts = []
+            for item in v:
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"list item must be string, got {type(item).__name__}"
+                    )
+                s = item.strip()
+                if s:
+                    parts.append(s)
+        else:
+            raise ValueError(
+                f"expected string or list, got {type(v).__name__}"
+            )
+        if len(parts) > max_len:
+            raise ValueError(
+                f"length {len(parts)} exceeds cap of {max_len}"
+            )
+        return tuple(parts) if parts else None
+    return _validate
 
 
-def _parse_label_list(value: Any) -> tuple[str, ...] | None:
-    """Accept either ``"email,ssn,phone"`` (string) or
-    ``["email", "ssn", "phone"]`` (array) and normalize to a tuple.
-    Empty input → None (the detector then falls back to its
-    configured default labels). Capped at `_MAX_GLINER_LABELS`."""
-    if isinstance(value, str):
-        parts = [s.strip() for s in value.split(",") if s.strip()]
-    elif isinstance(value, (list, tuple)):
-        parts = []
-        for item in value:
-            if not isinstance(item, str):
-                raise TypeError(
-                    f"label list item must be string, got {type(item).__name__}"
-                )
-            s = item.strip()
-            if s:
-                parts.append(s)
-    else:
-        raise TypeError(f"expected string or list, got {type(value).__name__}")
-    if len(parts) > _MAX_GLINER_LABELS:
-        raise ValueError(
-            f"gliner_labels length {len(parts)} exceeds cap of {_MAX_GLINER_LABELS}"
-        )
-    return tuple(parts) if parts else None
+def _strict_bool(v: Any) -> bool:
+    """Reject non-bool inputs. Pydantic's default `bool` field would
+    coerce ``"yes"`` / ``1`` to True; we want strictly the JSON
+    literals ``true`` / ``false``."""
+    if not isinstance(v, bool):
+        raise ValueError(f"expected bool, got {type(v).__name__}")
+    return v
 
 
-def _parse_threshold(value: Any) -> float | None:
-    """Accept int or float in [0, 1]. JSON booleans are rejected
-    (Python `bool` is a subclass of `int` so we have to test for it
-    first or `True` slips through as `1.0`)."""
-    if isinstance(value, bool):
-        raise TypeError(f"expected number, got bool")
-    if not isinstance(value, (int, float)):
-        raise TypeError(f"expected number, got {type(value).__name__}")
-    f = float(value)
+def _strict_threshold(v: Any) -> float:
+    """Accept int or float in [0, 1], rejecting bool. Python `bool` is
+    a subclass of `int` so ``True`` would otherwise slip through as
+    ``1.0``. The env-var form (`GLINER_PII_THRESHOLD="0.5"`) parses
+    strings inside the detector — the JSON request body should always
+    carry a number, so accepting strings here would just hide
+    misconfigured clients."""
+    if isinstance(v, bool):
+        raise ValueError("expected number, got bool")
+    if not isinstance(v, (int, float)):
+        raise ValueError(f"expected number, got {type(v).__name__}")
+    f = float(v)
     if not 0.0 <= f <= 1.0:
-        raise ValueError(f"gliner_threshold {f} not in [0, 1]")
+        raise ValueError(f"value {f} not in [0, 1]")
     return f
 
 
-def _parse_detector_mode(value: Any) -> tuple[str, ...] | None:
-    """Accept comma-separated string or list of strings, normalize to tuple."""
-    if isinstance(value, str):
-        parts = [s.strip() for s in value.split(",") if s.strip()]
-    elif isinstance(value, (list, tuple)):
-        parts = []
-        for item in value:
-            if not isinstance(item, str):
-                raise TypeError(f"detector_mode list item must be string, got {type(item).__name__}")
-            s = item.strip()
-            if s:
-                parts.append(s)
-    else:
-        raise TypeError(f"expected string or list, got {type(value).__name__}")
-    if len(parts) > _MAX_DETECTOR_LIST:
+def _strict_overlap_strategy(v: Any) -> str:
+    if not isinstance(v, str):
+        raise ValueError(f"expected string, got {type(v).__name__}")
+    norm = v.strip().lower()
+    if norm not in _VALID_OVERLAP_STRATEGIES:
         raise ValueError(
-            f"detector_mode list length {len(parts)} exceeds cap of {_MAX_DETECTOR_LIST}"
+            f"unknown strategy {v!r}; allowed: "
+            f"{', '.join(sorted(_VALID_OVERLAP_STRATEGIES))}"
         )
-    return tuple(parts) if parts else None
+    return norm
+
+
+def _strict_name(v: Any) -> str | None:
+    """For naming fields (`regex_patterns`, `llm_prompt`, `denylist`,
+    `llm_model`): accept a string, strip surrounding whitespace, and
+    treat empty/whitespace-only as 'no override' (None)."""
+    if not isinstance(v, str):
+        raise ValueError(f"expected string, got {type(v).__name__}")
+    stripped = v.strip()
+    return stripped if stripped else None
+
+
+class Overrides(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    use_faker: Annotated[bool | None, BeforeValidator(_strict_bool)] = None
+    faker_locale: Annotated[
+        tuple[str, ...] | None, BeforeValidator(_csv_or_list(_MAX_LOCALE_CHAIN))
+    ] = None
+    detector_mode: Annotated[
+        tuple[str, ...] | None, BeforeValidator(_csv_or_list(_MAX_DETECTOR_LIST))
+    ] = None
+    regex_overlap_strategy: Annotated[
+        str | None, BeforeValidator(_strict_overlap_strategy)
+    ] = None
+    regex_patterns: Annotated[str | None, BeforeValidator(_strict_name)] = None
+    llm_model: Annotated[str | None, BeforeValidator(_strict_name)] = None
+    llm_prompt: Annotated[str | None, BeforeValidator(_strict_name)] = None
+    denylist: Annotated[str | None, BeforeValidator(_strict_name)] = None
+    # Tuple keeps the field immutable in line with the rest of the
+    # model; the detector converts back to a list when building the
+    # request body.
+    gliner_labels: Annotated[
+        tuple[str, ...] | None, BeforeValidator(_csv_or_list(_MAX_GLINER_LABELS))
+    ] = None
+    gliner_threshold: Annotated[
+        float | None, BeforeValidator(_strict_threshold)
+    ] = None
+
+    @classmethod
+    def empty(cls) -> "Overrides":
+        return cls()
+
+
+# Per-field TypeAdapters power the lenient parse loop below. A
+# TypeAdapter built from the field's annotation (`bool | None` plus
+# its BeforeValidator) lets us validate one value at a time and catch
+# `ValidationError` per field — which is how we honour the
+# warn-and-drop contract without giving up declarative validation.
+#
+# `field.annotation` strips the `Annotated[...]` wrapper to just the
+# bare type; the BeforeValidator and friends live in `field.metadata`.
+# We have to reattach them, otherwise the per-field adapter would
+# accept inputs (e.g. `"0.5"` for a float, `True` for `gliner_threshold`)
+# that the model's own validator rejects, and the bad value would only
+# fail at the final `Overrides(**fields)` construction — outside the
+# per-field try/except, defeating the warn-and-drop contract.
+def _field_adapter(field: Any) -> TypeAdapter:
+    if field.metadata:
+        return TypeAdapter(Annotated[(field.annotation, *field.metadata)])
+    return TypeAdapter(field.annotation)
+
+
+_FIELD_ADAPTERS: dict[str, TypeAdapter] = {
+    name: _field_adapter(field)
+    for name, field in Overrides.model_fields.items()
+}
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """Pydantic's str(ValidationError) is multi-line and noisy for log
+    output. Pull the first error's `msg` so the log line stays tight
+    while still pointing at what was wrong."""
+    errors = exc.errors()
+    if not errors:
+        return str(exc)
+    return errors[0].get("msg", str(exc))
 
 
 def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
@@ -192,86 +240,30 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
     if not raw:
         return Overrides.empty()
 
-    use_faker: bool | None = None
-    faker_locale: tuple[str, ...] | None = None
-    detector_mode: tuple[str, ...] | None = None
-    regex_overlap_strategy: str | None = None
-    regex_patterns: str | None = None
-    llm_model: str | None = None
-    llm_prompt: str | None = None
-    denylist: str | None = None
-    gliner_labels: tuple[str, ...] | None = None
-    gliner_threshold: float | None = None
-
+    fields: dict[str, Any] = {}
     for key, value in raw.items():
+        adapter = _FIELD_ADAPTERS.get(key)
+        if adapter is None:
+            # Unknown key — silently ignore. Other guardrails sharing
+            # the same dict don't apply here (LiteLLM scopes
+            # additional_provider_specific_params per guardrail), but
+            # we still tolerate forward-compat / typo-tolerance.
+            log.debug("ignoring unknown override key %r", key)
+            continue
         try:
-            if key == "use_faker":
-                if not isinstance(value, bool):
-                    raise TypeError(f"expected bool, got {type(value).__name__}")
-                use_faker = value
-            elif key == "faker_locale":
-                faker_locale = _parse_locale(value)
-            elif key == "detector_mode":
-                detector_mode = _parse_detector_mode(value)
-            elif key == "regex_overlap_strategy":
-                if not isinstance(value, str):
-                    raise TypeError(f"expected string, got {type(value).__name__}")
-                norm = value.strip().lower()
-                if norm not in _VALID_OVERLAP_STRATEGIES:
-                    raise ValueError(
-                        f"unknown strategy {value!r}; allowed: "
-                        f"{', '.join(sorted(_VALID_OVERLAP_STRATEGIES))}"
-                    )
-                regex_overlap_strategy = norm
-            elif key == "llm_model":
-                if not isinstance(value, str):
-                    raise TypeError(f"expected string, got {type(value).__name__}")
-                stripped = value.strip()
-                if stripped:
-                    llm_model = stripped
-            elif key == "gliner_labels":
-                gliner_labels = _parse_label_list(value)
-            elif key == "gliner_threshold":
-                gliner_threshold = _parse_threshold(value)
-            elif key in ("regex_patterns", "llm_prompt", "denylist"):
-                # Each names a registered alternative
-                # (REGEX_PATTERNS_REGISTRY / LLM_SYSTEM_PROMPT_REGISTRY /
-                # DENYLIST_REGISTRY). The detector resolves the name
-                # against its registry at detect() time; an unknown name
-                # there logs a warning and falls back to the default.
-                # Path traversal is impossible because we never accept a
-                # path here — only a name.
-                if not isinstance(value, str):
-                    raise TypeError(f"expected string, got {type(value).__name__}")
-                stripped = value.strip()
-                if stripped:
-                    if key == "regex_patterns":
-                        regex_patterns = stripped
-                    elif key == "llm_prompt":
-                        llm_prompt = stripped
-                    else:
-                        denylist = stripped
-            else:
-                # Unknown key — silently ignore. Other guardrails sharing
-                # the same dict don't apply here (LiteLLM scopes
-                # additional_provider_specific_params per guardrail), but
-                # we still tolerate forward-compat / typo-tolerance.
-                log.debug("ignoring unknown override key %r", key)
-        except (TypeError, ValueError) as exc:
+            validated = adapter.validate_python(value)
+        except ValidationError as exc:
             log.warning(
                 "ignoring invalid override %s=%r: %s",
-                key, value, exc,
+                key, value, _format_validation_error(exc),
             )
-
-    return Overrides(
-        use_faker=use_faker,
-        faker_locale=faker_locale,
-        detector_mode=detector_mode,
-        regex_overlap_strategy=regex_overlap_strategy,
-        regex_patterns=regex_patterns,
-        llm_model=llm_model,
-        llm_prompt=llm_prompt,
-        denylist=denylist,
-        gliner_labels=gliner_labels,
-        gliner_threshold=gliner_threshold,
-    )
+            continue
+        # `None` means the validator legitimately treated the input
+        # as "no override" (e.g. empty `faker_locale=""`). Skip rather
+        # than pass it back to the model — the BeforeValidator would
+        # re-run on the second pass and reject None as not-a-string.
+        # Field defaults are None anyway, so this is identical.
+        if validated is None:
+            continue
+        fields[key] = validated
+    return Overrides(**fields)
