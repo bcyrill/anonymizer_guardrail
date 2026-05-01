@@ -295,105 +295,142 @@ flexibility.
 
 ---
 
-## Detector registration API
+## Detector registration API — bash launcher consolidation
 
-**What:** replace the per-detector hand-wiring in `Pipeline`,
-`config.py`, `_lib.sh`, `menu.sh`, and `cli.sh` with a single
-`DetectorSpec` descriptor each detector registers, plus an iterator
-that the centralized files consume. Adding a detector should be "drop
-a file under `detector/`, append to a registry list" — not "touch
-seven places".
+**Status:** Python side is **done**. Bash launchers (`_lib.sh`,
+`cli.sh`, `menu.sh`) still hand-wire each detector — the open work is
+collapsing that fan-out the same way the Python side did.
 
-**Why:** every new detector currently requires edits in a fan-out of
-files:
+**What shipped (Python registry):**
 
-  * `config.py`         — env-var fields
-  * `pipeline.py`       — factory entry, semaphore, in-flight counter,
-                          `_run` branch, exception handler, TaskGroup
-                          `except*` clause, `stats()` keys, log line
-  * `main.py`           — typed exception → BLOCKED handler
-  * `_lib.sh`           — `DETECTOR_HAS_*` predicate, env-var globals
-                          docs, optional auto-start lifecycle, env-var
-                          passthroughs in `build_run_args`, plan rows,
-                          run command wiring
-  * `menu.sh`           — checklist entry, submenu, labels/dialogs,
-                          backend-selection, validation
-  * `cli.sh`            — flags, validation, auto-start hook
-  * Tests               — fixtures for the new detector + pipeline tests
+  * `detector/spec.py` defines `DetectorSpec` carrying name, factory,
+    a module reference (for live `CONFIG` lookup), per-call kwargs
+    builder, semaphore + stats prefix, and typed-error + blocked-reason.
+  * Each detector module owns a `CONFIG` dataclass (`RegexConfig`,
+    `DenylistConfig`, `LLMConfig`, `PrivacyFilterConfig`,
+    `GlinerPIIConfig`) — env-var fields colocated with the detector.
+    The central `Config` shrank to cross-cutting fields only (host,
+    port, log level, DETECTOR_MODE, surrogate, vault).
+  * `detector/__init__.py` exposes `REGISTERED_SPECS`, `SPECS_BY_NAME`,
+    `SPECS_WITH_SEMAPHORE`, `TYPED_UNAVAILABLE_ERRORS`.
+  * `Pipeline.__init__` iterates the registry to allocate
+    `_semaphores` / `_inflight_counters` dicts and build the startup
+    log line. `stats()` iterates to assemble per-detector keys.
+    `_run` dispatches via `SPECS_BY_NAME[det.name]` (no `isinstance`
+    chains). The TaskGroup `except*` clause uses
+    `TYPED_UNAVAILABLE_ERRORS` so a new typed error needs no edit.
+  * `main.py`'s `BLOCKED` handler is one `except` over the typed-errors
+    tuple, looking up `spec.blocked_reason` from the registry.
+  * README's *Adding a new detector* section documents the four-step
+    Python flow (write Detector class, define CONFIG, define SPEC,
+    register).
 
-The fan-out is the actual cost of "adding a detector"; the file
-location of the detector itself is incidental. Centralizing the wiring
-into a registry collapses most of these edits into one descriptor.
+Adding a 6th Python detector is now: write a file, append to
+`REGISTERED_SPECS`. The `Pipeline`, `main.py`, `stats()`, and exception
+handling all light up automatically.
 
-**Why deferred:** the abstraction needs to be wide enough to fit every
-detector's quirks without becoming a leaky superset:
+**What's still open (bash launchers):**
 
-  * regex carries overlap strategy + per-call `patterns_name` override
-  * llm carries per-call `api_key` + `model` + `prompt_name`
-  * denylist carries per-call `denylist_name`
-  * privacy_filter has both in-process and remote variants under one
-    DETECTOR_MODE token, picked by URL presence
-  * gliner_pii is remote-only, with per-call `labels` + `threshold`
-    override (planned, see *Per-request gliner_labels* above)
-  * privacy_filter and gliner_pii have an auto-start lifecycle in the
-    launcher; regex / denylist don't
+The bash side still requires per-detector edits in three files for
+every new detector. The fan-out per detector is roughly:
 
-Designing the descriptor before we have enough datapoints risks
-either (a) a too-narrow abstraction that breaks the next detector
-or (b) an over-general one that's worse than the hand-wiring it
-replaced. Wait until a 4th or 5th external detector lands so the
-shape is forced by real variety, not anticipated.
+  * `_lib.sh`  — `DETECTOR_HAS_<NAME>` predicate in
+                 `resolve_predicates`; env-var globals doc block at
+                 top of file; optional `start_<name>` /
+                 `cleanup_<name>` lifecycle helpers (mirror PF /
+                 gliner shape); env-var passthroughs in
+                 `build_run_args` (`RUN_<NAME>_ARGS=…`); plan rows
+                 in `print_plan`; run command wiring in
+                 `run_guardrail`.
+  * `menu.sh`  — globals at top; checklist entry in
+                 `ws_pick_detector_mode`; backend / URL / labels /
+                 threshold / fail-mode dialogs; `submenu_<name>`;
+                 labels for the row display; auto-default-to-service
+                 logic in `ws_pick_flavour` / `ws_pick_detector_mode`;
+                 launch-time validation msgbox; auto-start hook.
+  * `cli.sh`   — flag parser cases; flag globals; backend-value
+                 validation; auto-derive URL from
+                 `--<name>-backend service`; validation that detector
+                 in mode requires URL/backend; auto-start hook.
 
-**Sketch:**
+Each new detector adds ~50–80 lines across the three files.
 
-1. Define `DetectorSpec` (dataclass) carrying:
-   * `name` — DETECTOR_MODE token
-   * `factory` — `() -> Detector`, may raise at boot
-   * `config_class` — owns its `*_url`, `*_fail_closed`,
-     `*_max_concurrency`, etc. fields; merged into `Config` via
-     composition
-   * `pipeline_hooks` — exposes the semaphore name, in-flight counter
-     name, typed unavailable-error class, fail-closed field name,
-     and a `prepare_kwargs(overrides) -> dict` for per-call args
-   * `launcher` — optional auto-start metadata
-     (`container_name`, `image_tag`, `port`, `health_endpoint`,
-     `start_timeout_s`, env-var passthrough list)
-   * `endpoint_block_reason` — string template for `main.py`'s
-     BLOCKED response when the typed error fires
-2. Detectors live where they live (flat files for now; can be
-   packagized later if any one outgrows ~500 lines). Each module
-   exposes a `SPEC = DetectorSpec(...)` constant.
-3. `src/anonymizer_guardrail/detector/__init__.py` enumerates the
-   modules and re-exports `REGISTERED_SPECS`.
-4. `Pipeline.__init__` iterates `REGISTERED_SPECS` to set up
-   semaphores, in-flight counters, the `_DETECTOR_FACTORIES` dict,
-   the `stats()` payload, and the log line. `_run` dispatches via
-   `spec.pipeline_hooks` instead of `isinstance` chains.
-5. `main.py`'s exception handlers iterate `REGISTERED_SPECS` to
-   register `(error_class → blocked_reason)` mappings.
-6. `_lib.sh` reads a generated env-var passthrough table (or has
-   each spec's launcher block emit its own `RUN_*_ARGS` array).
-   Same for the auto-start dispatch.
-7. `menu.sh` / `cli.sh` enumerate `REGISTERED_SPECS` to build the
-   checklist + submenus + flags. Detector-specific dialogs stay
-   per-spec but get wired up generically.
-8. Tests gain a `register_test_detector` helper for pipeline-level
-   tests that don't need a real detector.
+**Why deferred:** bash can't consume Python state. The two cleanest
+paths are roughly equal-effort:
 
-**Concrete trigger:** the moment we add a detector that the existing
-hand-wiring doesn't fit cleanly (e.g. one that needs a different
-auth model, a streaming response, or a different fail-mode shape).
-Or when the per-detector edit list crosses ~10 files.
+  1. **Generated manifest.** A small Python entry point
+     (`anonymizer-detector-manifest`) iterates `REGISTERED_SPECS` and
+     prints a sourceable `bash` file with arrays / case statements
+     the launchers source at startup. The detector module declares
+     launcher metadata in its SPEC (container name, port, health
+     endpoint, env-var passthrough list, auto-start enabled). The
+     launchers become loops over the manifest.
+  2. **Hand-rolled shared dispatcher.** Refactor `_lib.sh` so
+     `start_<name>` / `cleanup_<name>` / `ws_pick_<name>_*` /
+     `RUN_<NAME>_ARGS` follow a strict naming convention, then have
+     a generic `start_aux_service "<name>"` /
+     `for_each_detector_with_service` driver. Detector-specific
+     dialogs stay per-detector functions but get called generically.
+
+(1) is more work upfront but flips the bash side to "registry-driven"
+in the same way as the Python side. (2) is cheaper but only collapses
+the boilerplate — it doesn't centralize the source of truth.
+
+The Python registry has a clear win in correctness (impossible to
+forget to add a detector to one of seven files), so it was worth the
+abstraction debt. The bash side's wins are smaller — one edit per
+new detector to three files, all next to each other in the repo —
+so the deferral bar is higher. Wait for the 6th or 7th detector to
+land before tackling it.
+
+**Sketch (whichever path):**
+
+1. Decide on the manifest format (sourceable bash file emitted by a
+   Python entry point) vs the strict-naming-convention dispatcher.
+   Manifest is recommended; ties bash to the Python registry.
+2. Extend `DetectorSpec` with an optional `launcher` block:
+   `container_name`, `default_image_tag`, `port`, `hf_volume_name`,
+   `health_endpoint`, `start_timeout_s`, `env_passthroughs: list[str]`.
+   Detectors that don't have a service (regex, denylist) leave it `None`.
+3. `scripts/detector-manifest.py` reads `REGISTERED_SPECS`, writes
+   `scripts/_manifest.sh` with associative arrays:
+   ```bash
+   declare -A DETECTORS=(...)         # name → "service|noservice"
+   declare -A DETECTOR_PORT=(...)
+   declare -A DETECTOR_CONTAINER=(...)
+   declare -A DETECTOR_ENV_VARS=(...)
+   declare -A DETECTOR_HEALTH_PATH=(...)
+   ```
+   Run as a build step (or pre-commit hook) — the manifest is
+   generated, not hand-edited.
+4. `_lib.sh` sources the manifest. `start_aux_service "<name>"`
+   replaces `start_fake_llm` / `start_privacy_filter` / `start_gliner_pii`.
+   `resolve_predicates` becomes a loop. `build_run_args` reads
+   `DETECTOR_ENV_VARS` per detector.
+5. `menu.sh` enumerates the manifest to build the checklist; per-
+   detector submenus stay hand-written (each has unique fields like
+   `gliner_pii_labels` that no generic dialog can build). The
+   "auto-start hook" branches collapse into one `for name in
+   "${SERVICE_DETECTORS[@]}"` loop.
+6. `cli.sh` similarly: flag parsing stays per-detector (each has
+   its own `--<name>-url`, `--<name>-fail-open`, etc.) but the
+   backend-validation / auto-derive-URL / auto-start blocks collapse
+   into a loop.
+
+**Concrete trigger:** the 6th detector lands and an operator notices
+they touched three bash files for it. Or someone adds a 4th
+auto-start-able service and the duplication becomes too noisy to ignore.
 
 **Non-goals:**
 
-- Not a *plugin* system. We're not loading detectors from third-party
-  packages via entry points — that's premature for a project that
-  ships its own detector set. The registry stays an in-tree
-  enumeration; entry-point support can be layered on later if the
-  use case appears.
-- Not a refactor of `Match` / `Detector` Protocol / `_dedup`. The
-  shared types stay. This is wiring-level cleanup only.
+- Not a *plugin* system from third-party packages. The manifest is
+  built from in-tree `REGISTERED_SPECS`; entry-point support can be
+  layered later if the use case appears.
+- Not a refactor of detector-specific dialogs in `menu.sh`
+  (`ws_pick_gliner_pii_labels` etc.). Those expose
+  detector-unique fields that don't generalize. Only the boilerplate
+  around them gets centralized.
+- Not yet — wait for a 6th detector before paying this cost.
 
 ---
 
