@@ -275,13 +275,20 @@ def test_factory_picks_remote_when_url_set(
 
     det = pipeline_mod._privacy_filter_factory()
     assert isinstance(det, RemotePrivacyFilterDetector)
-    # Sanity: the in-process branch is reachable too. We don't actually
-    # construct it (it would import torch via the lazy loader on first
-    # detect, and that'd OOM the test runner); just confirm the factory
-    # dispatches to the in-process class when the URL is empty.
+
+    # Now flip the URL off and confirm the factory dispatches to the
+    # in-process class. PrivacyFilterDetector's __init__ does heavy
+    # work (loads torch + the model), so we mock it out — the test is
+    # about *which class the factory picks*, not about constructing it.
     fake_cfg.privacy_filter_url = ""
     monkeypatch.setattr(pipeline_mod, "config", fake_cfg)
-    # We can't .config.privacy_filter_url directly construct without
-    # transformers if it's not installed, so just check the class
-    # selection by inspecting the function's branch.
-    assert pipeline_mod._privacy_filter_factory.__doc__  # smoke
+    constructed: list[str] = []
+
+    def fake_init(self, *_args, **_kwargs):
+        constructed.append("PrivacyFilterDetector")
+        self.name = "privacy_filter"
+
+    monkeypatch.setattr(PrivacyFilterDetector, "__init__", fake_init)
+    det = pipeline_mod._privacy_filter_factory()
+    assert isinstance(det, PrivacyFilterDetector)
+    assert constructed == ["PrivacyFilterDetector"]

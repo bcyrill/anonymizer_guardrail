@@ -225,10 +225,10 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
 | `LLM_FAIL_CLOSED` | `true`                        | Block requests if the LLM detector errors. |
-| `PRIVACY_FILTER_URL` | *(empty)*                  | When set, the privacy_filter detector talks HTTP to a standalone privacy-filter-service instead of loading the model in-process; the slim image then covers privacy_filter. See *Privacy-filter detector* below. |
+| `PRIVACY_FILTER_URL` | *(empty)*                  | When set, the `privacy_filter` detector talks HTTP to a standalone privacy-filter-service instead of loading the model in-process; the slim image then covers `privacy_filter`. See *Privacy-filter detector → Remote* below. |
 | `PRIVACY_FILTER_TIMEOUT_S` | `30`                | Per-call timeout (seconds) on the remote privacy-filter HTTP requests. |
 | `PRIVACY_FILTER_FAIL_CLOSED` | `true`            | Block requests when the privacy_filter detector errors (mirrors `LLM_FAIL_CLOSED`). Independent flag — operators can fail closed on one detector and open on the other. Applies to both the in-process and remote variants. |
-| `HF_HUB_OFFLINE`  | `1` *(baked image only)* / *(unset)* | Pf-baked sets this so transformers doesn't ping HuggingFace Hub on every start; pass `-e HF_HUB_OFFLINE=0` to force online mode for a refresh. The `pf` (runtime-download) flavour leaves it unset on first run; `scripts/cli.sh --hf-offline` / the menu offer it after the cache volume is populated. |
+| `HF_HUB_OFFLINE`  | `1` *(baked images only)* / *(unset)* | Both the guardrail's `pf-baked` flavour and the privacy-filter-service's `pf-service-baked` flavour set this so transformers doesn't ping HuggingFace Hub on every start; pass `-e HF_HUB_OFFLINE=0` to force online mode for a refresh. The runtime-download flavours (`pf` / `pf-service`) leave it unset on first run; `scripts/cli.sh --hf-offline` / the menu offer it after the cache volume is populated. |
 
 ### Forwarding the caller's API key
 
@@ -511,6 +511,79 @@ Behaviour notes:
   override accepts only registered names, never paths. See *Named
   alternatives* below.
 
+### Privacy-filter detector
+
+Two implementations back the `privacy_filter` detector — same name in
+`DETECTOR_MODE`, same canonical entity types, same span semantics on
+the wire. Operators pick which one runs by the topology they want, not
+by changing the detector list.
+
+#### In-process (default)
+
+Loads the `openai/privacy-filter` model into the guardrail's own
+process. Pulls in `torch`, `transformers`, and ~6 GB of weights, so
+this option only works on the `pf` / `pf-baked` image flavours — slim
+doesn't ship the dependencies. Microsecond glue overhead per call;
+shares the guardrail's CPU/memory budget.
+
+Pick this when:
+
+- Single-replica deployment.
+- You don't already have a privacy-filter service running.
+- Latency is more important than image size or independent scaling.
+
+#### Remote (`PRIVACY_FILTER_URL` set)
+
+Off-loads inference to a standalone container running
+`services/privacy_filter/main.py` — a thin FastAPI wrapper around the
+same HuggingFace pipeline plus identical span-merge post-processing.
+The guardrail's `RemotePrivacyFilterDetector` posts each request's
+text to `${PRIVACY_FILTER_URL}/detect` and parses the returned span
+list. Output is byte-equivalent to the in-process detector for the
+same input.
+
+Pick this when:
+
+- You want the slim guardrail image (no torch, ~200 MB) but still
+  need privacy-filter coverage.
+- Multiple guardrail replicas should share one inference service
+  (single model copy in memory; one place to attach a GPU).
+- Model updates need to ship without rebuilding the guardrail image.
+
+Build the service image via `scripts/build-image.sh -t pf-service`
+(runtime download) or `pf-service-baked` (model in image). See
+[`services/privacy_filter/README.md`](services/privacy_filter/README.md)
+for the API contract, env vars, and standalone build/run commands.
+
+#### Selecting the backend
+
+For interactive / single-host development, the launcher exposes the
+choice as `PRIVACY_FILTER_BACKEND`:
+
+| Value      | What happens                                                   |
+|------------|----------------------------------------------------------------|
+| *(unset)*  | In-process. Requires `--type pf` or `--type pf-baked`.         |
+| `service`  | Auto-start a `privacy-filter-service` container on the shared network and point the guardrail at it. Mirrors how `--llm-backend fake-llm` auto-starts fake-llm. |
+| `external` | Use the URL given by `--privacy-filter-url` / `PRIVACY_FILTER_URL`. Nothing is auto-started. Use this for production deployments where the service is managed separately (Kubernetes, docker-compose, etc.). |
+
+The auto-start path mounts the same `anonymizer-hf-cache` volume the
+guardrail's `pf` flavour uses, so an operator who already pulled the
+model via the in-process path doesn't pay the download again on
+switching to remote.
+
+#### Failure handling
+
+`PRIVACY_FILTER_FAIL_CLOSED` (default `true`) is independent from
+`LLM_FAIL_CLOSED` — operators can fail closed on one detector and
+open on the other. When the privacy-filter detector raises
+`PrivacyFilterUnavailableError` (service unreachable, timeout, non-200,
+or any unexpected exception under fail-closed), the guardrail returns
+`BLOCKED`. With fail-open, the error is logged and the request
+proceeds with coverage from the remaining detectors. The flag applies
+to both the in-process and remote variants — a torch crash inside the
+in-process detector triggers the same fail-closed path as a connection
+error to the remote service.
+
 ### Per-request overrides
 
 Several settings can be flipped on a per-call basis via LiteLLM's
@@ -522,7 +595,7 @@ the deployment-wide default.
 |---|---|---|
 | `use_faker` | `bool` | Switch Faker on/off for this call. False forces opaque `[TYPE_…]` tokens. |
 | `faker_locale` | `string` or `string[]` | Override `FAKER_LOCALE`. Accepts `"pt_BR,en_US"` or `["pt_BR", "en_US"]` — first locale is primary, rest are fallbacks. |
-| `detector_mode` | `string` or `string[]` | **Subset filter** over the detectors built at startup. Override naming a detector that wasn't configured logs a warning and is dropped (privacy_filter and llm both need startup-time setup that isn't reversible per call). |
+| `detector_mode` | `string` or `string[]` | **Subset filter** over the detectors built at startup — can narrow the active set for one call but cannot introduce a detector that wasn't built at boot (every detector needs constructor work that isn't safe to run mid-request). Override naming a detector that wasn't configured logs a warning and is dropped. |
 | `regex_overlap_strategy` | `"longest"` or `"priority"` | Override `REGEX_OVERLAP_STRATEGY` for this call. |
 | `regex_patterns` | `string` | Name of a registered alternative regex pattern set (see *Named alternatives* below). |
 | `llm_model` | `string` | Override `LLM_MODEL` (the alias the LLM detector sends to its backend) for this call. |
