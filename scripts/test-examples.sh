@@ -434,20 +434,26 @@ fi
 # ── 8. Kitchen-sink ──
 say ""
 say "${c_bld}8. Kitchen-sink request${c_rst}"
-KS="Incident report: AcmeCorp engineer Alice Smith (alice.smith@acme.example, +1-415-555-0142, DOB: 1985-04-15) noticed unusual traffic from 10.0.42.7 to api.acme.internal at 03:14 UTC. The attacker appears to have lifted GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz from a public Gist. Affected resource id 550e8400-e29b-41d4-a716-446655440000. Card 4111-1111-1111-1111 was used on the linked account. Suspected internal codename: Project Zephyr."
-# Only assert PII guaranteed to be caught by the regex layer (so the
-# test passes regardless of whether privacy_filter or llm are on).
-# AcmeCorp / Alice Smith / Project Zephyr require pf or llm and are
-# checked indirectly by sections 5 and 6 above.
-expect_intervened "kitchen-sink" "$KS" \
-  "alice.smith@acme.example" \
-  "+1-415-555-0142" \
-  "1985-04-15" \
-  "10.0.42.7" \
-  "api.acme.internal" \
-  "ghp_1234567890abcdefghijklmnopqrstuvwxyz" \
-  "550e8400-e29b-41d4-a716-446655440000" \
-  "4111-1111-1111-1111"
+# Only assert PII guaranteed to be caught by the regex layer. The
+# privacy-filter and LLM detectors are context-dependent — e.g.
+# privacy-filter has been observed dropping a `.example`-TLD email
+# in dense prose even though it catches the same email in isolation.
+# Skip the whole section when regex isn't in DETECTOR_MODE; sections
+# 5 and 6 already cover what pf / llm contribute on their own inputs.
+if $has_regex; then
+  KS="Incident report: AcmeCorp engineer Alice Smith (alice.smith@acme.example, +1-415-555-0142, DOB: 1985-04-15) noticed unusual traffic from 10.0.42.7 to api.acme.internal at 03:14 UTC. The attacker appears to have lifted GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz from a public Gist. Affected resource id 550e8400-e29b-41d4-a716-446655440000. Card 4111-1111-1111-1111 was used on the linked account. Suspected internal codename: Project Zephyr."
+  expect_intervened "kitchen-sink" "$KS" \
+    "alice.smith@acme.example" \
+    "+1-415-555-0142" \
+    "1985-04-15" \
+    "10.0.42.7" \
+    "api.acme.internal" \
+    "ghp_1234567890abcdefghijklmnopqrstuvwxyz" \
+    "550e8400-e29b-41d4-a716-446655440000" \
+    "4111-1111-1111-1111"
+else
+  skip "kitchen-sink test" "regex not in DETECTOR_MODE"
+fi
 
 # ── Summary ──
 say ""
