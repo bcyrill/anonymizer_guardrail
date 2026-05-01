@@ -20,6 +20,7 @@ from typing import Callable, Iterable
 from .api import Overrides
 from .config import config
 from .detector.base import Detector, Match
+from .detector.denylist import DenylistDetector
 from .detector.llm import LLMDetector, LLMUnavailableError
 from .detector.privacy_filter import PrivacyFilterDetector
 from .detector.regex import RegexDetector
@@ -32,6 +33,10 @@ log = logging.getLogger("anonymizer.pipeline")
 _DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
     "regex":          RegexDetector,
     "llm":            LLMDetector,
+    # Literal-string match against an operator-supplied YAML denylist.
+    # Loads with no entries when DENYLIST_PATH is unset, so registering
+    # it here unconditionally is safe.
+    "denylist":       DenylistDetector,
     # Optional: requires the `privacy-filter` extras (torch + transformers).
     # The class itself imports cheap stuff; instantiation lazy-loads the
     # heavy deps. So unused, this entry costs nothing.
@@ -243,6 +248,10 @@ class Pipeline:
                         text,
                         overlap_strategy=overrides.regex_overlap_strategy,
                         patterns_name=overrides.regex_patterns,
+                    )
+                if isinstance(det, DenylistDetector):
+                    return await det.detect(
+                        text, denylist_name=overrides.denylist,
                     )
                 return await det.detect(text)
             except LLMUnavailableError as exc:

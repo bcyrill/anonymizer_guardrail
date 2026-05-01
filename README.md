@@ -12,16 +12,24 @@ sides of the round-trip.
 
 ## Detection layers
 
-Three layers, all optional, controlled by `DETECTOR_MODE` — a comma-
-separated list of detector names. Available names: `regex`, `llm`,
-`privacy_filter`. Order determines type-resolution priority: when the
-same text is detected by multiple detectors, the type from the one
-listed first wins. Example: `DETECTOR_MODE=regex,privacy_filter,llm`.
+Four layers, all optional, controlled by `DETECTOR_MODE` — a comma-
+separated list of detector names. Available names: `regex`, `denylist`,
+`llm`, `privacy_filter`. Order determines type-resolution priority: when
+the same text is detected by multiple detectors, the type from the one
+listed first wins. Example: `DETECTOR_MODE=denylist,regex,privacy_filter,llm`.
 
 - **regex** — high-precision patterns for things with recognizable shapes:
   IPs, CIDRs, emails, hashes, JWTs, AWS keys, GitHub tokens, OpenAI-style
   keys, internal hostnames (`*.local`, `*.internal`, etc.). Stateless,
   deterministic, no external dependencies.
+
+- **denylist** — literal-string match against an operator-supplied YAML
+  list. Useful for org-specific terms regex can't shape-match and the LLM
+  may miss: employee names, project codenames, customer identifiers,
+  internal product names. Deterministic, no false positives, no LLM
+  round-trip. Loads with no entries when `DENYLIST_PATH` is unset, so
+  registering it under `DETECTOR_MODE` before configuring the file is
+  safe.
 
 - **llm** — calls an OpenAI-compatible Chat Completions endpoint with a
   JSON-mode prompt that asks the model to enumerate sensitive entities.
@@ -203,6 +211,8 @@ All knobs are environment variables; sensible defaults baked into
 | `REGEX_PATTERNS_PATH` | *(empty → bundled `regex_default.yaml`)* | Override the bundled regex patterns YAML |
 | `REGEX_PATTERNS_REGISTRY` | *(empty)*             | Comma-separated `name=path` list of NAMED alternative regex pattern files callers can opt into per-request via `regex_patterns`. See *Per-request overrides → Named alternatives* below. |
 | `REGEX_OVERLAP_STRATEGY` | `longest`              | `longest` (longest match wins on overlapping spans) or `priority` (first pattern in YAML order wins). See *Regex overlap resolution* below. |
+| `DENYLIST_PATH`   | *(empty → no entries)*        | Path to the denylist YAML (literal-string match). Empty means the detector loads as a no-op — useful when `denylist` is included in `DETECTOR_MODE` but the list isn't ready yet. Accepts `bundled:NAME` or a filesystem path. See *Customising the denylist* below. |
+| `DENYLIST_REGISTRY` | *(empty)*                   | Comma-separated `name=path` list of NAMED alternative denylists callers can opt into per-request via `denylist`. See *Per-request overrides → Named alternatives* below. |
 | `FAKER_LOCALE`    | *(empty → en_US)*             | Faker locale, e.g. `pt_BR` or `pt_BR,en_US` |
 | `USE_FAKER`       | `true`                        | When false, all surrogates are opaque tokens |
 | `SURROGATE_CACHE_MAX_SIZE` | `100000`             | LRU cap on the surrogate cache (cross-request consistency) |
@@ -418,9 +428,69 @@ Patterns without groups still anonymize the full match. All patterns
 compile at startup; any bad regex, unknown flag, or unreadable extends
 path crashes the boot rather than silently dropping rules.
 
+### Customising the denylist
+
+The denylist detector flags literal strings that an org wants
+redacted regardless of context — employee names, project codenames,
+customer identifiers. No file ships with the package (these lists
+are by definition org-specific); set `DENYLIST_PATH` to your own
+YAML and add `denylist` to `DETECTOR_MODE`.
+
+Schema — each entry needs a `type` and `value`; `case_sensitive` and
+`word_boundary` are optional and default to `true`:
+
+```yaml
+# Loaded at startup. Override with DENYLIST_PATH=/path/to/your.yaml.
+#
+# Schema (per entry):
+#   type:              one of the entity types declared in
+#                        src/anonymizer_guardrail/detector/base.py → ENTITY_TYPES
+#                      (unknown types fall back to OTHER and produce
+#                      opaque-token surrogates).
+#   value:             the literal string to match (required, non-empty).
+#   case_sensitive:    optional bool, default true. When false, the entry
+#                      matches any casing of `value` in the text.
+#   word_boundary:     optional bool, default true. When true, `\b` is
+#                      attached around the value's word-character edges
+#                      so "Bob" doesn't match inside "Bobby". Set to
+#                      false to allow substring matches.
+
+entries:
+  # Project codename — exact casing only.
+  - type: ORGANIZATION
+    value: Project Aurora
+
+  # Employee name — match any casing the user typed.
+  - type: PERSON
+    value: Maria Schwarz
+    case_sensitive: false
+
+  # Internal product designator that may appear inside identifiers
+  # like "ORION-DB-PROD" — disable word boundaries for substring match.
+  - type: IDENTIFIER
+    value: ORION
+    word_boundary: false
+```
+
+Behaviour notes:
+
+- **Overlap resolution** is longest-first within the denylist: when
+  `Acme` and `Acme Corp` both appear, `Acme Corp` wins as a single
+  span. Across detectors, dedup is by matched text (first detector
+  to claim a substring keeps its type).
+- **Performance**: matching is implemented as two compiled
+  alternation regexes (one case-sensitive, one case-insensitive),
+  which is plenty fast up to low-thousands of entries. Larger lists
+  would benefit from a dedicated matcher (`pyahocorasick` or
+  similar); not implemented yet — opt for it once a deployment
+  actually hits the wall.
+- **No path traversal from clients**: the per-request `denylist`
+  override accepts only registered names, never paths. See *Named
+  alternatives* below.
+
 ### Per-request overrides
 
-Five settings can be flipped on a per-call basis via LiteLLM's
+Several settings can be flipped on a per-call basis via LiteLLM's
 `additional_provider_specific_params` field — useful when one model
 needs a different detection mode, locale, or anonymization model than
 the deployment-wide default.
@@ -434,6 +504,7 @@ the deployment-wide default.
 | `regex_patterns` | `string` | Name of a registered alternative regex pattern set (see *Named alternatives* below). |
 | `llm_model` | `string` | Override `LLM_MODEL` (the alias the LLM detector sends to its backend) for this call. |
 | `llm_prompt` | `string` | Name of a registered alternative LLM detection prompt (see *Named alternatives* below). |
+| `denylist` | `string` | Name of a registered alternative denylist (see *Named alternatives* below). |
 
 **Validation policy:** unknown keys are silently ignored;
 known-key bad values log a warning and are dropped. The other
@@ -446,7 +517,7 @@ config defaults for whatever was rejected.
 | Limit | Default | What it bounds |
 |---|---|---|
 | `faker_locale` chain length | 3 | Maximum locales in a single `faker_locale` value. A request asking for 50 locales is malformed and inflates Faker construction time. Hardcoded — primary + 1–2 fallbacks is the realistic shape. |
-| `detector_mode` list length | 3 | Three detector implementations exist (`regex`, `privacy_filter`, `llm`); anything longer cannot be valid. Hardcoded. |
+| `detector_mode` list length | 4 | Four detector implementations exist (`regex`, `denylist`, `privacy_filter`, `llm`); anything longer cannot be valid. Hardcoded. |
 | `SURROGATE_FAKER_LRU_MAX` | `32` | LRU cap on the per-locale Faker instance cache. Each Faker is a few MB resident (provider dictionaries); without a bound, a caller cycling distinct locale tuples could grow memory unboundedly. On overflow, the least-recently-used Faker is dropped and reconstructed on next use (~1–2 ms). Override at startup if your deployment legitimately serves many distinct locale combos. |
 
 When a length cap is exceeded, the override is dropped (warn-and-drop)
@@ -462,22 +533,24 @@ in the cache, each consistent within its bucket. Default-config
 traffic still buckets to the original key shape — no migration cost.
 The surrogate cache itself remains bounded by `SURROGATE_CACHE_MAX_SIZE`.
 
-**Named alternatives (`regex_patterns`, `llm_prompt`):**
+**Named alternatives (`regex_patterns`, `llm_prompt`, `denylist`):**
 
-`regex_patterns` and `llm_prompt` deliberately accept *names*, not
-paths. Letting callers pass arbitrary paths over the wire would be a
-path-traversal + bypass vector (e.g. an empty YAML disables redaction).
-Operators pre-declare the allowed alternatives via two env vars:
+`regex_patterns`, `llm_prompt`, and `denylist` deliberately accept
+*names*, not paths. Letting callers pass arbitrary paths over the wire
+would be a path-traversal + bypass vector (e.g. an empty YAML disables
+redaction). Operators pre-declare the allowed alternatives via three
+env vars:
 
 ```bash
 REGEX_PATTERNS_REGISTRY="pentest=bundled:regex_pentest.yaml,internal=/etc/anon/internal.yaml"
 LLM_SYSTEM_PROMPT_REGISTRY="pentest=bundled:llm_pentest.md,legal=/etc/anon/legal.md"
+DENYLIST_REGISTRY="legal=/etc/anon/legal-deny.yaml,marketing=/etc/anon/marketing-deny.yaml"
 ```
 
 Format: comma-separated `name=path` pairs (whitespace around `=` and
 `,` is stripped). Each path uses the same `bundled:NAME` /
 filesystem-path syntax as `REGEX_PATTERNS_PATH` /
-`LLM_SYSTEM_PROMPT_PATH`. Validation:
+`LLM_SYSTEM_PROMPT_PATH` / `DENYLIST_PATH`. Validation:
 
 - All entries are loaded + compiled at startup. Typos / unreadable
   files / empty prompts crash boot loudly with the offending entry

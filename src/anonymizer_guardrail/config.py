@@ -81,6 +81,22 @@ class Config:
     # Example:
     #   REGEX_PATTERNS_REGISTRY="pentest=bundled:regex_pentest.yaml,internal=/etc/anon/internal.yaml"
     regex_patterns_registry: str = os.getenv("REGEX_PATTERNS_REGISTRY", "")
+    # Path to the YAML file defining the denylist detector's literal-string
+    # entries. If unset, the detector still loads under DETECTOR_MODE=denylist
+    # but matches nothing — useful for boot order independence (operator
+    # can set DETECTOR_MODE first and DENYLIST_PATH later). Accepts the
+    # same `bundled:NAME` / filesystem-path conventions as REGEX_PATTERNS_PATH.
+    denylist_path: str = os.getenv("DENYLIST_PATH", "")
+    # Optional registry of NAMED alternative denylists that callers can
+    # opt into per-request via additional_provider_specific_params.denylist.
+    # Same format as REGEX_PATTERNS_REGISTRY / LLM_SYSTEM_PROMPT_REGISTRY:
+    # comma-separated `name=path` pairs. Each path uses the same
+    # `bundled:NAME` / filesystem-path conventions as DENYLIST_PATH.
+    # The default lives in DENYLIST_PATH; the registry never contains
+    # a "default" entry.
+    # Example:
+    #   DENYLIST_REGISTRY="legal=/etc/anon/legal-deny.yaml,marketing=/etc/anon/marketing-deny.yaml"
+    denylist_registry: str = os.getenv("DENYLIST_REGISTRY", "")
     # How the regex detector resolves overlapping matches between patterns:
     #   - "longest"  pick the longest match span (default). Robust against
     #                a child YAML's narrow pattern shadowing a parent's

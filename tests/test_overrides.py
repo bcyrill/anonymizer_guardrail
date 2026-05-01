@@ -38,6 +38,7 @@ def test_parse_overrides_accepts_known_keys() -> None:
         "regex_patterns": "pentest",
         "llm_model": "gpt-4o-mini",
         "llm_prompt": "legal",
+        "denylist": "marketing",
     })
     assert o.use_faker is False
     assert o.faker_locale == ("pt_BR", "en_US")
@@ -46,26 +47,32 @@ def test_parse_overrides_accepts_known_keys() -> None:
     assert o.regex_patterns == "pentest"
     assert o.llm_model == "gpt-4o-mini"
     assert o.llm_prompt == "legal"
+    assert o.denylist == "marketing"
 
 
 def test_parse_overrides_named_alternatives_strip_whitespace() -> None:
-    """`regex_patterns` and `llm_prompt` accept names — the parser
-    strips surrounding whitespace, mirroring how detector_mode tokens
-    are normalised."""
+    """`regex_patterns`, `llm_prompt`, and `denylist` accept names — the
+    parser strips surrounding whitespace, mirroring how detector_mode
+    tokens are normalised."""
     o = parse_overrides({
         "regex_patterns": "  pentest  ",
         "llm_prompt": "\tlegal\n",
+        "denylist": " legal ",
     })
     assert o.regex_patterns == "pentest"
     assert o.llm_prompt == "legal"
+    assert o.denylist == "legal"
 
 
 def test_parse_overrides_named_alternatives_empty_string_means_default() -> None:
     """An empty/whitespace name doesn't pin an override — caller will
     fall through to the configured default."""
-    o = parse_overrides({"regex_patterns": "", "llm_prompt": "   "})
+    o = parse_overrides(
+        {"regex_patterns": "", "llm_prompt": "   ", "denylist": ""}
+    )
     assert o.regex_patterns is None
     assert o.llm_prompt is None
+    assert o.denylist is None
 
 
 def test_parse_overrides_named_alternatives_reject_non_string(
@@ -74,12 +81,16 @@ def test_parse_overrides_named_alternatives_reject_non_string(
     """Wrong type → warn + drop. Matches the warn-and-drop policy of
     the other knobs; the request still proceeds with the default."""
     caplog.set_level(logging.WARNING)
-    o = parse_overrides({"regex_patterns": 42, "llm_prompt": ["a", "b"]})
+    o = parse_overrides(
+        {"regex_patterns": 42, "llm_prompt": ["a", "b"], "denylist": 7}
+    )
     assert o.regex_patterns is None
     assert o.llm_prompt is None
+    assert o.denylist is None
     msgs = " | ".join(r.message for r in caplog.records)
     assert "regex_patterns" in msgs
     assert "llm_prompt" in msgs
+    assert "denylist" in msgs
 
 
 def test_parse_overrides_locale_array_form_normalizes_to_tuple() -> None:
@@ -229,6 +240,161 @@ async def test_regex_overlap_strategy_invalid_raises() -> None:
     detector = regex_mod.RegexDetector()
     with pytest.raises(ValueError, match="Invalid overlap_strategy"):
         await detector.detect("foo", overlap_strategy="bogus")
+
+
+# ── Denylist detector override ─────────────────────────────────────────────
+from anonymizer_guardrail.detector import denylist as deny_mod
+
+
+def _index_from_yaml(text: str, tmp_path, name: str) -> deny_mod._Index:
+    """Compile a denylist YAML body into an index suitable for assigning
+    onto DenylistDetector._registry. The detector itself doesn't read
+    the file — registries are pre-built at import time — so per-test we
+    bypass that and inject indices directly."""
+    p = tmp_path / f"{name}.yaml"
+    p.write_text(text, encoding="utf-8")
+    return deny_mod._build_index(deny_mod._load_entries(str(p)))
+
+
+@pytest.mark.asyncio
+async def test_denylist_override_selects_named_registry_entry(tmp_path) -> None:
+    """Per-call `denylist_name` override picks an entry from the registry
+    instead of the default. Confirms detection switches behaviour
+    cleanly for one call without persisting state."""
+    legal_yaml = (
+        "entries:\n"
+        "  - type: ORGANIZATION\n"
+        "    value: ACME-LEGAL\n"
+    )
+    marketing_yaml = (
+        "entries:\n"
+        "  - type: ORGANIZATION\n"
+        "    value: ACME-MKT\n"
+    )
+
+    detector = deny_mod.DenylistDetector()
+    detector._registry = {
+        "legal": _index_from_yaml(legal_yaml, tmp_path, "legal"),
+        "marketing": _index_from_yaml(marketing_yaml, tmp_path, "marketing"),
+    }
+
+    text = "Notes: ACME-LEGAL and ACME-MKT both appear here."
+
+    legal_matches = await detector.detect(text, denylist_name="legal")
+    assert {m.text for m in legal_matches} == {"ACME-LEGAL"}
+
+    mkt_matches = await detector.detect(text, denylist_name="marketing")
+    assert {m.text for m in mkt_matches} == {"ACME-MKT"}
+
+
+@pytest.mark.asyncio
+async def test_denylist_override_unknown_name_falls_back_to_default(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Typo in the per-call `denylist` name doesn't BLOCK the request —
+    log a warning, fall through to the default. Mirrors the
+    regex_patterns / llm_prompt fallback contract."""
+    default_yaml = (
+        "entries:\n"
+        "  - type: ORGANIZATION\n"
+        "    value: DefaultListTerm\n"
+    )
+
+    detector = deny_mod.DenylistDetector()
+    detector._default_index = _index_from_yaml(
+        default_yaml, tmp_path, "default",
+    )
+    detector._registry = {
+        "legal": _index_from_yaml(
+            "entries:\n  - type: ORGANIZATION\n    value: LEGAL_TERM\n",
+            tmp_path, "legal",
+        ),
+    }
+
+    text = "DefaultListTerm and LEGAL_TERM appear in the same line."
+    caplog.set_level(logging.WARNING, logger="anonymizer.denylist")
+    matches = await detector.detect(text, denylist_name="nonexistent")
+    assert {m.text for m in matches} == {"DefaultListTerm"}
+    assert any(
+        "nonexistent" in r.message and "fallback" in r.message.lower() or
+        "falling back" in r.message.lower()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_denylist_override_default_keyword_uses_default_list(
+    tmp_path,
+) -> None:
+    """The literal name `default` is reserved (the registry loader
+    rejects it). Passing it as an override is a no-op — same as
+    passing None — and routes through the default list."""
+    default_yaml = (
+        "entries:\n"
+        "  - type: ORGANIZATION\n"
+        "    value: DefaultListTerm\n"
+    )
+
+    detector = deny_mod.DenylistDetector()
+    detector._default_index = _index_from_yaml(
+        default_yaml, tmp_path, "default",
+    )
+    detector._registry = {
+        "legal": _index_from_yaml(
+            "entries:\n  - type: ORGANIZATION\n    value: LEGAL_TERM\n",
+            tmp_path, "legal",
+        ),
+    }
+
+    text = "Both DefaultListTerm and LEGAL_TERM appear here."
+    no_override = await detector.detect(text)
+    explicit_default = await detector.detect(text, denylist_name="default")
+    assert {m.text for m in no_override} == {"DefaultListTerm"}
+    assert {m.text for m in explicit_default} == {"DefaultListTerm"}
+
+
+def test_denylist_registry_loader_rejects_default_name() -> None:
+    """The shared registry parser bans the reserved `default` name —
+    putting one into DENYLIST_REGISTRY must crash boot, not silently
+    shadow DENYLIST_PATH."""
+    from anonymizer_guardrail.registry import parse_named_path_registry
+    with pytest.raises(RuntimeError, match="reserved"):
+        parse_named_path_registry(
+            "default=/etc/anon/default.yaml", "DENYLIST_REGISTRY"
+        )
+
+
+def test_denylist_registry_loader_compiles_each_entry(tmp_path) -> None:
+    """`_load_registry` walks DENYLIST_REGISTRY and produces one compiled
+    index per name. A typo in any path crashes boot — same loud-fail
+    contract as the default path."""
+    p_legal = tmp_path / "legal.yaml"
+    p_legal.write_text(
+        "entries:\n  - type: ORGANIZATION\n    value: ACME-LEGAL\n",
+        encoding="utf-8",
+    )
+    p_mkt = tmp_path / "marketing.yaml"
+    p_mkt.write_text(
+        "entries:\n  - type: ORGANIZATION\n    value: ACME-MKT\n",
+        encoding="utf-8",
+    )
+
+    from types import SimpleNamespace
+    fake_cfg = SimpleNamespace(
+        denylist_path="",
+        denylist_registry=f"legal={p_legal},marketing={p_mkt}",
+    )
+    import unittest.mock
+    with unittest.mock.patch.object(deny_mod, "config", fake_cfg):
+        registry = deny_mod._load_registry()
+    assert set(registry) == {"legal", "marketing"}
+    # Each compiled index has at least one of the two patterns set —
+    # confirms the loader did real work, not just bookkeeping.
+    for name, idx in registry.items():
+        cs, ci, _, _ = idx
+        assert cs is not None or ci is not None, (
+            f"{name} compiled to an empty index"
+        )
 
 
 # ── Faker LRU cache bound (OOM safety) ──────────────────────────────────────

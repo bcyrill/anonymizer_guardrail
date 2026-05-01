@@ -63,6 +63,7 @@ class Overrides:
     regex_patterns: str | None = None
     llm_model: str | None = None
     llm_prompt: str | None = None
+    denylist: str | None = None
 
     @classmethod
     def empty(cls) -> Overrides:
@@ -71,13 +72,13 @@ class Overrides:
 
 _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
 
-# Defensive caps on parsed override values. Three detectors exist
-# (regex, privacy_filter, llm) so a list longer than that is malformed.
-# Three locales covers primary + a couple of fallbacks, which is what
-# realistic Faker chains use; anything beyond is almost certainly
-# abuse and inflates per-request Faker construction time.
+# Defensive caps on parsed override values. Four detectors exist
+# (regex, denylist, privacy_filter, llm) so a list longer than that
+# is malformed. Three locales covers primary + a couple of fallbacks,
+# which is what realistic Faker chains use; anything beyond is almost
+# certainly abuse and inflates per-request Faker construction time.
 _MAX_LOCALE_CHAIN = 3
-_MAX_DETECTOR_LIST = 3
+_MAX_DETECTOR_LIST = 4
 
 
 def _parse_locale(value: Any) -> tuple[str, ...] | None:
@@ -141,6 +142,7 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
     regex_patterns: str | None = None
     llm_model: str | None = None
     llm_prompt: str | None = None
+    denylist: str | None = None
 
     for key, value in raw.items():
         try:
@@ -168,11 +170,12 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
                 stripped = value.strip()
                 if stripped:
                     llm_model = stripped
-            elif key in ("regex_patterns", "llm_prompt"):
-                # Both name a registered alternative (REGEX_PATTERNS_REGISTRY
-                # / LLM_SYSTEM_PROMPT_REGISTRY). The detector resolves the
-                # name against its registry at detect() time; an unknown
-                # name there logs a warning and falls back to the default.
+            elif key in ("regex_patterns", "llm_prompt", "denylist"):
+                # Each names a registered alternative
+                # (REGEX_PATTERNS_REGISTRY / LLM_SYSTEM_PROMPT_REGISTRY /
+                # DENYLIST_REGISTRY). The detector resolves the name
+                # against its registry at detect() time; an unknown name
+                # there logs a warning and falls back to the default.
                 # Path traversal is impossible because we never accept a
                 # path here — only a name.
                 if not isinstance(value, str):
@@ -181,8 +184,10 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
                 if stripped:
                     if key == "regex_patterns":
                         regex_patterns = stripped
-                    else:
+                    elif key == "llm_prompt":
                         llm_prompt = stripped
+                    else:
+                        denylist = stripped
             else:
                 # Unknown key — silently ignore. Other guardrails sharing
                 # the same dict don't apply here (LiteLLM scopes
@@ -203,4 +208,5 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
         regex_patterns=regex_patterns,
         llm_model=llm_model,
         llm_prompt=llm_prompt,
+        denylist=denylist,
     )
