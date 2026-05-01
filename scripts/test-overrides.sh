@@ -116,8 +116,14 @@ start_test_guardrail() {
   say ""
   say "${c_bld}Setting up test environment via cli.sh --preset ${PRESET}${c_rst}"
   say "  port=${TEST_PORT}  name=${TEST_NAME}  log=${TEST_LOG}"
+  # Inject the named-alternative registries via cli.sh's `--` passthrough.
+  # Tests for regex_patterns / llm_prompt then reference these names.
+  # `pentest` is a name we made up; the operator picks any name they want.
   "$SCRIPT_DIR/cli.sh" --preset "$PRESET" \
     --port "$TEST_PORT" --name "$TEST_NAME" --replace \
+    -- \
+    -e "REGEX_PATTERNS_REGISTRY=pentest=bundled:regex_pentest.yaml" \
+    -e "LLM_SYSTEM_PROMPT_REGISTRY=pentest=bundled:llm_pentest.md" \
     > "$TEST_LOG" 2>&1 &
   GUARDRAIL_PID=$!
   TEARDOWN_REGISTERED=true
@@ -318,9 +324,99 @@ else
   ffail "oversize detector list" "action=$a"
 fi
 
-# ── 5. regex_overlap_strategy override ──────────────────────────────────────
+# ── 5. regex_patterns override (named alternative) ──────────────────────────
 say ""
-say "${c_bld}5. regex_overlap_strategy override${c_rst}"
+say "${c_bld}5. regex_patterns override (named alternative)${c_rst}"
+if $has_regex; then
+  # CNPJ (Brazilian tax ID, format `\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}`)
+  # is matched by regex_pentest.yaml's CNPJ pattern but NOT by
+  # regex_default.yaml — confirmed via direct detector probing. So
+  # switching to the "pentest" registry entry at request time changes
+  # whether the value gets redacted, with no overlap from PHONE or
+  # other shape-similar patterns in the default set.
+  TEXT="Tax ID 12.345.678/0001-99 in the report."
+  CNPJ="12.345.678/0001-99"
+
+  # No-detection responses come back as {action: NONE, texts: null} —
+  # LiteLLM passes the original text through unchanged, so for the
+  # "CNPJ left alone" assertion, action=NONE is success.
+  r=$(post "$(mkbody "$TEXT" 'rp-default' '')")
+  a=$(printf '%s' "$r" | jget '["action"]')
+  if [[ "$a" == "NONE" ]]; then
+    pass "default patterns leave the CNPJ alone (action=NONE)"
+  else
+    m=$(printf '%s' "$r" | jget '["texts"][0]')
+    ffail "rp default" "expected NONE, got action=$a, response: $m"
+  fi
+
+  r=$(post "$(mkbody "$TEXT" 'rp-pentest' '{"regex_patterns": "pentest"}')")
+  a=$(printf '%s' "$r" | jget '["action"]')
+  if [[ "$a" == "GUARDRAIL_INTERVENED" ]]; then
+    m=$(printf '%s' "$r" | jget '["texts"][0]')
+    if [[ "$m" != *"$CNPJ"* ]]; then
+      pass "regex_patterns=pentest → CNPJ redacted (registry switch end-to-end)"
+    else
+      ffail "rp pentest" "intervened but CNPJ still present, got: $m"
+    fi
+  else
+    ffail "rp pentest" "expected GUARDRAIL_INTERVENED, got action=$a"
+  fi
+
+  # Unknown name → warn-and-fall-back. Same as default: NONE.
+  r=$(post "$(mkbody "$TEXT" 'rp-bogus' '{"regex_patterns": "nonexistent"}')")
+  a=$(printf '%s' "$r" | jget '["action"]')
+  if [[ "$a" == "NONE" ]]; then
+    pass "unknown regex_patterns name → fallback to default (CNPJ untouched)"
+  else
+    ffail "rp unknown name" "expected NONE (fallback), got action=$a"
+  fi
+else
+  skip "regex_patterns tests" "regex not in DETECTOR_MODE"
+fi
+
+# ── 6. llm_prompt override (named alternative) ──────────────────────────────
+say ""
+say "${c_bld}6. llm_prompt override (named alternative)${c_rst}"
+if $has_llm; then
+  # End-to-end: fake-llm has a rule keyed on match_system_prompt="NORDVENTO"
+  # (a substring unique to bundled:llm_pentest.md). When the guardrail
+  # forwards that prompt as the system message, fake-llm fires the rule
+  # and returns 503 → FAIL_CLOSED → outer BLOCKED. The default prompt
+  # doesn't contain NORDVENTO, so without the override the request flows
+  # normally.
+  r=$(post "$(mkbody 'Some random user input.' 'lp-pentest' '{"llm_prompt": "pentest"}')")
+  a=$(printf '%s' "$r" | jget '["action"]')
+  if [[ "$a" == "BLOCKED" ]]; then
+    pass "llm_prompt=pentest reaches fake-llm (NORDVENTO rule → 503 → BLOCKED)"
+  else
+    ffail "lp pentest" "expected BLOCKED, got action=$a"
+  fi
+
+  # Negative control: same payload without the override — default prompt,
+  # no NORDVENTO, no rule match.
+  r=$(post "$(mkbody 'Some random user input.' 'lp-default' '')")
+  a=$(printf '%s' "$r" | jget '["action"]')
+  if [[ "$a" != "BLOCKED" ]]; then
+    pass "without llm_prompt override: not BLOCKED (action=$a) — confirms isolation"
+  else
+    ffail "lp isolation" "default prompt also BLOCKED?"
+  fi
+
+  # Unknown name → warn-and-fall-back; same as the negative control.
+  r=$(post "$(mkbody 'Some random user input.' 'lp-bogus' '{"llm_prompt": "nonexistent"}')")
+  a=$(printf '%s' "$r" | jget '["action"]')
+  if [[ "$a" != "BLOCKED" ]]; then
+    pass "unknown llm_prompt name → fallback to default"
+  else
+    ffail "lp unknown name" "unknown name routed to a registered prompt?"
+  fi
+else
+  skip "llm_prompt tests" "llm not in DETECTOR_MODE"
+fi
+
+# ── 7. regex_overlap_strategy override ──────────────────────────────────────
+say ""
+say "${c_bld}7. regex_overlap_strategy override${c_rst}"
 if $has_regex; then
   # On the slim image with the bundled default YAML, regex_pentest's
   # \d{12} pattern isn't present, so this test only meaningfully
@@ -357,9 +453,9 @@ else
   skip "regex strategy tests" "regex not in DETECTOR_MODE"
 fi
 
-# ── 6. llm_model override ──────────────────────────────────────────────────
+# ── 8. llm_model override ──────────────────────────────────────────────────
 say ""
-say "${c_bld}6. llm_model override${c_rst}"
+say "${c_bld}8. llm_model override${c_rst}"
 if $has_llm; then
   # End-to-end verification: fake-llm's bundled rules.example.yaml
   # has a rule keyed on match_model="invalid-model" that returns 503.
@@ -390,9 +486,9 @@ else
   skip "llm_model test" "llm not in DETECTOR_MODE"
 fi
 
-# ── 7. Unknown / invalid override keys ─────────────────────────────────────
+# ── 9. Unknown / invalid override keys ─────────────────────────────────────
 say ""
-say "${c_bld}7. Invalid override values${c_rst}"
+say "${c_bld}9. Invalid override values${c_rst}"
 
 # Bad type (string for a bool) → dropped, request still works.
 r=$(post "$(mkbody 'Email at lily@corp.example.' 'inv-1' '{"use_faker": "yes"}')")
