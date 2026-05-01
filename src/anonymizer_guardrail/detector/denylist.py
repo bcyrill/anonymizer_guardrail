@@ -22,12 +22,11 @@ from __future__ import annotations
 
 import logging
 import re
-from importlib import resources
-from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
+from ..bundled_resource import resolve_spec
 from ..config import config
 from ..registry import parse_named_path_registry
 from .base import Match
@@ -35,28 +34,7 @@ from .base import Match
 log = logging.getLogger("anonymizer.denylist")
 
 
-_BUNDLED_PREFIX = "bundled:"
 _BUNDLED_DENYLISTS_DIR = "denylists"
-
-
-def _read_bundled(name: str, label: str) -> str:
-    if not name or "/" in name or "\\" in name:
-        raise RuntimeError(
-            f"{label}=bundled:{name!r}: name must be a bare filename (no "
-            f"path separators). Use a filesystem path if you want a file "
-            f"outside the bundled denylists/."
-        )
-    try:
-        return (
-            resources.files("anonymizer_guardrail")
-            .joinpath(f"{_BUNDLED_DENYLISTS_DIR}/{name}")
-            .read_text(encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError) as exc:
-        raise RuntimeError(
-            f"{label}=bundled:{name!r} not found in bundled "
-            f"{_BUNDLED_DENYLISTS_DIR}/: {exc}"
-        ) from exc
 
 
 def _read_yaml(
@@ -74,16 +52,10 @@ def _read_yaml(
     override = override.strip()
     if not override:
         return None
-    if override.startswith(_BUNDLED_PREFIX):
-        name = override[len(_BUNDLED_PREFIX):].strip()
-        return _read_bundled(name, label), f"bundled {_BUNDLED_DENYLISTS_DIR}/{name}"
-    path = Path(override)
-    try:
-        return path.read_text(encoding="utf-8"), str(path)
-    except OSError as exc:
-        raise RuntimeError(
-            f"{label}={override!r} could not be read: {exc}"
-        ) from exc
+    text, source, _file_dir = resolve_spec(
+        override, bundled_dir=_BUNDLED_DENYLISTS_DIR, label=label,
+    )
+    return text, source
 
 
 def _bool_field(entry: dict[str, Any], field: str, default: bool, loc: str) -> bool:

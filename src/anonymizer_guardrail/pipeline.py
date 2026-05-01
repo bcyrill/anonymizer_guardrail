@@ -149,20 +149,29 @@ class Pipeline:
         self._surrogates = SurrogateGenerator()
         self._vault = Vault()
         self._llm_semaphore = asyncio.Semaphore(config.llm_max_concurrency)
-        # In-flight LLM call counter. We increment/decrement around the
+        # Privacy-filter shares the same throttling rationale as LLM:
+        # in-process inference is CPU/GPU-bound, remote inference is one
+        # HTTP call per text and a chatty request can fan out far past
+        # the service's safe concurrency. Independent semaphore so a
+        # saturated PF queue doesn't reduce LLM headroom (or vice versa).
+        self._pf_semaphore = asyncio.Semaphore(config.privacy_filter_max_concurrency)
+        # In-flight call counters. We increment/decrement around the
         # detect() call rather than reading Semaphore._value (private)
         # because the asyncio.Semaphore API doesn't expose a stable
         # "current waiters" attribute. Single-threaded asyncio means
         # plain int mutation is safe between await points.
         self._llm_in_flight = 0
+        self._pf_in_flight = 0
         log.info(
             "Pipeline ready — detectors=[%s], vault_ttl=%ds, "
-            "llm_fail_closed=%s, pf_fail_closed=%s, max_concurrency=%d",
+            "llm_fail_closed=%s, pf_fail_closed=%s, "
+            "llm_max_concurrency=%d, pf_max_concurrency=%d",
             ", ".join(d.name for d in self._detectors),
             config.vault_ttl_s,
             config.llm_fail_closed,
             config.privacy_filter_fail_closed,
             config.llm_max_concurrency,
+            config.privacy_filter_max_concurrency,
         )
 
     def stats(self) -> dict[str, int]:
@@ -175,6 +184,8 @@ class Pipeline:
             "surrogate_cache_max": cache_max,
             "llm_in_flight": self._llm_in_flight,
             "llm_max_concurrency": config.llm_max_concurrency,
+            "pf_in_flight": self._pf_in_flight,
+            "pf_max_concurrency": config.privacy_filter_max_concurrency,
         }
 
     @property
@@ -276,6 +287,20 @@ class Pipeline:
                     return await det.detect(
                         text, denylist_name=overrides.denylist,
                     )
+                # Privacy-filter (in-process or remote) goes through its
+                # own concurrency cap. In-process inference is CPU/GPU-
+                # bound and benefits from serialization the same way LLM
+                # does; remote PF is one HTTP call per text and the
+                # service has finite worker capacity, so unbounded fan-
+                # out from a chatty request is the same thundering-herd
+                # the LLM cap was added to prevent.
+                if isinstance(det, (PrivacyFilterDetector, RemotePrivacyFilterDetector)):
+                    async with self._pf_semaphore:
+                        self._pf_in_flight += 1
+                        try:
+                            return await det.detect(text)
+                        finally:
+                            self._pf_in_flight -= 1
                 return await det.detect(text)
             except LLMUnavailableError as exc:
                 if config.llm_fail_closed:
@@ -321,7 +346,29 @@ class Pipeline:
                     ) from exc
                 return []
 
-        results = await asyncio.gather(*[_run(d) for d in active])
+        # TaskGroup (vs asyncio.gather) cancels in-flight sibling tasks
+        # the moment one detector raises. Matters under fail-closed: when
+        # the LLM detector raises LLMUnavailableError we're going to BLOCK
+        # the whole request, and a still-running privacy_filter call (which
+        # can take hundreds of ms locally or seconds remotely) is wasted
+        # work. gather() left the siblings running until completion and
+        # discarded their results; TaskGroup short-circuits.
+        #
+        # The except* unwrap re-raises the first matching typed exception
+        # so main.py's `except LLMUnavailableError / PrivacyFilterUnavailableError`
+        # clauses still match — they wouldn't catch the BaseExceptionGroup
+        # TaskGroup raises by default. `_run` is the only place in this
+        # function that lets typed exceptions escape, so the group will
+        # contain at most these two types.
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(_run(d)) for d in active]
+        except* LLMUnavailableError as eg:
+            raise eg.exceptions[0] from None
+        except* PrivacyFilterUnavailableError as eg:
+            raise eg.exceptions[0] from None
+
+        results = [t.result() for t in tasks]
         if log.isEnabledFor(logging.DEBUG):
             for det, matches in zip(active, results):
                 log.debug(

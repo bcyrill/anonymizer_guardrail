@@ -261,7 +261,7 @@ async def test_pf_and_llm_fail_modes_are_independent(
 
 async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
     """Pipeline.stats() snapshots vault size, surrogate cache size + cap,
-    and LLM in-flight + cap. Used by /health for ops monitoring."""
+    and per-detector in-flight + cap. Used by /health for ops monitoring."""
     s = pipeline.stats()
     expected_keys = {
         "vault_size",
@@ -269,10 +269,13 @@ async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
         "surrogate_cache_max",
         "llm_in_flight",
         "llm_max_concurrency",
+        "pf_in_flight",
+        "pf_max_concurrency",
     }
     assert expected_keys.issubset(s.keys())
     assert s["vault_size"] == 0
     assert s["llm_in_flight"] == 0
+    assert s["pf_in_flight"] == 0
     assert s["surrogate_cache_max"] >= 1
 
     # Anonymize a request — surrogate cache should grow, vault should fill.
@@ -312,6 +315,39 @@ async def test_llm_in_flight_increments_around_detect(
     finish.set()
     await task
     assert p.stats()["llm_in_flight"] == 0
+
+
+async def test_pf_in_flight_increments_around_detect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Privacy-filter counter mirrors the LLM one. Same blocked-detector
+    technique; uses RemotePrivacyFilterDetector since instantiation
+    doesn't touch torch / the model."""
+    _patch_pf_fail_closed(monkeypatch, False)
+    p = Pipeline()
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        RemotePrivacyFilterDetector,
+    )
+    bad = RemotePrivacyFilterDetector.__new__(RemotePrivacyFilterDetector)
+    bad.name = "privacy_filter"
+
+    async def slow_detect(*_args, **_kwargs):
+        started.set()
+        await finish.wait()
+        return []
+
+    bad.detect = slow_detect  # type: ignore[method-assign]
+    p._detectors = [bad]
+
+    task = asyncio.create_task(p.anonymize(["x"], call_id="pf-inflight"))
+    await started.wait()
+    assert p.stats()["pf_in_flight"] == 1
+    finish.set()
+    await task
+    assert p.stats()["pf_in_flight"] == 0
 
 
 def test_detector_mode_parses_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:

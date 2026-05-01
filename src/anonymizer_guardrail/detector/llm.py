@@ -14,12 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from importlib import resources
-from pathlib import Path
 from typing import Any
 
 import httpx
 
+from ..bundled_resource import read_bundled_default, resolve_spec
 from ..registry import parse_named_path_registry
 from ..config import config
 from .base import Match
@@ -33,27 +32,6 @@ class LLMUnavailableError(RuntimeError):
 
 _DEFAULT_PROMPT_RELPATH = "prompts/llm_default.md"
 _BUNDLED_PROMPTS_DIR = "prompts"
-_BUNDLED_PREFIX = "bundled:"
-
-
-def _read_bundled_prompt(name: str, label: str) -> str:
-    """Read a file from the package's bundled prompts/ directory."""
-    if not name or "/" in name or "\\" in name:
-        raise RuntimeError(
-            f"{label}=bundled:{name!r}: name must be a bare "
-            f"filename (no path separators). Use a filesystem path if you "
-            f"want to reference a file outside the bundled prompts/."
-        )
-    try:
-        return (
-            resources.files("anonymizer_guardrail")
-            .joinpath(f"{_BUNDLED_PROMPTS_DIR}/{name}")
-            .read_text(encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError) as exc:
-        raise RuntimeError(
-            f"{label}=bundled:{name!r} not found in bundled prompts/: {exc}"
-        ) from exc
 
 
 def _load_system_prompt(
@@ -70,11 +48,8 @@ def _load_system_prompt(
     `LLM_SYSTEM_PROMPT_REGISTRY="legal=…"` reports the entry name, not
     the global env var.
 
-    The override accepts either:
-      * a filesystem path (absolute or relative)
-      * `bundled:<name>` — a bare filename in the package's prompts/ dir,
-        which insulates the env var from the Python version embedded in
-        the site-packages path.
+    Spec syntax (filesystem path, `bundled:NAME`, fail-loud-on-typo) is
+    shared with the regex / denylist loaders via bundled_resource.
 
     Loaded once at import-time — restart to pick up edits, same as every
     other config knob. An empty/whitespace-only file is rejected: a
@@ -85,30 +60,14 @@ def _load_system_prompt(
         override = config.llm_system_prompt_path
     override = override.strip()
     if override:
-        if override.startswith(_BUNDLED_PREFIX):
-            text = _read_bundled_prompt(
-                override[len(_BUNDLED_PREFIX):].strip(), label,
-            )
-            source = f"{label}={override!r}"
-        else:
-            path = Path(override)
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError as exc:
-                # Fail loud rather than silently fall back: an operator who set
-                # this path expects their prompt to be used. Crashing at import
-                # surfaces the typo immediately instead of after the first call.
-                raise RuntimeError(
-                    f"{label}={override!r} could not be read: {exc}"
-                ) from exc
-            source = f"{label}={override!r}"
-    else:
-        # Anchor at the parent package so `prompts/` doesn't need __init__.py.
-        text = (
-            resources.files("anonymizer_guardrail")
-            .joinpath(_DEFAULT_PROMPT_RELPATH)
-            .read_text(encoding="utf-8")
+        text, _source, _file_dir = resolve_spec(
+            override, bundled_dir=_BUNDLED_PROMPTS_DIR, label=label,
         )
+        # Keep the env-var-style source label for the empty-prompt
+        # error so an operator's eyes go straight to the env var name.
+        source = f"{label}={override!r}"
+    else:
+        text = read_bundled_default(_DEFAULT_PROMPT_RELPATH)
         source = f"bundled {_DEFAULT_PROMPT_RELPATH}"
 
     if not text.strip():

@@ -199,6 +199,13 @@ class Config:
     # for openai/privacy-filter is ~hundreds of ms on CPU; the default
     # leaves plenty of headroom for first-request load and queueing.
     privacy_filter_timeout_s: int = _env_int("PRIVACY_FILTER_TIMEOUT_S", 30)
+    # Max number of concurrent privacy_filter detector calls (in-process
+    # AND remote). Mirrors LLM_MAX_CONCURRENCY: a request with N texts
+    # fans out to N PF calls in parallel, which can hammer the inference
+    # path (CPU/GPU contention in-process; thundering-herd over HTTP for
+    # the remote service). Per-process semaphore caps that fan-out.
+    privacy_filter_max_concurrency: int = _env_int("PRIVACY_FILTER_MAX_CONCURRENCY", 10)
+
     # Failure mode for the privacy_filter detector — mirrors FAIL_CLOSED
     # (which governs the LLM detector). When the privacy_filter service
     # is unreachable, times out, or returns non-200:

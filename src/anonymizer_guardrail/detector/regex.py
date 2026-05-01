@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +21,11 @@ import yaml
 
 import logging
 
+from ..bundled_resource import (
+    read_bundled,
+    read_bundled_default,
+    resolve_spec,
+)
 from ..registry import parse_named_path_registry
 from ..config import config
 from .base import Match
@@ -74,14 +78,6 @@ def _resolve_flags(raw: Any, source: str) -> int:
     return bits
 
 
-def _read_bundled(relpath: str) -> str:
-    return (
-        resources.files("anonymizer_guardrail")
-        .joinpath(relpath)
-        .read_text(encoding="utf-8")
-    )
-
-
 def _resolve_extends(
     extends_raw: Any, current_source: str, current_dir: Path | None
 ) -> list[tuple[str, str]]:
@@ -115,10 +111,17 @@ def _resolve_extends(
         if not name:
             continue
         if "/" not in name and "\\" not in name:
-            # Bundled lookup.
+            # Bundled lookup. Use read_bundled for the canonical
+            # error wording, but re-wrap the not-found case so the
+            # message points back at the YAML directive that caused
+            # the lookup ("did you mean a path with `/`?").
             try:
-                text = _read_bundled(f"{_BUNDLED_PATTERNS_DIR}/{name}")
-            except (FileNotFoundError, OSError) as exc:
+                text = read_bundled(
+                    name,
+                    bundled_dir=_BUNDLED_PATTERNS_DIR,
+                    label=current_source,
+                )
+            except RuntimeError as exc:
                 raise RuntimeError(
                     f"{current_source}: extends={name!r} not found in bundled "
                     f"patterns/ — use a path with `/` to reference an "
@@ -139,9 +142,6 @@ def _resolve_extends(
     return out
 
 
-_BUNDLED_PREFIX = "bundled:"
-
-
 def _read_root_patterns_yaml(
     override: str | None = None,
     label: str = "REGEX_PATTERNS_PATH",
@@ -155,48 +155,17 @@ def _read_root_patterns_yaml(
     bundled default. `label` is used in error messages.
 
     file_dir is the parent directory if the source is on-disk, else None
-    (used to resolve relative `extends:` paths). The override accepts
-    either:
-      * a filesystem path (absolute or relative)
-      * `bundled:<name>` — a bare filename in the package's patterns/ dir,
-        which insulates the env var from the Python version embedded in
-        the site-packages path.
+    (used to resolve relative `extends:` paths).
     """
     if override is None:
         override = config.regex_patterns_path
     override = override.strip()
     if override:
-        if override.startswith(_BUNDLED_PREFIX):
-            name = override[len(_BUNDLED_PREFIX):].strip()
-            if not name or "/" in name or "\\" in name:
-                raise RuntimeError(
-                    f"{label}=bundled:{name!r}: name must be a "
-                    f"bare filename (no path separators). Use a filesystem "
-                    f"path if you want a file outside the bundled patterns/."
-                )
-            try:
-                text = _read_bundled(f"{_BUNDLED_PATTERNS_DIR}/{name}")
-            except (FileNotFoundError, OSError) as exc:
-                raise RuntimeError(
-                    f"{label}=bundled:{name!r} not found in "
-                    f"bundled patterns/: {exc}"
-                ) from exc
-            # No on-disk parent → child `extends:` directives must use
-            # bundled lookups too (cannot resolve a relative path).
-            return text, f"bundled patterns/{name}", None
-        path = Path(override)
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            # Fail loud rather than fall back: the operator set this path on
-            # purpose; silently using a different pattern set would be a
-            # nasty source of "why isn't my secret being redacted".
-            raise RuntimeError(
-                f"{label}={override!r} could not be read: {exc}"
-            ) from exc
-        return text, str(path), path.parent
+        return resolve_spec(
+            override, bundled_dir=_BUNDLED_PATTERNS_DIR, label=label,
+        )
     return (
-        _read_bundled(_DEFAULT_PATTERNS_RELPATH),
+        read_bundled_default(_DEFAULT_PATTERNS_RELPATH),
         f"bundled {_DEFAULT_PATTERNS_RELPATH}",
         None,
     )

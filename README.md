@@ -141,7 +141,9 @@ monitor pressure or leak without inspecting the process:
   "surrogate_cache_size": 1421,
   "surrogate_cache_max": 100000,
   "llm_in_flight": 0,
-  "llm_max_concurrency": 10
+  "llm_max_concurrency": 10,
+  "pf_in_flight": 0,
+  "pf_max_concurrency": 10
 }
 ```
 
@@ -228,6 +230,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_TIMEOUT_S`   | `30`                          | Per-call timeout (seconds) on LLM detector HTTP requests |
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
 | `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
+| `PRIVACY_FILTER_MAX_CONCURRENCY` | `10`           | Semaphore on in-flight `privacy_filter` detector calls (in-process AND remote). Independent of `LLM_MAX_CONCURRENCY` so the two detectors don't share headroom. Surfaced as `pf_in_flight`/`pf_max_concurrency` on `/health`. |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
 | `VAULT_MAX_ENTRIES` | `10000`                     | Hard cap on vault entries; LRU-evicted on overflow as a backstop against a flood of unique `call_id`s before TTL clears them. Raise for sustained high in-flight traffic; floor of 1 protects against typos. |
 | `LLM_FAIL_CLOSED` | `true`                        | Block requests if the LLM detector errors. |
@@ -265,34 +268,46 @@ If the header is missing or arrives as `[present]`, we fall back to
 `Authorization` header (fine for local/dev backends; everything else will
 likely return 401, which routes through `LLM_FAIL_CLOSED`).
 
-### Capping LLM detector concurrency
+### Capping detector concurrency
 
-`LLM_MAX_CONCURRENCY` is a process-wide semaphore around the LLM
-detector — it does **not** throttle regex or privacy-filter, both of
-which run locally and don't have a backend to overwhelm. Every text in
-the request's `texts` array triggers its own detection call, so a
-single guardrail invocation with four texts already consumes four
-slots; once the cap is reached, further detection calls await rather
-than fire in parallel.
+Two process-wide semaphores throttle the detectors that have a
+finite-capacity backend behind them:
 
-The default of `10` is a conservative number that keeps a small backend
-(local Ollama, a single LiteLLM instance fronting a rate-limited
-provider) from getting buried under a burst of concurrent users. Raise
-it if your detection backend is generously provisioned and you're
-seeing detection latency dominated by queueing, lower it if you're
-hitting upstream 429s.
+- `LLM_MAX_CONCURRENCY` (default 10) — caps in-flight LLM detector
+  calls. Protects the upstream LLM (Ollama, a single LiteLLM instance
+  fronting a rate-limited provider, etc.) from a burst of concurrent
+  users.
+- `PRIVACY_FILTER_MAX_CONCURRENCY` (default 10) — caps in-flight
+  privacy-filter detector calls, both the in-process variant
+  (CPU/GPU-bound inference) and the remote variant (HTTP to the
+  standalone privacy-filter-service, which has its own finite worker
+  pool).
+
+Regex and denylist are not throttled — they're stdlib-`re` against the
+input string, microseconds per call.
+
+Every text in the request's `texts` array triggers its own detection
+call per active detector, so a single guardrail invocation with four
+texts already consumes four LLM slots and four PF slots in parallel.
+Once a cap is reached, further calls into that detector await rather
+than fire in parallel; the other detector's cap is independent, so a
+saturated PF queue doesn't reduce LLM headroom.
 
 Saturation is observable via `/health`:
 
 ```json
-{ "status": "ok", "llm_in_flight": 8, "llm_max_concurrency": 10, ... }
+{
+  "status": "ok",
+  "llm_in_flight": 8, "llm_max_concurrency": 10,
+  "pf_in_flight":  3, "pf_max_concurrency":  10,
+  ...
+}
 ```
 
-`llm_in_flight` close to `llm_max_concurrency` for sustained periods
-means detection is the bottleneck — either the upstream LLM is slow,
-or the cap needs to come up. The counter is the actual in-flight
-count, not the semaphore's queue depth, so it tops out at
-`llm_max_concurrency`.
+A counter close to its cap for sustained periods means that detector is
+the bottleneck — either the upstream service is slow, or the cap needs
+to come up. The counters are actual in-flight counts, not the
+semaphore queue depth, so they top out at the matching cap.
 
 ### Customising the detection prompt
 
