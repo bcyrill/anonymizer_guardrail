@@ -145,6 +145,124 @@ gate (use a single-variant run for that).
   not necessarily every detector that exists. If `gliner_pii` isn't
   in your guardrail's DETECTOR_MODE, "all" excludes it.
 
+### Worked example: pentest comparison end-to-end
+
+A complete recipe — build the images, start the guardrail with every
+detector wired in, then run `--compare` on the bundled pentest corpus.
+
+```bash
+# 1. Build every image needed for this run. Comma-separated -t builds
+#    them all in one shot (added in this sprint).
+./scripts/build-image.sh -t slim,pf-service,gliner-service,fake-llm
+
+# 2. Start the guardrail with everything switched on. Worth knowing
+#    which flag does what:
+#      -t slim                       slim API container; ML deps live in sidecars.
+#      -d ...                        every detector enabled.
+#      --*-backend service           auto-start each sidecar (pf, gliner, fake-llm).
+#      --regex-patterns bundled:...  pentest pattern set (cloud creds, hashes, …).
+#      --llm-prompt bundled:...      pentest detection prompt.
+#      --llm-model fake-model        fake-llm doesn't validate model names.
+#      --llm-fail-open               degrade silently on LLM errors so the
+#                                    benchmark scores detection quality, not
+#                                    error policy. Production stays fail-closed.
+#      --rules ...                   deterministic fake-LLM responses for the
+#                                    benchmark (correct calls, mistypings,
+#                                    hallucinations, malformed output).
+./scripts/cli.sh -t slim -d regex,denylist,privacy_filter,gliner_pii,llm \
+    --privacy-filter-backend service \
+    --gliner-pii-backend service \
+    --llm-backend service \
+    --regex-patterns bundled:regex_pentest.yaml \
+    --llm-prompt bundled:llm_pentest.md \
+    --llm-model fake-model \
+    --llm-fail-open \
+    --rules ./services/fake_llm/rules.pentest.yaml
+
+# 3. In another terminal, run the comparison:
+./scripts/benchmark.sh --config bundled:pentest --compare
+```
+
+Expected output (numbers vary with model / hardware):
+
+```
+Loading corpus: tests/corpus/pentest.yaml
+Synthetic snippets typical of a security engagement: cracked
+password artefacts, cloud creds, internal hostnames, employee
+names embedded in prose, NTLM hashes, JWTs, etc.
+Guardrail: http://localhost:8000  DETECTOR_MODE: regex,denylist,privacy_filter,gliner_pii,llm
+
+Running variant: regex
+Running variant: denylist
+Running variant: privacy_filter
+Running variant: gliner_pii
+Running variant: llm
+Running variant: all
+
+                Comparison (corpus: Pentest engagement transcript)
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━┳━━━━━━┓
+┃ metric           ┃ regex ┃ denylist ┃ privacy_filter ┃ gliner_pii ┃ llm ┃  all ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━╇━━━━━━┩
+│ recall           │   67% │       0% │            33% │        40% │ 60% │  93% │
+│ strict recall    │  100% │       0% │            30% │        30% │ 50% │ 100% │
+│ type accuracy    │   40% │       0% │            13% │        27% │ 40% │  67% │
+│ precision        │  100% │     100% │           100% │       100% │ 50% │  50% │
+│ avg latency ms   │     3 │        2 │            536 │       1681 │   7 │ 7095 │
+│ blocked / scored │   0/9 │      0/9 │            0/9 │        0/9 │ 0/9 │  0/9 │
+└──────────────────┴───────┴──────────┴────────────────┴────────────┴─────┴──────┘
+```
+
+What this run tells you:
+
+- **`regex` strict recall = 100%** — every entity the corpus marks as
+  non-tolerated (creds, hashes, JWT, hostname, IP) has a regex shape
+  and gets caught deterministically. Cheap and exhaustive on shape-
+  driven entities.
+- **`all` recall = 93% vs regex's 67%** — the other detectors pull
+  weight on contextual entities regex can't shape-match (org names,
+  addresses, codenames). The bump is mostly from `llm` + `gliner_pii`.
+- **`denylist` = 0% across the board** — expected, the bundled corpus
+  doesn't include any denylist terms. Set `DENYLIST_PATH` to your
+  org's terms and the column lights up.
+- **`llm` and `all` precision = 50%** — the bundled `rules.pentest.yaml`
+  has a deliberate "France → ORGANIZATION" rule for the
+  `must_keep: ["capital of France"]` sentinel. That's the false
+  positive. Drop the rule (or fix the prompt) and precision goes back
+  to 100%.
+- **`type accuracy = 67%` for `all`** — the LLM rules deliberately
+  mis-type AcmeCorp (PERSON instead of ORGANIZATION), the AWS secret
+  key (AWS_ACCESS_KEY instead of CREDENTIAL), and the address
+  (IDENTIFIER instead of ADDRESS). Same root cause as precision —
+  fix the rules / prompt to fix the score.
+
+#### Why is `all` latency so much higher than the individual columns?
+
+`all` shows ~7s, but the slowest individual detector (`gliner_pii`)
+is ~1.7s. Per-case wall clock for `all` should be roughly
+`max(latencies)` if everything truly ran in parallel, *plus* per-case
+machinery overhead. Two things drive the gap:
+
+1. **CPU contention between the ML sidecars.** `privacy-filter-service`
+   (~536 ms solo) and `gliner-pii-service` (~1.7 s solo) both run
+   inference on the same CPU when launched as sidecars on a single
+   host. When the guardrail fires both detectors in parallel for one
+   case, each container's inference thread fights the other for the
+   same cores — both end up several times slower than their
+   uncontested baseline. On a multi-node deployment (one container
+   per node, or GPU for the heavy ones) this contention disappears.
+2. **Sequential per-case execution.** The benchmark sends one corpus
+   case at a time and waits for the response before sending the next.
+   Within a case, the guardrail fires detectors concurrently; across
+   cases, latency stacks. Production traffic with many concurrent
+   requests amortises this differently — `--compare` measures the
+   single-stream cost, which is the worst case.
+
+The takeaway for an operator picking a detector mix: **single-stream
+latency for `all` ≠ what your production p50/p99 will look like.**
+Use `--compare` to score detection quality and to surface ordering
+of cost (regex < llm < pf < gliner here), then load-test on the
+target topology to size hardware.
+
 ## Exit code
 
 Exits **0** when every executed case passed. A case "fails" when:
