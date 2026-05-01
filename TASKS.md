@@ -6,41 +6,38 @@ future contributor (or future-you) can pick it up cold.
 
 ---
 
-## Remove deprecated `FAIL_CLOSED` env var + `--fail-open` / `--fail-closed` cli flags
+## Remove deprecated `FAIL_CLOSED` env var
 
-**What:** drop the backward-compat shims that keep the old `FAIL_CLOSED`
-env var and the old cli aliases working. The new names are
-`LLM_FAIL_CLOSED` (env var) and `--llm-fail-open` / `--llm-fail-closed`
-(cli flags), introduced when the privacy-filter detector got its own
-fail-mode flag and the old name became misleading.
+**What:** drop the backward-compat shim in
+`detector/llm.py:_llm_fail_closed_default` that still honours the old
+`FAIL_CLOSED` env var. The new name is `LLM_FAIL_CLOSED`, introduced
+when the privacy-filter detector got its own fail-mode flag and the
+old name became misleading.
 
-**Why deferred:** doing it now would break operators upgrading from the
-previous release in a single step. The shim emits a loud deprecation
-warning at boot (env var) or per-invocation (cli flag), so anyone still
-on the old names will see the message before this task fires.
+The matching `--fail-open` / `--fail-closed` cli aliases were
+removed implicitly when the bash `cli.sh` was replaced with the
+Click-based launcher (the new launcher only knows `--llm-fail-open`).
 
-**Why it matters:** the shim is small (~15 lines in
-`config.py:_llm_fail_closed_default`, two lines in `cli.sh`), but it
-muddles the surface area — every reader has to learn that
-`config.llm_fail_closed` MIGHT come from `FAIL_CLOSED` instead of
-`LLM_FAIL_CLOSED`. Drop it once the rename has had a release or two
-to bake in.
+**Why deferred:** the env var shim still fires for operators upgrading
+from the FAIL_CLOSED era; emits a loud deprecation warning at boot.
+Drop only after a release or two has baked in the rename.
+
+**Why it matters:** the shim is small (~20 lines), but it muddles the
+surface area — every reader has to learn that the LLM detector's
+fail-closed flag MIGHT come from the legacy `FAIL_CLOSED` env var.
 
 **Sketch:**
 
-1. Remove `_llm_fail_closed_default` from `src/anonymizer_guardrail/config.py`;
-   inline `_env_bool("LLM_FAIL_CLOSED", True)` on the field.
-2. Remove the two `--fail-open` / `--fail-closed` deprecated-alias
-   cases from `scripts/cli.sh`.
-3. Drop the `(Renamed from FAIL_CLOSED — …)` parenthetical from the
-   README env-var table and the `_lib.sh` globals doc.
-4. Grep for any lingering `FAIL_CLOSED` references introduced after
-   the rename and update them.
+1. Remove `_llm_fail_closed_default` from
+   `src/anonymizer_guardrail/detector/llm.py`; inline
+   `_env_bool("LLM_FAIL_CLOSED", True)` on the LLMConfig field.
+2. Update or remove the matching test in `tests/test_config.py`
+   (the deprecation-shim tests).
+3. Grep for any lingering `FAIL_CLOSED` references and update.
 
-**Concrete trigger:** the next minor release after the rename
-ships, or whenever someone notices the shim is no longer earning
-its keep (no recent reports of operators hitting the deprecation
-warning).
+**Concrete trigger:** the next minor release after the rename ships,
+or whenever an operator-facing deprecation cycle has clearly passed
+(no recent reports of operators hitting the warning).
 
 **Non-goals:**
 
@@ -295,142 +292,47 @@ flexibility.
 
 ---
 
-## Detector registration API — bash launcher consolidation
+## ~~Detector registration API — bash launcher consolidation~~ — done
 
-**Status:** Python side is **done**. Bash launchers (`_lib.sh`,
-`cli.sh`, `menu.sh`) still hand-wire each detector — the open work is
-collapsing that fan-out the same way the Python side did.
+**Closed.** Both halves of this task shipped. Brief record below; see
+[DEVELOPMENT.md](DEVELOPMENT.md) for the canonical "adding a new
+detector" walkthrough.
 
-**What shipped (Python registry):**
+**Python side (registry):**
+- `detector/spec.py` defines `DetectorSpec` (name, factory, module ref
+  for live CONFIG lookup, per-call kwargs builder, semaphore + stats
+  prefix, typed-error + blocked-reason).
+- Each detector module owns its own `<Name>Config` dataclass + a
+  `CONFIG` instance + a `SPEC` constant.
+- Central `Config` shrank to cross-cutting fields only (vault, surrogate,
+  http server, faker locale).
+- `detector/__init__.py` exposes `REGISTERED_SPECS`, `SPECS_BY_NAME`,
+  `SPECS_WITH_SEMAPHORE`, `TYPED_UNAVAILABLE_ERRORS`.
+- `Pipeline.__init__` / `_run` / `stats()` and `main.py`'s exception
+  handler all iterate the registry — no per-detector branches.
 
-  * `detector/spec.py` defines `DetectorSpec` carrying name, factory,
-    a module reference (for live `CONFIG` lookup), per-call kwargs
-    builder, semaphore + stats prefix, and typed-error + blocked-reason.
-  * Each detector module owns a `CONFIG` dataclass (`RegexConfig`,
-    `DenylistConfig`, `LLMConfig`, `PrivacyFilterConfig`,
-    `GlinerPIIConfig`) — env-var fields colocated with the detector.
-    The central `Config` shrank to cross-cutting fields only (host,
-    port, log level, DETECTOR_MODE, surrogate, vault).
-  * `detector/__init__.py` exposes `REGISTERED_SPECS`, `SPECS_BY_NAME`,
-    `SPECS_WITH_SEMAPHORE`, `TYPED_UNAVAILABLE_ERRORS`.
-  * `Pipeline.__init__` iterates the registry to allocate
-    `_semaphores` / `_inflight_counters` dicts and build the startup
-    log line. `stats()` iterates to assemble per-detector keys.
-    `_run` dispatches via `SPECS_BY_NAME[det.name]` (no `isinstance`
-    chains). The TaskGroup `except*` clause uses
-    `TYPED_UNAVAILABLE_ERRORS` so a new typed error needs no edit.
-  * `main.py`'s `BLOCKED` handler is one `except` over the typed-errors
-    tuple, looking up `spec.blocked_reason` from the registry.
-  * README's *Adding a new detector* section documents the four-step
-    Python flow (write Detector class, define CONFIG, define SPEC,
-    register).
+**Bash launcher side:** the original plan was to keep bash and feed it
+a generated manifest. Instead the bash launchers (`cli.sh`, `menu.sh`,
+`_lib.sh`) were **rewritten in Python** under `tools/launcher/`:
 
-Adding a 6th Python detector is now: write a file, append to
-`REGISTERED_SPECS`. The `Pipeline`, `main.py`, `stats()`, and exception
-handling all light up automatically.
+- `cli.sh` → 5-line wrapper that execs `python -m tools.launcher`
+  (Click CLI, options grouped per detector via a custom `GroupedCommand`).
+- `menu.sh` → 5-line wrapper that execs `python -m tools.launcher.menu`
+  (Textual single-screen TUI).
+- `_lib.sh` deleted entirely. Per-detector launcher metadata lives in
+  `tools/launcher/spec_extras.LAUNCHER_METADATA` — the launcher
+  consumes the Python registry directly.
 
-**What's still open (bash launchers):**
+The launcher lives **outside the production wheel** (`tools/` is not
+under `src/`, hatch's wheel target excludes it implicitly). Production
+operators install `anonymizer-guardrail` without `[dev]` and never see
+typer/click/textual/rich. Devs install `pip install -e ".[dev]"` for
+the launcher.
 
-The bash side still requires per-detector edits in three files for
-every new detector. The fan-out per detector is roughly:
-
-  * `_lib.sh`  — `DETECTOR_HAS_<NAME>` predicate in
-                 `resolve_predicates`; env-var globals doc block at
-                 top of file; optional `start_<name>` /
-                 `cleanup_<name>` lifecycle helpers (mirror PF /
-                 gliner shape); env-var passthroughs in
-                 `build_run_args` (`RUN_<NAME>_ARGS=…`); plan rows
-                 in `print_plan`; run command wiring in
-                 `run_guardrail`.
-  * `menu.sh`  — globals at top; checklist entry in
-                 `ws_pick_detector_mode`; backend / URL / labels /
-                 threshold / fail-mode dialogs; `submenu_<name>`;
-                 labels for the row display; auto-default-to-service
-                 logic in `ws_pick_flavour` / `ws_pick_detector_mode`;
-                 launch-time validation msgbox; auto-start hook.
-  * `cli.sh`   — flag parser cases; flag globals; backend-value
-                 validation; auto-derive URL from
-                 `--<name>-backend service`; validation that detector
-                 in mode requires URL/backend; auto-start hook.
-
-Each new detector adds ~50–80 lines across the three files.
-
-**Why deferred:** bash can't consume Python state. The two cleanest
-paths are roughly equal-effort:
-
-  1. **Generated manifest.** A small Python entry point
-     (`anonymizer-detector-manifest`) iterates `REGISTERED_SPECS` and
-     prints a sourceable `bash` file with arrays / case statements
-     the launchers source at startup. The detector module declares
-     launcher metadata in its SPEC (container name, port, health
-     endpoint, env-var passthrough list, auto-start enabled). The
-     launchers become loops over the manifest.
-  2. **Hand-rolled shared dispatcher.** Refactor `_lib.sh` so
-     `start_<name>` / `cleanup_<name>` / `ws_pick_<name>_*` /
-     `RUN_<NAME>_ARGS` follow a strict naming convention, then have
-     a generic `start_aux_service "<name>"` /
-     `for_each_detector_with_service` driver. Detector-specific
-     dialogs stay per-detector functions but get called generically.
-
-(1) is more work upfront but flips the bash side to "registry-driven"
-in the same way as the Python side. (2) is cheaper but only collapses
-the boilerplate — it doesn't centralize the source of truth.
-
-The Python registry has a clear win in correctness (impossible to
-forget to add a detector to one of seven files), so it was worth the
-abstraction debt. The bash side's wins are smaller — one edit per
-new detector to three files, all next to each other in the repo —
-so the deferral bar is higher. Wait for the 6th or 7th detector to
-land before tackling it.
-
-**Sketch (whichever path):**
-
-1. Decide on the manifest format (sourceable bash file emitted by a
-   Python entry point) vs the strict-naming-convention dispatcher.
-   Manifest is recommended; ties bash to the Python registry.
-2. Extend `DetectorSpec` with an optional `launcher` block:
-   `container_name`, `default_image_tag`, `port`, `hf_volume_name`,
-   `health_endpoint`, `start_timeout_s`, `env_passthroughs: list[str]`.
-   Detectors that don't have a service (regex, denylist) leave it `None`.
-3. `scripts/detector-manifest.py` reads `REGISTERED_SPECS`, writes
-   `scripts/_manifest.sh` with associative arrays:
-   ```bash
-   declare -A DETECTORS=(...)         # name → "service|noservice"
-   declare -A DETECTOR_PORT=(...)
-   declare -A DETECTOR_CONTAINER=(...)
-   declare -A DETECTOR_ENV_VARS=(...)
-   declare -A DETECTOR_HEALTH_PATH=(...)
-   ```
-   Run as a build step (or pre-commit hook) — the manifest is
-   generated, not hand-edited.
-4. `_lib.sh` sources the manifest. `start_aux_service "<name>"`
-   replaces `start_fake_llm` / `start_privacy_filter` / `start_gliner_pii`.
-   `resolve_predicates` becomes a loop. `build_run_args` reads
-   `DETECTOR_ENV_VARS` per detector.
-5. `menu.sh` enumerates the manifest to build the checklist; per-
-   detector submenus stay hand-written (each has unique fields like
-   `gliner_pii_labels` that no generic dialog can build). The
-   "auto-start hook" branches collapse into one `for name in
-   "${SERVICE_DETECTORS[@]}"` loop.
-6. `cli.sh` similarly: flag parsing stays per-detector (each has
-   its own `--<name>-url`, `--<name>-fail-open`, etc.) but the
-   backend-validation / auto-derive-URL / auto-start blocks collapse
-   into a loop.
-
-**Concrete trigger:** the 6th detector lands and an operator notices
-they touched three bash files for it. Or someone adds a 4th
-auto-start-able service and the duplication becomes too noisy to ignore.
-
-**Non-goals:**
-
-- Not a *plugin* system from third-party packages. The manifest is
-  built from in-tree `REGISTERED_SPECS`; entry-point support can be
-  layered later if the use case appears.
-- Not a refactor of detector-specific dialogs in `menu.sh`
-  (`ws_pick_gliner_pii_labels` etc.). Those expose
-  detector-unique fields that don't generalize. Only the boilerplate
-  around them gets centralized.
-- Not yet — wait for a 6th detector before paying this cost.
+Adding a Python-only in-process detector now touches **2 files** (the
+new detector module + `detector/__init__.py`). With a service container
++ launcher CLI/menu support: **~10 files**. Down from the pre-refactor
+~10 Python files plus 3 bash files for every new detector.
 
 ---
 
@@ -455,12 +357,14 @@ config table. The rest of the user-facing surface isn't there yet:
     `GLINER_PII_MAX_CONCURRENCY` exists alongside the LLM and PF caps
   * `DETECTOR_MODE` examples don't include `gliner_pii`
 
-**Why deferred:** the README was already getting unwieldy at 800+
-lines, and the user has flagged a docs split (multi-file `docs/`
-folder) as the next docs project. Adding more to the existing README
-before that split makes the eventual reorganization more painful.
-Better to add the GLiNER content as part of the docs split, in the
-right new home.
+**Why deferred:** the README is already 1000+ lines and a full docs
+split (multi-file `docs/` folder) is on the table as a separate
+follow-up. DEVELOPMENT.md was factored out as a first step — the
+contributor-facing material now lives there — but the operator-facing
+README is still the canonical home for detector overviews, env-var
+tables, and deployment guidance, and it's getting unwieldy. Either
+fold the GLiNER content into the existing README or wait until the
+broader split decides where detector docs should live.
 
 **Why it matters:** the detector is fully functional — operators
 discovering it via `cli.sh --help` or the menu can run it, but they
@@ -469,22 +373,24 @@ license caveat, the experimental status) without reading the source.
 
 **Sketch:**
 
-1. Wait for the README → `docs/` split (separate task — see the
-   notes in the user conversation; not yet logged here as it's a
-   broader docs reorg, not a defined deliverable).
-2. In the new structure, add a `docs/detectors.md` (or similar)
-   GLiNER-PII section mirroring the privacy_filter section's shape:
-   what the model is, where it differs, how to run the service,
-   how to wire the detector, when to pick it, the license note.
-3. Add a `gliner-pii-service` row to the *Container images* section
-   noting it's local-build-only.
-4. Extend the *Capping detector concurrency* section with
+1. Add a `### GLiNER-PII detector` section under the existing
+   *Privacy-filter detector* section in `README.md`, mirroring its
+   shape: what the model is, where it differs, label / threshold
+   semantics, how to run the service, when to pick it, the NVIDIA
+   Open Model License caveat.
+2. Add a `gliner-pii-service` row to the *Container images* section
+   noting it's local-build-only (CPU + CUDA matrix).
+3. Extend the *Capping detector concurrency* section with
    `GLINER_PII_MAX_CONCURRENCY`.
-5. Update DETECTOR_MODE examples that currently list
-   `regex,denylist,privacy_filter,llm` to mention the gliner_pii
+4. Update DETECTOR_MODE examples that currently list
+   `regex,denylist,privacy_filter,llm` to mention the `gliner_pii`
    token as an option.
+5. (Optional) revisit as part of the broader README → `docs/` split
+   if that lands first — the detector content moves to
+   `docs/detectors.md` (or similar) instead of growing the README.
 
-**Concrete trigger:** the README docs split lands.
+**Concrete trigger:** next time someone touches the detector docs
+in the README, OR when the broader docs split is decided.
 
 **Non-goals:**
 
