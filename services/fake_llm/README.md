@@ -10,7 +10,7 @@ the user message decides what comes back.
 The LLM detector talks to whatever lives at `LLM_API_BASE` and parses
 back JSON entities. To reproduce edge cases — overlap with regex
 matches, hallucinations the parser should drop, malformed JSON, 5xx
-forcing `FAIL_CLOSED`, slow responses tripping `LLM_TIMEOUT_S` — you
+forcing `LLM_FAIL_CLOSED`, slow responses tripping `LLM_TIMEOUT_S` — you
 want a backend that responds *exactly* the way you ask. This is that
 backend.
 

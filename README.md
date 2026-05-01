@@ -224,7 +224,10 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
 | `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
-| `FAIL_CLOSED`     | `true`                        | Block requests if LLM detector errors    |
+| `LLM_FAIL_CLOSED` | `true`                        | Block requests if the LLM detector errors. |
+| `PRIVACY_FILTER_URL` | *(empty)*                  | When set, the privacy_filter detector talks HTTP to a standalone privacy-filter-service instead of loading the model in-process; the slim image then covers privacy_filter. See *Privacy-filter detector* below. |
+| `PRIVACY_FILTER_TIMEOUT_S` | `30`                | Per-call timeout (seconds) on the remote privacy-filter HTTP requests. |
+| `PRIVACY_FILTER_FAIL_CLOSED` | `true`            | Block requests when the privacy_filter detector errors (mirrors `LLM_FAIL_CLOSED`). Independent flag — operators can fail closed on one detector and open on the other. Applies to both the in-process and remote variants. |
 | `HF_HUB_OFFLINE`  | `1` *(baked image only)* / *(unset)* | Pf-baked sets this so transformers doesn't ping HuggingFace Hub on every start; pass `-e HF_HUB_OFFLINE=0` to force online mode for a refresh. The `pf` (runtime-download) flavour leaves it unset on first run; `scripts/cli.sh --hf-offline` / the menu offer it after the cache volume is populated. |
 
 ### Forwarding the caller's API key
@@ -254,7 +257,7 @@ litellm_settings:
 If the header is missing or arrives as `[present]`, we fall back to
 `LLM_API_KEY`. If both are empty, the LLM call goes out without an
 `Authorization` header (fine for local/dev backends; everything else will
-likely return 401, which routes through `FAIL_CLOSED`).
+likely return 401, which routes through `LLM_FAIL_CLOSED`).
 
 ### Capping LLM detector concurrency
 

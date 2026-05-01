@@ -6,6 +6,50 @@ future contributor (or future-you) can pick it up cold.
 
 ---
 
+## Remove deprecated `FAIL_CLOSED` env var + `--fail-open` / `--fail-closed` cli flags
+
+**What:** drop the backward-compat shims that keep the old `FAIL_CLOSED`
+env var and the old cli aliases working. The new names are
+`LLM_FAIL_CLOSED` (env var) and `--llm-fail-open` / `--llm-fail-closed`
+(cli flags), introduced when the privacy-filter detector got its own
+fail-mode flag and the old name became misleading.
+
+**Why deferred:** doing it now would break operators upgrading from the
+previous release in a single step. The shim emits a loud deprecation
+warning at boot (env var) or per-invocation (cli flag), so anyone still
+on the old names will see the message before this task fires.
+
+**Why it matters:** the shim is small (~15 lines in
+`config.py:_llm_fail_closed_default`, two lines in `cli.sh`), but it
+muddles the surface area — every reader has to learn that
+`config.llm_fail_closed` MIGHT come from `FAIL_CLOSED` instead of
+`LLM_FAIL_CLOSED`. Drop it once the rename has had a release or two
+to bake in.
+
+**Sketch:**
+
+1. Remove `_llm_fail_closed_default` from `src/anonymizer_guardrail/config.py`;
+   inline `_env_bool("LLM_FAIL_CLOSED", True)` on the field.
+2. Remove the two `--fail-open` / `--fail-closed` deprecated-alias
+   cases from `scripts/cli.sh`.
+3. Drop the `(Renamed from FAIL_CLOSED — …)` parenthetical from the
+   README env-var table and the `_lib.sh` globals doc.
+4. Grep for any lingering `FAIL_CLOSED` references introduced after
+   the rename and update them.
+
+**Concrete trigger:** the next minor release after the rename
+ships, or whenever someone notices the shim is no longer earning
+its keep (no recent reports of operators hitting the deprecation
+warning).
+
+**Non-goals:**
+
+- Don't remove the shim before at least one release with the
+  deprecation warning. The whole point of the soft rename was to
+  give operators a heads-up.
+
+---
+
 ## Prometheus-style `/metrics` endpoint
 
 **What:** a new HTTP endpoint that returns OpenMetrics text for scraping by

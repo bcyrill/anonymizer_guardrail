@@ -2,7 +2,7 @@
 
 The guardrail invariant under test: nothing in the input may silently bypass
 detection because of length. We do that by *refusing* oversized inputs (so
-FAIL_CLOSED in the pipeline decides), never by truncating.
+LLM_FAIL_CLOSED in the pipeline decides), never by truncating.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ async def test_oversized_input_refused_without_http_call(
     detector: LLMDetector, mock_post: AsyncMock
 ) -> None:
     """The bug we're fixing: oversized inputs MUST NOT be silently truncated.
-    They must raise so FAIL_CLOSED decides whether to block or fall back."""
+    They must raise so LLM_FAIL_CLOSED decides whether to block or fall back."""
     text = "a" * 101  # cap is 100
 
     with pytest.raises(LLMUnavailableError, match="too large"):

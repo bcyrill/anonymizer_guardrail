@@ -10,7 +10,7 @@ Designed for the LLMAnonymizer guardrail's LLM detector: rule outputs
 default to OpenAI Chat Completions JSON containing
 `{"entities": [...]}`, which is what the detector parses. Escape hatches
 (`raw_content`, `status_code`, `delay_s`) let you exercise the parser's
-error paths and timeout/FAIL_CLOSED handling.
+error paths and timeout/LLM_FAIL_CLOSED handling.
 
 Configuration:
   RULES_PATH   path to the rules YAML (default /app/rules.yaml)

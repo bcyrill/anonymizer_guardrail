@@ -29,9 +29,6 @@
 #   RULES_FILE                   — host path or empty (fake-llm only)
 #   LLM_FAIL_CLOSED              — true | false (default true)
 #                                  Governs the LLM detector specifically.
-#                                  (Renamed from FAIL_CLOSED — the old
-#                                  name still works inside the container
-#                                  with a deprecation warning.)
 #   PRIVACY_FILTER_FAIL_CLOSED   — true | false (default true)
 #                                  Governs the privacy_filter detector
 #                                  (in-process or remote). Independent

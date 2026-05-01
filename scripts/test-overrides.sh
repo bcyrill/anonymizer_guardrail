@@ -381,7 +381,7 @@ if $has_llm; then
   # End-to-end: fake-llm has a rule keyed on match_system_prompt="NORDVENTO"
   # (a substring unique to bundled:llm_pentest.md). When the guardrail
   # forwards that prompt as the system message, fake-llm fires the rule
-  # and returns 503 → FAIL_CLOSED → outer BLOCKED. The default prompt
+  # and returns 503 → LLM_FAIL_CLOSED → outer BLOCKED. The default prompt
   # doesn't contain NORDVENTO, so without the override the request flows
   # normally.
   r=$(post "$(mkbody 'Some random user input.' 'lp-pentest' '{"llm_prompt": "pentest"}')")
@@ -461,7 +461,7 @@ if $has_llm; then
   # has a rule keyed on match_model="invalid-model" that returns 503.
   # When the override propagates through the LLMDetector to the
   # outgoing chat-completions request, fake-llm fires that rule, the
-  # guardrail's LLMUnavailableError trips FAIL_CLOSED, and the
+  # guardrail's LLMUnavailableError trips LLM_FAIL_CLOSED, and the
   # response comes back BLOCKED. That's only possible if the override
   # actually reached fake-llm — proves the plumbing is real.
   r=$(post "$(mkbody 'AcmeCorp uses ml-platform.' 'lm-bad' '{"llm_model": "invalid-model"}')")

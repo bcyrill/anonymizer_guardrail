@@ -132,7 +132,7 @@ def _llm_detector_that_raises(exc_factory):
 async def test_unexpected_llm_failure_routes_through_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Under FAIL_CLOSED, any failure inside the LLM detector — even an
+    """Under LLM_FAIL_CLOSED, any failure inside the LLM detector — even an
     unexpected one that isn't LLMUnavailableError — must propagate so the
     guardrail BLOCKs the request instead of silently returning empty
     matches. Without this, a programmer error in the LLM path would let

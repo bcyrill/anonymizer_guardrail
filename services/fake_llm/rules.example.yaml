@@ -11,7 +11,7 @@
 #   raw_content: assistant message content as a literal string
 #                (for parser-robustness tests: malformed JSON, prose
 #                output, code-fenced JSON, <think>…</think> blocks, …)
-#   status_code: non-200 to test the FAIL_CLOSED path
+#   status_code: non-200 to test the LLM_FAIL_CLOSED path
 #   delay_s:     seconds to sleep before responding (timeout testing)
 #
 # When no rule matches, the `default:` block applies.
@@ -21,7 +21,7 @@ rules:
   # request's model field (not the user message), and we want it to
   # pre-empt text-only rules whenever the guardrail's `llm_model`
   # override propagates "invalid-model" through the chat-completions
-  # call. The 503 response trips FAIL_CLOSED in the guardrail, so the
+  # call. The 503 response trips LLM_FAIL_CLOSED in the guardrail, so the
   # outer request comes back BLOCKED — proves the override reached us.
   - description: "Override test: model='invalid-model' → 503"
     match_model: "invalid-model"
@@ -87,7 +87,7 @@ rules:
     match: "broken-json-test"
     raw_content: '{"entities": [{"text": "broken"'
 
-  # Forces a 5xx so FAIL_CLOSED kicks in (request blocked).
+  # Forces a 5xx so LLM_FAIL_CLOSED kicks in (request blocked).
   - description: "Backend error → 503"
     match: "force-5xx"
     status_code: 503
