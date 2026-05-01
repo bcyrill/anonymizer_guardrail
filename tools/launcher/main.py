@@ -526,7 +526,25 @@ def cli(
                     f"Detector {det_name!r} has no service to auto-start. "
                     f"Use --{det_name.replace('_', '-')}-backend external."
                 )
-            start_service(engine, det_name, log_level=cfg.log_level)
+            extra_volumes: list[tuple[str, str]] = []
+            # Mount the operator's --rules YAML into the auto-started
+            # fake-llm. Other services don't currently consume extra
+            # bind mounts; if a second one ever does, generalise via a
+            # ServiceSpec field rather than stacking detector names here.
+            if det_name == "llm" and cfg.fake_llm_rules_file:
+                rules_path = os.path.abspath(cfg.fake_llm_rules_file)
+                if not os.path.isfile(rules_path):
+                    raise click.BadParameter(
+                        f"--rules path {cfg.fake_llm_rules_file!r} doesn't "
+                        f"exist (resolved to {rules_path}).",
+                        param_hint="--rules",
+                    )
+                extra_volumes.append((rules_path, "/app/rules.yaml:ro"))
+            start_service(
+                engine, det_name,
+                log_level=cfg.log_level,
+                extra_volumes=extra_volumes or None,
+            )
             auto_started_detectors.append(det_name)
 
     if auto_started_detectors:

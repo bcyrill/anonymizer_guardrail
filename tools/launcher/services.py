@@ -73,7 +73,12 @@ def _resolve_image(engine: Engine, service: ServiceSpec) -> tuple[str, str]:
     return service.image_tag_defaults[-1], "fallback"
 
 
-def start_service(engine: Engine, name: str, log_level: str = "info") -> None:
+def start_service(
+    engine: Engine,
+    name: str,
+    log_level: str = "info",
+    extra_volumes: Iterable[tuple[str, str]] | None = None,
+) -> None:
     """Auto-start the service container for detector `name`.
 
     Idempotent: if the container is already running, reuses it (and
@@ -85,6 +90,12 @@ def start_service(engine: Engine, name: str, log_level: str = "info") -> None:
     (e.g. GLINER_PII_LABELS → DEFAULT_LABELS) and forwards them to the
     service container. Polls /health until ready or the
     `readiness_timeout_s` deadline fires.
+
+    `extra_volumes` is an optional list of (host_path, container_path)
+    pairs. The container_path may include a mode suffix (e.g.
+    ``/app/rules.yaml:ro``). Used today to mount a custom fake-llm
+    rules file when the operator passes ``--rules``; kept generic so
+    other services can opt in without adding a second special case.
     """
     spec = LAUNCHER_METADATA.get(name)
     if spec is None or spec.service is None:
@@ -148,6 +159,13 @@ def start_service(engine: Engine, name: str, log_level: str = "info") -> None:
         val = os.environ.get(launcher_var, "")
         if val:
             cmd.extend(["-e", f"{service_var}={val}"])
+
+    # Caller-supplied bind mounts (e.g. fake-llm's rules file from
+    # `--rules`). Path validation is the caller's job — we just emit
+    # the `-v host:container[:mode]` flags.
+    if extra_volumes:
+        for host, container in extra_volumes:
+            cmd.extend(["-v", f"{host}:{container}"])
 
     cmd.append(image)
 

@@ -6,47 +6,6 @@ future contributor (or future-you) can pick it up cold.
 
 ---
 
-## Remove deprecated `FAIL_CLOSED` env var
-
-**What:** drop the backward-compat shim in
-`detector/llm.py:_llm_fail_closed_default` that still honours the old
-`FAIL_CLOSED` env var. The new name is `LLM_FAIL_CLOSED`, introduced
-when the privacy-filter detector got its own fail-mode flag and the
-old name became misleading.
-
-The matching `--fail-open` / `--fail-closed` cli aliases were
-removed implicitly when the bash `cli.sh` was replaced with the
-Click-based launcher (the new launcher only knows `--llm-fail-open`).
-
-**Why deferred:** the env var shim still fires for operators upgrading
-from the FAIL_CLOSED era; emits a loud deprecation warning at boot.
-Drop only after a release or two has baked in the rename.
-
-**Why it matters:** the shim is small (~20 lines), but it muddles the
-surface area — every reader has to learn that the LLM detector's
-fail-closed flag MIGHT come from the legacy `FAIL_CLOSED` env var.
-
-**Sketch:**
-
-1. Remove `_llm_fail_closed_default` from
-   `src/anonymizer_guardrail/detector/llm.py`; inline
-   `_env_bool("LLM_FAIL_CLOSED", True)` on the LLMConfig field.
-2. Update or remove the matching test in `tests/test_config.py`
-   (the deprecation-shim tests).
-3. Grep for any lingering `FAIL_CLOSED` references and update.
-
-**Concrete trigger:** the next minor release after the rename ships,
-or whenever an operator-facing deprecation cycle has clearly passed
-(no recent reports of operators hitting the warning).
-
-**Non-goals:**
-
-- Don't remove the shim before at least one release with the
-  deprecation warning. The whole point of the soft rename was to
-  give operators a heads-up.
-
----
-
 ## Prometheus-style `/metrics` endpoint
 
 **What:** a new HTTP endpoint that returns OpenMetrics text for scraping by
@@ -292,50 +251,6 @@ flexibility.
 
 ---
 
-## ~~Detector registration API — bash launcher consolidation~~ — done
-
-**Closed.** Both halves of this task shipped. Brief record below; see
-[DEVELOPMENT.md](DEVELOPMENT.md) for the canonical "adding a new
-detector" walkthrough.
-
-**Python side (registry):**
-- `detector/spec.py` defines `DetectorSpec` (name, factory, module ref
-  for live CONFIG lookup, per-call kwargs builder, semaphore + stats
-  prefix, typed-error + blocked-reason).
-- Each detector module owns its own `<Name>Config` dataclass + a
-  `CONFIG` instance + a `SPEC` constant.
-- Central `Config` shrank to cross-cutting fields only (vault, surrogate,
-  http server, faker locale).
-- `detector/__init__.py` exposes `REGISTERED_SPECS`, `SPECS_BY_NAME`,
-  `SPECS_WITH_SEMAPHORE`, `TYPED_UNAVAILABLE_ERRORS`.
-- `Pipeline.__init__` / `_run` / `stats()` and `main.py`'s exception
-  handler all iterate the registry — no per-detector branches.
-
-**Bash launcher side:** the original plan was to keep bash and feed it
-a generated manifest. Instead the bash launchers (`cli.sh`, `menu.sh`,
-`_lib.sh`) were **rewritten in Python** under `tools/launcher/`:
-
-- `cli.sh` → 5-line wrapper that execs `python -m tools.launcher`
-  (Click CLI, options grouped per detector via a custom `GroupedCommand`).
-- `menu.sh` → 5-line wrapper that execs `python -m tools.launcher.menu`
-  (Textual single-screen TUI).
-- `_lib.sh` deleted entirely. Per-detector launcher metadata lives in
-  `tools/launcher/spec_extras.LAUNCHER_METADATA` — the launcher
-  consumes the Python registry directly.
-
-The launcher lives **outside the production wheel** (`tools/` is not
-under `src/`, hatch's wheel target excludes it implicitly). Production
-operators install `anonymizer-guardrail` without `[dev]` and never see
-typer/click/textual/rich. Devs install `pip install -e ".[dev]"` for
-the launcher.
-
-Adding a Python-only in-process detector now touches **2 files** (the
-new detector module + `detector/__init__.py`). With a service container
-+ launcher CLI/menu support: **~10 files**. Down from the pre-refactor
-~10 Python files plus 3 bash files for every new detector.
-
----
-
 ## Document the GLiNER-PII detector + service in README
 
 **What:** the GLiNER-PII detector (`RemoteGlinerPIIDetector`) and the
@@ -397,3 +312,62 @@ in the README, OR when the broader docs split is decided.
 - Don't move the existing `services/gliner_pii/README.md` into the
   top-level docs — keep the service-specific README colocated with
   its code. The top-level README links there for the deep-dive.
+
+---
+
+## Split README into a `docs/` folder
+
+**What:** the operator-facing README is over 1000 lines and mixes
+several audiences — quickstart (operators), env-var reference
+(operators tuning a deployment), deployment guides (ops), detector
+deep-dives (operators picking a detection setup), and architecture
+notes. A multi-file `docs/` folder would let each audience reach
+their content without scrolling past the others.
+
+**Why deferred:** restructuring 1000+ lines of prose is a focused
+effort that should not be entangled with code changes. DEVELOPMENT.md
+was factored out as a first step (contributor docs); operator docs
+remain in the single README file pending a decision on the broader
+split.
+
+**Why it matters:** every new detector / env var / deployment
+recipe is one more reason for a new reader to scroll past 800 lines
+to find the section they need. The current "Find on page" UX is
+acceptable for now but degrades with each addition.
+
+**Sketch:**
+
+A reasonable cut, given the README's current section headers:
+
+- `README.md` — keep as a landing page: what-it-is, quickstart,
+  table-of-contents pointing at the docs/ files, the detector
+  matrix at a glance.
+- `docs/configuration.md` — env-var tables (currently the bulk of
+  the README), forwarded keys, concurrency caps.
+- `docs/detectors.md` — detector deep-dives (regex, denylist,
+  privacy_filter, gliner_pii, llm) with when-to-pick-each guidance.
+- `docs/operations.md` — vault, surrogate cache, observability,
+  per-request overrides.
+- `docs/deployment.md` — container images, build commands, run
+  commands, smoke test.
+- `docs/architecture.md` — pipeline overview, regex overlap
+  resolution, anything that's "how it works internally" for
+  operators (deeper internals stay in DEVELOPMENT.md).
+
+Each file would internally cross-reference the others. A small
+table-of-contents at the top of README would point at the right
+file for each common question.
+
+**Concrete trigger:** the next time someone wants to add a new
+detector deep-dive section to the README and recoils at how much
+prose is already there. Or when the gliner-pii doc task (above) is
+ready to land — we could either fold it into the existing README
+or use it as the forcing function for the split.
+
+**Non-goals:**
+
+- Don't move `services/*/README.md` content into the top-level
+  docs. Service-specific READMEs stay colocated with their code.
+- Don't move DEVELOPMENT.md into the docs/ folder. Contributor docs
+  are a different audience from operator docs; keeping them at the
+  repo root flags them as such.

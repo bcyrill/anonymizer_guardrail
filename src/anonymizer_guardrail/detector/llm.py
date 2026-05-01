@@ -30,35 +30,6 @@ from .spec import DetectorSpec
 log = logging.getLogger("anonymizer.llm")
 
 
-def _llm_fail_closed_default() -> bool:
-    """Read LLM_FAIL_CLOSED, fall back to the deprecated FAIL_CLOSED with
-    a loud warning, default true.
-
-    `FAIL_CLOSED` was renamed to `LLM_FAIL_CLOSED` once the privacy-filter
-    detector got its own `PRIVACY_FILTER_FAIL_CLOSED` knob — the old name
-    misled operators into thinking it governed both. Existing deployments
-    setting `FAIL_CLOSED=…` keep working for one release cycle, but get a
-    rename hint at boot so the migration is impossible to miss.
-
-    Lives here (not in central config.py) so the deprecation shim stays
-    next to the LLM detector code that consumes it. Will be removed
-    once the deprecation cycle ends — see TASKS.md.
-    """
-    raw = os.getenv("LLM_FAIL_CLOSED")
-    if raw is not None:
-        return raw.strip().lower() in ("1", "true", "yes", "on")
-    legacy = os.getenv("FAIL_CLOSED")
-    if legacy is not None:
-        logging.getLogger("anonymizer.config").warning(
-            "FAIL_CLOSED is deprecated; rename to LLM_FAIL_CLOSED. "
-            "It governs the LLM detector only — the privacy-filter "
-            "detector has its own PRIVACY_FILTER_FAIL_CLOSED. The old "
-            "name will be removed in a future release."
-        )
-        return legacy.strip().lower() in ("1", "true", "yes", "on")
-    return True
-
-
 # ── Per-detector config ───────────────────────────────────────────────────
 @dataclass(frozen=True)
 class LLMConfig:
@@ -87,8 +58,7 @@ class LLMConfig:
     max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
     # Failure mode when the LLM detector errors out. true (default) →
     # block; false → fall back to coverage from the other detectors.
-    # Honours the deprecated FAIL_CLOSED env var via the shim above.
-    fail_closed: bool = _llm_fail_closed_default()
+    fail_closed: bool = _env_bool("LLM_FAIL_CLOSED", True)
 
 
 CONFIG = LLMConfig()
