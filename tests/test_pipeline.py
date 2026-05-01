@@ -76,13 +76,42 @@ async def test_vault_evicts_after_pop(pipeline: Pipeline) -> None:
 
 def _patch_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
     """Replace the frozen Config singleton in pipeline.py for one test.
-    Wraps the real config so all OTHER fields keep their values."""
+    Wraps the real config so all OTHER fields keep their values.
+    Governs the LLM detector specifically (config.llm_fail_closed)."""
     from types import SimpleNamespace
     from anonymizer_guardrail import pipeline as pipeline_mod
 
     fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["fail_closed"] = value
+    fields["llm_fail_closed"] = value
     monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+
+def _patch_pf_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
+    """Same shim for privacy_filter_fail_closed. Independent from the
+    LLM flag — operators can fail closed on one and open on the other."""
+    from types import SimpleNamespace
+    from anonymizer_guardrail import pipeline as pipeline_mod
+
+    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
+    fields["privacy_filter_fail_closed"] = value
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+
+def _pf_detector_that_raises(exc_factory):
+    """A bare RemotePrivacyFilterDetector instance whose detect() raises
+    whatever exc_factory returns. Bypasses the real httpx wiring."""
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        RemotePrivacyFilterDetector,
+    )
+
+    bad = RemotePrivacyFilterDetector.__new__(RemotePrivacyFilterDetector)
+    bad.name = "privacy_filter"
+
+    async def boom(*_args, **_kwargs):
+        raise exc_factory()
+
+    bad.detect = boom  # type: ignore[method-assign]
+    return bad
 
 
 def _llm_detector_that_raises(exc_factory):
@@ -119,6 +148,115 @@ async def test_unexpected_llm_failure_routes_through_fail_closed(
 
     with pytest.raises(LLMUnavailableError, match="Unexpected failure"):
         await p.anonymize(["alice"], call_id="unexpected-fail")
+
+
+async def test_privacy_filter_unavailable_propagates_under_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRIVACY_FILTER_FAIL_CLOSED=true → a PrivacyFilterUnavailableError
+    inside the PF detector propagates so main.py returns BLOCKED. Without
+    this, an outage of the privacy-filter service would silently drop PF
+    coverage even though the operator explicitly chose fail-closed."""
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        PrivacyFilterUnavailableError,
+    )
+
+    _patch_pf_fail_closed(monkeypatch, True)
+
+    p = Pipeline()
+    p._detectors = [_pf_detector_that_raises(
+        lambda: PrivacyFilterUnavailableError("service unreachable")
+    )]
+
+    with pytest.raises(PrivacyFilterUnavailableError, match="service unreachable"):
+        await p.anonymize(["alice"], call_id="pf-fail-closed")
+
+
+async def test_privacy_filter_unavailable_swallowed_under_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRIVACY_FILTER_FAIL_CLOSED=false → log + degrade to no PF matches.
+    The request still goes through (covered by other detectors)."""
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        PrivacyFilterUnavailableError,
+    )
+
+    _patch_pf_fail_closed(monkeypatch, False)
+
+    p = Pipeline()
+    p._detectors = [_pf_detector_that_raises(
+        lambda: PrivacyFilterUnavailableError("service unreachable")
+    )]
+
+    # No exception, no matches — the only detector returned [] for this call.
+    modified, mapping = await p.anonymize(["alice"], call_id="pf-fail-open")
+    assert mapping == {}
+    assert modified == ["alice"]
+
+
+async def test_unexpected_pf_failure_routes_through_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-PrivacyFilterUnavailable crash inside a PF detector must
+    still route through PRIVACY_FILTER_FAIL_CLOSED — same asymmetry the
+    LLM detector has. Otherwise a programmer error in the PF path
+    (torch OOM, tokenizer drift, etc.) would silently drop coverage in
+    fail-closed mode."""
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        PrivacyFilterUnavailableError,
+    )
+
+    _patch_pf_fail_closed(monkeypatch, True)
+
+    p = Pipeline()
+    p._detectors = [_pf_detector_that_raises(
+        lambda: RuntimeError("unexpected non-PrivacyFilterUnavailable explosion")
+    )]
+
+    with pytest.raises(PrivacyFilterUnavailableError, match="Unexpected failure"):
+        await p.anonymize(["alice"], call_id="pf-unexpected-fail")
+
+
+async def test_pf_and_llm_fail_modes_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operators must be able to fail closed on one detector and open
+    on the other. Pin that down: PF closed + LLM open → PF errors
+    propagate, LLM errors get swallowed."""
+    from anonymizer_guardrail.detector.llm import LLMUnavailableError
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        PrivacyFilterUnavailableError,
+    )
+
+    # Apply both flags via one config shim; _patch_*_fail_closed replaces
+    # the whole config, so calling both in sequence would only keep the
+    # last patch's value for the field that matters.
+    from types import SimpleNamespace
+    from anonymizer_guardrail import pipeline as pipeline_mod
+    fields = {
+        f: getattr(pipeline_mod.config, f)
+        for f in pipeline_mod.config.__dataclass_fields__
+    }
+    fields["llm_fail_closed"] = False           # LLM open
+    fields["privacy_filter_fail_closed"] = True  # PF closed
+    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+
+    # PF detector raising → propagates (PF is fail-closed).
+    p = Pipeline()
+    p._detectors = [_pf_detector_that_raises(
+        lambda: PrivacyFilterUnavailableError("pf service unreachable")
+    )]
+    with pytest.raises(PrivacyFilterUnavailableError):
+        await p.anonymize(["alice"], call_id="independent-pf")
+
+    # LLM detector raising → swallowed (LLM is fail-open).
+    p = Pipeline()
+    p._detectors = [_llm_detector_that_raises(
+        lambda: LLMUnavailableError("llm api unreachable")
+    )]
+    modified, mapping = await p.anonymize(["alice"], call_id="independent-llm")
+    assert mapping == {}
+    assert modified == ["alice"]
 
 
 async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:

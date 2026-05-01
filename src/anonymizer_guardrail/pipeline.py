@@ -24,10 +24,32 @@ from .detector.denylist import DenylistDetector
 from .detector.llm import LLMDetector, LLMUnavailableError
 from .detector.privacy_filter import PrivacyFilterDetector
 from .detector.regex import RegexDetector
+from .detector.remote_privacy_filter import (
+    PrivacyFilterUnavailableError,
+    RemotePrivacyFilterDetector,
+)
 from .surrogate import SurrogateGenerator
 from .vault import Vault
 
 log = logging.getLogger("anonymizer.pipeline")
+
+
+def _privacy_filter_factory() -> Detector:
+    """Pick in-process or remote based on PRIVACY_FILTER_URL.
+
+    Empty (default) → in-process PrivacyFilterDetector (torch +
+    transformers loaded in this container; image must be `pf` /
+    `pf-baked`). URL set → RemotePrivacyFilterDetector talks to a
+    standalone privacy-filter-service over HTTP and the slim image
+    is sufficient.
+
+    The branch is evaluated at instantiation, not at module import,
+    so a test that monkeypatches `config.privacy_filter_url` then
+    rebuilds the pipeline picks up the new value.
+    """
+    if config.privacy_filter_url:
+        return RemotePrivacyFilterDetector()
+    return PrivacyFilterDetector()
 
 
 _DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
@@ -37,10 +59,9 @@ _DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
     # Loads with no entries when DENYLIST_PATH is unset, so registering
     # it here unconditionally is safe.
     "denylist":       DenylistDetector,
-    # Optional: requires the `privacy-filter` extras (torch + transformers).
-    # The class itself imports cheap stuff; instantiation lazy-loads the
-    # heavy deps. So unused, this entry costs nothing.
-    "privacy_filter": PrivacyFilterDetector,
+    # Dispatches between in-process (torch in this container) and
+    # remote (HTTP to a privacy-filter-service) at instantiation time.
+    "privacy_filter": _privacy_filter_factory,
 }
 
 
@@ -135,10 +156,12 @@ class Pipeline:
         # plain int mutation is safe between await points.
         self._llm_in_flight = 0
         log.info(
-            "Pipeline ready — detectors=[%s], vault_ttl=%ds, fail_closed=%s, max_concurrency=%d",
+            "Pipeline ready — detectors=[%s], vault_ttl=%ds, "
+            "llm_fail_closed=%s, pf_fail_closed=%s, max_concurrency=%d",
             ", ".join(d.name for d in self._detectors),
             config.vault_ttl_s,
-            config.fail_closed,
+            config.llm_fail_closed,
+            config.privacy_filter_fail_closed,
             config.llm_max_concurrency,
         )
 
@@ -217,9 +240,9 @@ class Pipeline:
 
         Per-detector exceptions are handled inside the inner runner so one
         detector crashing doesn't poison the gather. LLMUnavailableError
-        still propagates under FAIL_CLOSED, in which case asyncio cancels
-        the other in-flight detectors — the right behaviour because we're
-        about to BLOCK the request anyway.
+        still propagates under LLM_FAIL_CLOSED, in which case asyncio
+        cancels the other in-flight detectors — the right behaviour
+        because we're about to BLOCK the request anyway.
 
         `overrides` is plumbed through to the detectors that care:
         regex picks up the overlap-strategy override, LLM picks up the
@@ -255,23 +278,45 @@ class Pipeline:
                     )
                 return await det.detect(text)
             except LLMUnavailableError as exc:
-                if config.fail_closed:
+                if config.llm_fail_closed:
                     raise
                 log.warning("LLM detector unavailable, proceeding fail-open: %s", exc)
+                return []
+            except PrivacyFilterUnavailableError as exc:
+                if config.privacy_filter_fail_closed:
+                    raise
+                log.warning(
+                    "Privacy-filter detector unavailable, proceeding fail-open: %s", exc,
+                )
                 return []
             except Exception as exc:  # defensive: a buggy detector shouldn't kill us
                 log.exception("Detector %s crashed: %s", det.name, exc)
                 # Asymmetry on purpose: a buggy regex pattern can degrade to
                 # empty matches without taking the request down — the LLM
                 # layer still runs. But an unexpected LLM failure under
-                # FAIL_CLOSED is not safely degradable; if we silently
-                # returned [] here, an operator who set FAIL_CLOSED=true
+                # LLM_FAIL_CLOSED is not safely degradable; if we silently
+                # returned [] here, an operator who set LLM_FAIL_CLOSED=true
                 # specifically to BLOCK on any LLM problem would instead
                 # see the request quietly proceed with regex-only redaction.
                 # Re-raise as LLMUnavailableError so the BLOCKED path fires.
-                if isinstance(det, LLMDetector) and config.fail_closed:
+                if isinstance(det, LLMDetector) and config.llm_fail_closed:
                     raise LLMUnavailableError(
                         f"Unexpected failure in LLM detector "
+                        f"({type(exc).__name__}): {exc}"
+                    ) from exc
+                # Same asymmetry for the privacy-filter detector — both
+                # in-process (PrivacyFilterDetector) and remote
+                # (RemotePrivacyFilterDetector). An operator who set
+                # PRIVACY_FILTER_FAIL_CLOSED=true wants to BLOCK on any
+                # PF problem, including unexpected crashes from the
+                # in-process pipeline (torch OOM, tokenizer drift, etc.)
+                # that wouldn't otherwise raise our typed error.
+                if (
+                    isinstance(det, (PrivacyFilterDetector, RemotePrivacyFilterDetector))
+                    and config.privacy_filter_fail_closed
+                ):
+                    raise PrivacyFilterUnavailableError(
+                        f"Unexpected failure in privacy-filter detector "
                         f"({type(exc).__name__}): {exc}"
                     ) from exc
                 return []

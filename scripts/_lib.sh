@@ -27,8 +27,32 @@
 #   LOCALE_CHOICE                — empty or locale string
 #   HF_OFFLINE                   — true | false (pf only)
 #   RULES_FILE                   — host path or empty (fake-llm only)
-#   FAIL_CLOSED                  — true | false (default true)
+#   LLM_FAIL_CLOSED              — true | false (default true)
+#                                  Governs the LLM detector specifically.
+#                                  (Renamed from FAIL_CLOSED — the old
+#                                  name still works inside the container
+#                                  with a deprecation warning.)
+#   PRIVACY_FILTER_FAIL_CLOSED   — true | false (default true)
+#                                  Governs the privacy_filter detector
+#                                  (in-process or remote). Independent
+#                                  from LLM_FAIL_CLOSED.
 #   SURROGATE_SALT               — empty (random per restart) or string
+#   DENYLIST_PATH                — empty | bundled:NAME | filesystem path
+#                                  (only meaningful when DETECTOR_MODE has denylist)
+#   DENYLIST_BACKEND             — empty | regex | aho (server default: regex)
+#   PRIVACY_FILTER_URL           — empty | http(s) URL of a privacy-filter
+#                                  service. When set, the guardrail's
+#                                  RemotePrivacyFilterDetector talks to that
+#                                  service instead of loading the model
+#                                  in-process — slim image becomes sufficient.
+#   PRIVACY_FILTER_BACKEND       — empty | service | external
+#                                  service  → auto-start a local
+#                                             privacy-filter-service
+#                                             container; URL defaults to
+#                                             http://privacy-filter-service:8001
+#                                  external → use PRIVACY_FILTER_URL verbatim;
+#                                             nothing is auto-started
+#                                  empty    → no remote backend (in-process)
 #   EXTRA_ARGS                   — array of extra args for `podman run`
 
 # ── Color helpers ────────────────────────────────────────────────────────────
@@ -43,12 +67,28 @@ TAG_SLIM="${TAG_SLIM:-anonymizer-guardrail:latest}"
 TAG_PF="${TAG_PF:-anonymizer-guardrail:privacy-filter}"
 TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
 TAG_FAKE_LLM="${TAG_FAKE_LLM:-fake-llm:latest}"
+TAG_PF_SERVICE="${TAG_PF_SERVICE:-privacy-filter-service:latest}"
+TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked}"
 
+# Shared HF cache volume — used by both the in-process pf / pf-baked
+# guardrail and the standalone privacy-filter-service. Both mount it at
+# /app/.cache/huggingface and pull the same `openai/privacy-filter`
+# weights, so reusing one volume across them avoids re-downloading the
+# ~6 GB model when the operator switches flavours. The HF cache is
+# content-addressed, so concurrent readers are safe; concurrent first-
+# time writers (cold cache) are theoretically possible but practically
+# rare in dev / test. Operators wanting isolation can set HF_VOLUME to
+# a different name.
 HF_VOLUME="${HF_VOLUME:-anonymizer-hf-cache}"
 SHARED_NETWORK="${SHARED_NETWORK:-anonymizer-net}"
 
 CONTAINER_NAME_DEFAULT="anonymizer-guardrail"
 CONTAINER_NAME_FAKE_LLM="fake-llm"
+CONTAINER_NAME_PF_SERVICE="privacy-filter-service"
+# Canonical URL the launcher hands to the guardrail when auto-starting
+# the service. Operators who prefer an external service set their own
+# URL via --privacy-filter-url and the auto-start path is skipped.
+PF_SERVICE_URL_LOCAL="http://${CONTAINER_NAME_PF_SERVICE}:8001"
 
 # ── Engine detection ─────────────────────────────────────────────────────────
 detect_engine() {
@@ -124,8 +164,12 @@ resolve_flavour() {
 resolve_predicates() {
   DETECTOR_HAS_LLM=false
   DETECTOR_HAS_REGEX=false
-  [[ ",${DETECTOR_MODE}," == *",llm,"* ]]   && DETECTOR_HAS_LLM=true
-  [[ ",${DETECTOR_MODE}," == *",regex,"* ]] && DETECTOR_HAS_REGEX=true
+  DETECTOR_HAS_DENYLIST=false
+  DETECTOR_HAS_PRIVACY_FILTER=false
+  [[ ",${DETECTOR_MODE}," == *",llm,"*            ]] && DETECTOR_HAS_LLM=true
+  [[ ",${DETECTOR_MODE}," == *",regex,"*          ]] && DETECTOR_HAS_REGEX=true
+  [[ ",${DETECTOR_MODE}," == *",denylist,"*       ]] && DETECTOR_HAS_DENYLIST=true
+  [[ ",${DETECTOR_MODE}," == *",privacy_filter,"* ]] && DETECTOR_HAS_PRIVACY_FILTER=true
   return 0
 }
 
@@ -204,6 +248,144 @@ cleanup_fake_llm() {
   fi
 }
 
+# ── privacy-filter-service lifecycle ────────────────────────────────────────
+# Same auto-start pattern as fake-llm: when the operator picks the
+# `service` backend (cli.sh --privacy-filter-backend service, or the
+# matching menu choice), the launcher starts the privacy-filter-service
+# container in the background on the shared network and points the
+# guardrail at it. External services (operator's own URL) skip this
+# entirely.
+#
+# Two readiness wrinkles vs fake-llm:
+#   1. The model is huge — runtime-download images can take minutes
+#      to load on first start. We use a generous timeout and print a
+#      progress hint so the operator knows it's still working.
+#   2. Two image flavours exist. Prefer the baked image (model in the
+#      image, no runtime download); fall back to runtime-download if
+#      that's the only one built.
+
+GUARDRAIL_STARTED_PRIVACY_FILTER=false
+# Override via env if a deployment legitimately needs longer (e.g. a
+# slow upstream HF Hub mirror). 5 minutes is plenty for both flavours
+# on a healthy network.
+PF_SERVICE_READY_TIMEOUT_S="${PF_SERVICE_READY_TIMEOUT_S:-300}"
+
+# Pick whichever pf-service image is actually built. Returns 0 + sets
+# PF_SERVICE_TAG when one is found; returns 1 when neither is built.
+_pick_pf_service_image() {
+  if image_exists "$TAG_PF_SERVICE_BAKED"; then
+    PF_SERVICE_TAG="$TAG_PF_SERVICE_BAKED"
+    PF_SERVICE_TAG_KIND="baked"
+    return 0
+  fi
+  if image_exists "$TAG_PF_SERVICE"; then
+    PF_SERVICE_TAG="$TAG_PF_SERVICE"
+    PF_SERVICE_TAG_KIND="runtime-download"
+    return 0
+  fi
+  return 1
+}
+
+start_privacy_filter() {
+  ensure_shared_network
+
+  if container_exists "$CONTAINER_NAME_PF_SERVICE"; then
+    if container_running "$CONTAINER_NAME_PF_SERVICE"; then
+      ok "privacy-filter-service container already running — reusing it (will NOT stop on exit)."
+      return 0
+    fi
+    warn "privacy-filter-service container exists but isn't running — removing."
+    "$ENGINE" rm -f "$CONTAINER_NAME_PF_SERVICE" >/dev/null
+  fi
+
+  if ! _pick_pf_service_image; then
+    err "No privacy-filter-service image found."
+    err "Build it with:  scripts/build-image.sh -t pf-service"
+    err "                scripts/build-image.sh -t pf-service-baked  (recommended for repeat use)"
+    exit 1
+  fi
+
+  # Runtime-download flavour benefits from a persistent cache volume so
+  # the model survives container recreation. Baked image already has
+  # the weights; the volume mount is a no-op there. We share HF_VOLUME
+  # with the in-process pf / pf-baked guardrail so an operator who
+  # already downloaded the model via that flavour doesn't pay the
+  # download again when switching to slim + service.
+  local pf_volume_args=()
+  local volume_was_present=true
+  if [[ "$PF_SERVICE_TAG_KIND" == "runtime-download" ]]; then
+    if ! volume_exists "$HF_VOLUME"; then
+      say "Creating named volume \"${HF_VOLUME}\" for the privacy-filter HF cache..."
+      "$ENGINE" volume create "$HF_VOLUME" >/dev/null
+      volume_was_present=false
+    fi
+    pf_volume_args=(-v "${HF_VOLUME}:/app/.cache/huggingface")
+  fi
+
+  say "Starting privacy-filter-service (${PF_SERVICE_TAG_KIND}) on network \"${SHARED_NETWORK}\" (port 8001)..."
+  if [[ "$PF_SERVICE_TAG_KIND" == "runtime-download" && "$volume_was_present" == "false" ]]; then
+    warn "First run: model will be fetched from HuggingFace into volume \"${HF_VOLUME}\"."
+    warn "This can take several minutes on a slow connection."
+  fi
+  "$ENGINE" run -d --rm \
+    --name "$CONTAINER_NAME_PF_SERVICE" \
+    --network "$SHARED_NETWORK" \
+    -p 8001:8001 \
+    -e "LOG_LEVEL=${LOG_LEVEL_CHOICE:-info}" \
+    "${pf_volume_args[@]}" \
+    "$PF_SERVICE_TAG" >/dev/null
+
+  GUARDRAIL_STARTED_PRIVACY_FILTER=true
+
+  # Probe /health from inside the container — same routing-edge-case
+  # avoidance as fake-llm. The /health endpoint returns
+  # `{"status":"loading"}` until the model is loaded, then `"ok"`.
+  # Our HEALTHCHECK already grep's for `"status":"ok"` but we have to
+  # do that ourselves here too because the container exit-status from
+  # outside doesn't expose that distinction quickly.
+  say "Waiting for privacy-filter-service to be ready (timeout: ${PF_SERVICE_READY_TIMEOUT_S}s)..."
+  local i deadline now
+  deadline=$(( $(date +%s) + PF_SERVICE_READY_TIMEOUT_S ))
+  local last_progress=$(date +%s)
+  while true; do
+    now=$(date +%s)
+    if [[ $now -ge $deadline ]]; then
+      err "privacy-filter-service did not become ready within ${PF_SERVICE_READY_TIMEOUT_S}s."
+      err "Check: ${ENGINE} logs ${CONTAINER_NAME_PF_SERVICE}"
+      exit 1
+    fi
+    if "$ENGINE" exec "$CONTAINER_NAME_PF_SERVICE" \
+         python3 -c "import json, urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2); d=json.load(r); exit(0 if d.get('status')=='ok' else 1)" \
+         >/dev/null 2>&1; then
+      ok "privacy-filter-service is ready."
+      return 0
+    fi
+    # Periodic progress so a multi-minute model download doesn't look
+    # like a hang to the operator.
+    if (( now - last_progress >= 20 )); then
+      say "  …still loading (elapsed: $(( now - (deadline - PF_SERVICE_READY_TIMEOUT_S) ))s)"
+      last_progress=$now
+    fi
+    sleep 1
+  done
+}
+
+# EXIT-trap target. No-op when we didn't start the service ourselves.
+cleanup_privacy_filter() {
+  if [[ "${GUARDRAIL_STARTED_PRIVACY_FILTER:-false}" == "true" ]]; then
+    say ""
+    say "Stopping auto-started privacy-filter-service..."
+    "$ENGINE" stop "$CONTAINER_NAME_PF_SERVICE" >/dev/null 2>&1 || true
+  fi
+}
+
+# Combined cleanup invoked by the EXIT trap. We can only set ONE trap
+# target on EXIT, so funnel both teardowns through this single function.
+cleanup_aux_services() {
+  cleanup_fake_llm
+  cleanup_privacy_filter
+}
+
 # ── Run-arg composition ──────────────────────────────────────────────────────
 # Builds the global `*_ARGS` arrays consumed by `run_guardrail`. Reads
 # every config global; idempotent — safe to call multiple times.
@@ -247,6 +429,15 @@ build_run_args() {
     esac
   fi
 
+  # The guardrail joins the shared network whenever an auto-started
+  # service (fake-llm OR privacy-filter-service) is in use, so the
+  # service hostnames resolve. Idempotent if both are on — set once.
+  if [[ "${PRIVACY_FILTER_BACKEND:-}" == "service" ]]; then
+    if [[ ${#RUN_NETWORK_ARGS[@]} -eq 0 ]]; then
+      RUN_NETWORK_ARGS=(--network "$SHARED_NETWORK")
+    fi
+  fi
+
   RUN_FAKER_ARGS=()
   if [[ "${USE_FAKER_CHOICE:-false}" == "false" ]]; then
     RUN_FAKER_ARGS+=(-e "USE_FAKER=false")
@@ -277,16 +468,41 @@ build_run_args() {
     RUN_FORWARDED_KEY_ARGS=(-e "LLM_USE_FORWARDED_KEY=true")
   fi
 
-  # FAIL_CLOSED defaults to true in the container; only set when the
-  # operator chose fail-open. Keeps the env clean at default settings.
-  RUN_FAIL_CLOSED_ARGS=()
-  if [[ "${FAIL_CLOSED:-true}" == "false" ]]; then
-    RUN_FAIL_CLOSED_ARGS=(-e "FAIL_CLOSED=false")
+  # LLM_FAIL_CLOSED defaults to true in the container; only set when
+  # the operator chose fail-open. Keeps the env clean at default
+  # settings. Same shape for the privacy_filter equivalent below.
+  RUN_LLM_FAIL_CLOSED_ARGS=()
+  if [[ "${LLM_FAIL_CLOSED:-true}" == "false" ]]; then
+    RUN_LLM_FAIL_CLOSED_ARGS=(-e "LLM_FAIL_CLOSED=false")
+  fi
+  RUN_PF_FAIL_CLOSED_ARGS=()
+  if [[ "${PRIVACY_FILTER_FAIL_CLOSED:-true}" == "false" ]]; then
+    RUN_PF_FAIL_CLOSED_ARGS=(-e "PRIVACY_FILTER_FAIL_CLOSED=false")
   fi
 
   RUN_SALT_ARGS=()
   if [[ -n "${SURROGATE_SALT:-}" ]]; then
     RUN_SALT_ARGS=(-e "SURROGATE_SALT=${SURROGATE_SALT}")
+  fi
+
+  # Denylist: only emit env vars when the operator actually configured
+  # something. The detector itself loads (with no entries) when DENYLIST_PATH
+  # is empty, so leaving these unset keeps the env clean for default runs.
+  RUN_DENYLIST_ARGS=()
+  if [[ -n "${DENYLIST_PATH:-}" ]]; then
+    RUN_DENYLIST_ARGS+=(-e "DENYLIST_PATH=${DENYLIST_PATH}")
+  fi
+  if [[ -n "${DENYLIST_BACKEND:-}" ]]; then
+    RUN_DENYLIST_ARGS+=(-e "DENYLIST_BACKEND=${DENYLIST_BACKEND}")
+  fi
+
+  # Remote privacy-filter URL — when set, the guardrail's
+  # RemotePrivacyFilterDetector takes over and the in-process model load
+  # is skipped. The detector itself isn't implemented yet; the env var is
+  # plumbed now so the launcher is ready when it lands.
+  RUN_PRIVACY_FILTER_URL_ARGS=()
+  if [[ -n "${PRIVACY_FILTER_URL:-}" ]]; then
+    RUN_PRIVACY_FILTER_URL_ARGS=(-e "PRIVACY_FILTER_URL=${PRIVACY_FILTER_URL}")
   fi
 
   RUN_LOG_LEVEL_ARGS=(-e "LOG_LEVEL=${LOG_LEVEL_CHOICE:-info}")
@@ -324,14 +540,37 @@ print_plan() {
   if [[ -n "${REGEX_PATTERNS_PATH:-}" ]]; then
     say "Regex YAML:  ${c_grn}${REGEX_PATTERNS_PATH}${c_rst}"
   fi
+  if [[ "${DETECTOR_HAS_DENYLIST:-false}" == "true" ]]; then
+    if [[ -n "${DENYLIST_PATH:-}" ]]; then
+      say "Denylist:    ${c_grn}${DENYLIST_PATH}${c_rst} ${c_dim}backend=${DENYLIST_BACKEND:-regex}${c_rst}"
+    else
+      say "Denylist:    ${c_ylw}empty${c_rst} ${c_dim}(detector loads with no entries — set DENYLIST_PATH)${c_rst}"
+    fi
+  fi
+  if [[ -n "${PRIVACY_FILTER_URL:-}" ]]; then
+    case "${PRIVACY_FILTER_BACKEND:-}" in
+      service)
+        say "PF service:  ${c_grn}service${c_rst} ${c_dim}(auto-started on ${SHARED_NETWORK} → ${PRIVACY_FILTER_URL})${c_rst}"
+        ;;
+      external)
+        say "PF service:  ${c_grn}external${c_rst} ${c_dim}(${PRIVACY_FILTER_URL})${c_rst}"
+        ;;
+      *)
+        say "PF URL:      ${c_grn}${PRIVACY_FILTER_URL}${c_rst} ${c_dim}(remote privacy-filter; in-process load skipped)${c_rst}"
+        ;;
+    esac
+  fi
   if [[ -n "${LLM_SYSTEM_PROMPT_PATH:-}" ]]; then
     say "LLM prompt:  ${c_grn}${LLM_SYSTEM_PROMPT_PATH}${c_rst}"
   fi
   if [[ "${LLM_USE_FORWARDED_KEY:-false}" == "true" ]]; then
     say "Forward key: ${c_grn}yes${c_rst} ${c_dim}(send caller's Authorization header to detection LLM)${c_rst}"
   fi
-  if [[ "${FAIL_CLOSED:-true}" == "false" ]]; then
-    say "Fail mode:   ${c_ylw}open${c_rst} ${c_dim}(LLM errors fall through to regex-only)${c_rst}"
+  if [[ "${LLM_FAIL_CLOSED:-true}" == "false" ]]; then
+    say "LLM fail:    ${c_ylw}open${c_rst} ${c_dim}(LLM errors fall through to regex-only)${c_rst}"
+  fi
+  if [[ "${PRIVACY_FILTER_FAIL_CLOSED:-true}" == "false" ]]; then
+    say "PF fail:     ${c_ylw}open${c_rst} ${c_dim}(privacy_filter errors degrade to no PF matches)${c_rst}"
   fi
   if [[ -n "${SURROGATE_SALT:-}" ]]; then
     say "Salt:        ${c_grn}set${c_rst} ${c_dim}(stable surrogates across restarts)${c_rst}"
@@ -359,7 +598,7 @@ print_plan() {
 # nothing to clean up; otherwise wraps so the EXIT trap fires.
 run_guardrail() {
   build_run_args
-  trap cleanup_fake_llm EXIT
+  trap cleanup_aux_services EXIT
 
   local status=0
   "$ENGINE" run --rm --name "$NAME" -p "${PORT}:8000" \
@@ -368,10 +607,13 @@ run_guardrail() {
     "${RUN_LOG_LEVEL_ARGS[@]}" \
     "${REGEX_OVERLAP_ARGS[@]}" \
     "${RUN_REGEX_PATTERNS_ARGS[@]}" \
+    "${RUN_DENYLIST_ARGS[@]}" \
+    "${RUN_PRIVACY_FILTER_URL_ARGS[@]}" \
     "${RUN_LLM_ARGS[@]}" \
     "${RUN_LLM_PROMPT_ARGS[@]}" \
     "${RUN_FORWARDED_KEY_ARGS[@]}" \
-    "${RUN_FAIL_CLOSED_ARGS[@]}" \
+    "${RUN_LLM_FAIL_CLOSED_ARGS[@]}" \
+    "${RUN_PF_FAIL_CLOSED_ARGS[@]}" \
     "${RUN_SALT_ARGS[@]}" \
     "${RUN_FAKER_ARGS[@]}" \
     "${RUN_OFFLINE_ARGS[@]}" \

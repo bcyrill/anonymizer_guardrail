@@ -88,10 +88,18 @@ def _load_pipeline(model_name: str) -> Any:
         from transformers import pipeline  # noqa: WPS433 — intentional lazy import
     except ImportError as exc:
         raise ImportError(
-            "PrivacyFilterDetector requires the privacy-filter optional "
-            "dependency. Install with `pip install \"anonymizer-guardrail"
-            "[privacy-filter]\"`, or build the container with "
-            "`--build-arg WITH_PRIVACY_FILTER=true`."
+            "The in-process PrivacyFilterDetector requires the "
+            "privacy-filter optional dependency, which the slim image "
+            "doesn't ship. Pick one of:\n"
+            "  • Build the guardrail with the model: "
+            "`scripts/build-image.sh -t pf` (or `pf-baked`).\n"
+            "  • Run the privacy-filter as a separate service and set "
+            "PRIVACY_FILTER_URL to its address — the guardrail then "
+            "uses RemotePrivacyFilterDetector and the slim image is "
+            "sufficient. See services/privacy_filter/ and "
+            "`scripts/build-image.sh -t pf-service`.\n"
+            "  • If running outside the container, install the extra: "
+            "`pip install \"anonymizer-guardrail[privacy-filter]\"`."
         ) from exc
     # aggregation_strategy="first" collapses BIOES per-token output into
     # contiguous spans, with the entity_group derived from the first

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
@@ -11,6 +12,31 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _llm_fail_closed_default() -> bool:
+    """Read LLM_FAIL_CLOSED, fall back to the deprecated FAIL_CLOSED with
+    a loud warning, default true.
+
+    `FAIL_CLOSED` was renamed to `LLM_FAIL_CLOSED` once the privacy-filter
+    detector got its own `PRIVACY_FILTER_FAIL_CLOSED` knob — the old name
+    misled operators into thinking it governed both. Existing deployments
+    setting `FAIL_CLOSED=…` keep working for one release cycle, but get a
+    rename hint at boot so the migration is impossible to miss.
+    """
+    raw = os.getenv("LLM_FAIL_CLOSED")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    legacy = os.getenv("FAIL_CLOSED")
+    if legacy is not None:
+        logging.getLogger("anonymizer.config").warning(
+            "FAIL_CLOSED is deprecated; rename to LLM_FAIL_CLOSED. "
+            "It governs the LLM detector only — the privacy-filter "
+            "detector has its own PRIVACY_FILTER_FAIL_CLOSED. The old "
+            "name will be removed in a future release."
+        )
+        return legacy.strip().lower() in ("1", "true", "yes", "on")
+    return True
 
 
 def _env_int(name: str, default: int) -> int:
@@ -156,6 +182,40 @@ class Config:
     # Max number of concurrent LLM calls.
     llm_max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
 
+    # ── Privacy-filter detector (in-process vs remote) ─────────────────────────
+    # Empty (default) → DETECTOR_MODE=privacy_filter loads the model
+    # in-process (PrivacyFilterDetector). Pulls in torch + transformers
+    # + ~6 GB of weights, so the image flavour matters (slim doesn't
+    # ship them; pf / pf-baked do).
+    #
+    # Set to an HTTP URL → the detector becomes RemotePrivacyFilterDetector
+    # and posts to {URL}/detect on every request. The standalone
+    # privacy-filter-service container (see services/privacy_filter/)
+    # is the canonical other end. Lets the slim guardrail image cover
+    # the privacy_filter detector and lets multiple guardrail replicas
+    # share one inference service.
+    privacy_filter_url: str = os.getenv("PRIVACY_FILTER_URL", "").strip()
+    # Per-call timeout on the remote detector's HTTP requests. Inference
+    # for openai/privacy-filter is ~hundreds of ms on CPU; the default
+    # leaves plenty of headroom for first-request load and queueing.
+    privacy_filter_timeout_s: int = _env_int("PRIVACY_FILTER_TIMEOUT_S", 30)
+    # Failure mode for the privacy_filter detector — mirrors FAIL_CLOSED
+    # (which governs the LLM detector). When the privacy_filter service
+    # is unreachable, times out, or returns non-200:
+    #   true (default)  → block the request. The operator chose to
+    #                     include privacy_filter for a reason; silently
+    #                     dropping its coverage on a transient HTTP
+    #                     hiccup is the same kind of footgun the LLM's
+    #                     fail-closed default guards against.
+    #   false           → log the error and proceed with coverage from
+    #                     the other detectors (regex, denylist, llm).
+    # The two flags are independent — operators can fail closed on
+    # the LLM but open on PF (or vice versa) without coupling.
+    # Affects both the in-process and remote detectors: the pipeline's
+    # catch-all re-raises a generic PF crash as
+    # PrivacyFilterUnavailableError when this is true.
+    privacy_filter_fail_closed: bool = _env_bool("PRIVACY_FILTER_FAIL_CLOSED", True)
+
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     vault_ttl_s: int = _env_int("VAULT_TTL_S", 600)
 
@@ -163,8 +223,14 @@ class Config:
     # If the LLM detector errors out, do we proceed with regex-only results
     # (fail_open) or block the request (fail_closed)? LiteLLM has its own
     # `unreachable_fallback` for when WE are down; this controls our internal
-    # behaviour when our LLM dependency is down.
-    fail_closed: bool = _env_bool("FAIL_CLOSED", True)
+    # behaviour when our LLM dependency is down. Independent from
+    # `privacy_filter_fail_closed` (above) — operators can fail closed on
+    # one detector and open on the other.
+    # Backward compat: `FAIL_CLOSED` was the old name for this env var,
+    # before the privacy-filter detector got its own fail-mode flag. The
+    # default-resolver below honours `FAIL_CLOSED` with a deprecation
+    # warning if the new name is unset.
+    llm_fail_closed: bool = _llm_fail_closed_default()
 
 
 config = Config()

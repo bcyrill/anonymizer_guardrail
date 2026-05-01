@@ -244,7 +244,7 @@ class LLMDetector:
         # Refuse oversized inputs rather than truncating. Truncation would
         # silently let everything past the cap through unscanned — the
         # opposite of what a guardrail should do. Raised as
-        # LLMUnavailableError so the FAIL_CLOSED policy in the pipeline
+        # LLMUnavailableError so the LLM_FAIL_CLOSED policy in the pipeline
         # decides: block the request, or fall back to regex-only.
         if len(text) > config.llm_max_chars:
             raise LLMUnavailableError(
@@ -281,8 +281,8 @@ class LLMDetector:
             # Catches ReadError, WriteError, RemoteProtocolError, NetworkError,
             # ProxyError, etc. — any HTTP-layer failure that isn't a clean
             # connect/timeout. Routing through LLMUnavailableError ensures
-            # FAIL_CLOSED applies; bare exceptions used to be swallowed by
-            # the pipeline's defensive handler, which would silently ship
+            # LLM_FAIL_CLOSED applies; bare exceptions used to be swallowed
+            # by the pipeline's defensive handler, which would silently ship
             # unredacted text upstream.
             raise LLMUnavailableError(
                 f"HTTP error talking to LLM at {url}: {exc}"

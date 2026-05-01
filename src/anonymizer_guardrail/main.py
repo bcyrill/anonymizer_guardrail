@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from .api import GuardrailRequest, GuardrailResponse, parse_overrides
 from .config import config
 from .detector.llm import LLMUnavailableError
+from .detector.remote_privacy_filter import PrivacyFilterUnavailableError
 from .pipeline import Pipeline
 
 logging.basicConfig(
@@ -157,13 +158,27 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=restored)
 
     except LLMUnavailableError as exc:
-        # Reached only when fail_closed=True; otherwise the pipeline swallows it.
+        # Reached only when llm_fail_closed=True; otherwise the pipeline swallows it.
         log.error("Blocking request — LLM detector unavailable: %s", exc)
         return GuardrailResponse(
             action="BLOCKED",
             blocked_reason=(
                 "Anonymization LLM is unreachable; request blocked to prevent "
                 "unredacted data from reaching the upstream model."
+            ),
+        )
+    except PrivacyFilterUnavailableError as exc:
+        # Reached only when privacy_filter_fail_closed=True; otherwise the
+        # pipeline swallows it. Same risk shape as the LLM case — silent
+        # downgrade of redaction coverage is the failure mode we're guarding
+        # against.
+        log.error("Blocking request — privacy-filter detector unavailable: %s", exc)
+        return GuardrailResponse(
+            action="BLOCKED",
+            blocked_reason=(
+                "Anonymization privacy-filter is unreachable; request "
+                "blocked to prevent unredacted data from reaching the "
+                "upstream model."
             ),
         )
     except Exception as exc:

@@ -38,8 +38,13 @@ HF_OFFLINE=false
 RULES_FILE=""
 REGEX_PATTERNS_PATH=""
 LLM_SYSTEM_PROMPT_PATH=""
+DENYLIST_PATH=""
+DENYLIST_BACKEND=""              # empty → server default (regex)
+PRIVACY_FILTER_URL=""
+PRIVACY_FILTER_BACKEND=""        # empty | service | external
 LLM_USE_FORWARDED_KEY=false
-FAIL_CLOSED=true
+LLM_FAIL_CLOSED=true
+PRIVACY_FILTER_FAIL_CLOSED=true
 SURROGATE_SALT=""
 EXTRA_ARGS=()
 NAME="$CONTAINER_NAME_DEFAULT"
@@ -64,35 +69,55 @@ ws_pick_flavour() {
     "pf-baked" "privacy-filter (model baked in)"       "$(on "$TYPE" pf-baked)" \
     3>&1 1>&2 2>&3) || return 1
   TYPE="$r"
+
+  # Switching to slim with the in-process privacy-filter backend
+  # selected → auto-correct to `service` with the canonical URL.
+  # The in-process path needs torch + the model, which slim doesn't
+  # ship; without this the launch-time validation would block and
+  # bounce the operator back to the menu anyway. Cheaper UX to fix
+  # silently here.
+  if [[ "$TYPE" == "slim" \
+        && "${DETECTOR_MODE},"  == *"privacy_filter,"* \
+        && -z "$PRIVACY_FILTER_BACKEND" ]]; then
+    PRIVACY_FILTER_BACKEND="service"
+    [[ -z "$PRIVACY_FILTER_URL" ]] && PRIVACY_FILTER_URL="$PF_SERVICE_URL_LOCAL"
+  fi
 }
 
 ws_pick_detector_mode() {
   # Checklist: pick which detection layers to enable. We assemble the
-  # canonical priority order (regex → privacy_filter → llm) from the
-  # selected boxes; operators wanting an unusual order can use cli.sh.
-  # privacy_filter is only offered on images that ship the model.
+  # canonical priority order (regex → denylist → privacy_filter → llm)
+  # from the selected boxes; operators wanting an unusual order can use
+  # cli.sh. privacy_filter is offered when the image ships the model
+  # (pf / pf-baked) OR when the operator pointed at a remote
+  # privacy-filter service (PRIVACY_FILTER_URL set on the slim image).
   local cur=",${DETECTOR_MODE},"
-  local has_regex=off has_pf=off has_llm=off
+  local has_regex=off has_denylist=off has_pf=off has_llm=off
   [[ "$cur" == *",regex,"*          ]] && has_regex=on
+  [[ "$cur" == *",denylist,"*       ]] && has_denylist=on
   [[ "$cur" == *",privacy_filter,"* ]] && has_pf=on
   [[ "$cur" == *",llm,"*            ]] && has_llm=on
 
   local opts=()
-  opts+=("regex"          "Regex"           "$has_regex")
-  if [[ "$TYPE" == "pf" || "$TYPE" == "pf-baked" ]]; then
-    opts+=("privacy_filter" "Privacy-Filter" "$has_pf")
-  fi
-  opts+=("llm"            "LLM"             "$has_llm")
+  opts+=("regex"    "Regex"           "$has_regex")
+  opts+=("denylist" "Denylist"        "$has_denylist")
+  # `privacy_filter` is offered on every flavour. On pf / pf-baked the
+  # in-process detector handles it; on slim the user has to set
+  # PRIVACY_FILTER_URL (Detectors → Privacy-filter) so the remote
+  # detector can take over. The launch-time validation catches the
+  # slim+no-URL combination with a clear pointer.
+  opts+=("privacy_filter" "Privacy-Filter" "$has_pf")
+  opts+=("llm"     "LLM"             "$has_llm")
 
   local selected
   selected=$(dialog --title "Enabled detectors" --no-tags \
     --separate-output --checklist \
-    "Space toggles a detector. The order of type-resolution priority is regex → privacy_filter → llm." \
-    14 72 4 "${opts[@]}" 3>&1 1>&2 2>&3) || return 1
+    "Space toggles a detector. The order of type-resolution priority is regex → denylist → privacy_filter → llm." \
+    14 72 5 "${opts[@]}" 3>&1 1>&2 2>&3) || return 1
 
   # Build the comma-separated list in canonical priority order.
   local mode=""
-  for d in regex privacy_filter llm; do
+  for d in regex denylist privacy_filter llm; do
     if printf '%s\n' "$selected" | grep -qx "$d"; then
       [[ -z "$mode" ]] && mode="$d" || mode="${mode},${d}"
     fi
@@ -103,6 +128,18 @@ ws_pick_detector_mode() {
     return 1
   fi
   DETECTOR_MODE="$mode"
+
+  # Ticking privacy_filter on slim with no backend chosen → default to
+  # `service`. The in-process backend isn't valid on slim, and leaving
+  # the backend empty would render the submenu as "in-process" (which
+  # the launch-time check would then reject). Picking service here
+  # makes the submenu / plan output reflect a launchable state.
+  if [[ "$TYPE" == "slim" \
+        && ",${DETECTOR_MODE},"  == *",privacy_filter,"* \
+        && -z "$PRIVACY_FILTER_BACKEND" ]]; then
+    PRIVACY_FILTER_BACKEND="service"
+    [[ -z "$PRIVACY_FILTER_URL" ]] && PRIVACY_FILTER_URL="$PF_SERVICE_URL_LOCAL"
+  fi
 }
 
 ws_pick_overlap_strategy() {
@@ -285,6 +322,143 @@ ws_pick_llm_prompt() {
   esac
 }
 
+ws_pick_denylist_path() {
+  # No bundled denylist files ship with the package — the use case is
+  # org-specific names. So we offer "none" (loaded but empty) and
+  # "custom" (filesystem path or bundled:NAME if the operator has a
+  # baked-in image variant).
+  local cur="$DENYLIST_PATH"
+  local on_none=off on_custom=off
+  if [[ -z "$cur" ]]; then
+    on_none=on
+  else
+    on_custom=on
+  fi
+  local r
+  r=$(dialog --title "Denylist path" --no-tags --radiolist \
+    "DENYLIST_PATH for the denylist detector" 12 72 2 \
+    "none"   "none — detector loads with no entries (matches nothing)" "$on_none" \
+    "custom" "custom — filesystem path or bundled:NAME"                "$on_custom" \
+    3>&1 1>&2 2>&3) || return 1
+  case "$r" in
+    none)
+      DENYLIST_PATH=""
+      ;;
+    custom)
+      r=$(dialog --title "Denylist path" --inputbox \
+        "Path or 'bundled:NAME' (e.g. /etc/anonymizer/deny.yaml):" 8 70 "$cur" \
+        3>&1 1>&2 2>&3) || return 1
+      DENYLIST_PATH="$r"
+      ;;
+  esac
+}
+
+ws_pick_denylist_backend() {
+  # Empty = "use the server default" (regex). Offer the two real values
+  # plus the no-override pseudo-option so an operator who's just
+  # exploring the menu doesn't accidentally pin the env var.
+  local on_default=off on_regex=off on_aho=off
+  case "$DENYLIST_BACKEND" in
+    "")     on_default=on ;;
+    regex)  on_regex=on   ;;
+    aho)    on_aho=on     ;;
+  esac
+  local r
+  r=$(dialog --title "Denylist backend" --no-tags --radiolist \
+    "Matching backend used by the denylist detector" 12 72 3 \
+    "default" "default — leave DENYLIST_BACKEND unset (server picks regex)" "$on_default" \
+    "regex"   "regex   — Python re alternation (stdlib)"                    "$on_regex" \
+    "aho"     "aho     — Aho-Corasick via pyahocorasick (sub-linear)"       "$on_aho" \
+    3>&1 1>&2 2>&3) || return 1
+  case "$r" in
+    default) DENYLIST_BACKEND="" ;;
+    *)       DENYLIST_BACKEND="$r" ;;
+  esac
+}
+
+ws_pick_privacy_filter_backend() {
+  # The in-process option is only valid on the pf / pf-baked images
+  # (they ship torch + the model). slim has no in-process path, so
+  # offering "in-process" there would be a footgun — the launch-time
+  # validation would reject it. Hide it instead.
+  local supports_inproc=false
+  if [[ "$TYPE" == "pf" || "$TYPE" == "pf-baked" ]]; then
+    supports_inproc=true
+  fi
+
+  local on_inproc=off on_service=off on_external=off
+  case "$PRIVACY_FILTER_BACKEND" in
+    "")       on_inproc=on   ;;
+    service)  on_service=on  ;;
+    external) on_external=on ;;
+  esac
+
+  # Build the option list per flavour. dialog needs at least one
+  # entry pre-selected; the radiolist below ensures that holds.
+  local opts=()
+  if [[ "$supports_inproc" == "true" ]]; then
+    opts+=("in-process" "in-process — model loaded in this container" "$on_inproc")
+  elif [[ "$on_inproc" == "on" ]]; then
+    # Operator had in-process selected but switched to slim. Default
+    # the radiolist to `service` so they have a valid pick on submit.
+    on_service=on
+  fi
+  opts+=("service"    "service    — auto-start service" "$on_service")
+  opts+=("external"   "external   — custom URL"         "$on_external")
+
+  local height=12
+  [[ "$supports_inproc" == "true" ]] && height=13
+
+  local r
+  r=$(dialog --title "Privacy-filter backend" --no-tags --radiolist \
+    "Where the privacy_filter detector runs" "$height" 76 3 \
+    "${opts[@]}" \
+    3>&1 1>&2 2>&3) || return 1
+  case "$r" in
+    in-process)
+      PRIVACY_FILTER_BACKEND=""
+      PRIVACY_FILTER_URL=""
+      ;;
+    service)
+      PRIVACY_FILTER_BACKEND="service"
+      # Default URL to the canonical local container — the operator
+      # can override later via "Service URL" if they want a different
+      # host on the shared network.
+      [[ -z "$PRIVACY_FILTER_URL" ]] && PRIVACY_FILTER_URL="$PF_SERVICE_URL_LOCAL"
+      ;;
+    external)
+      PRIVACY_FILTER_BACKEND="external"
+      # Force the URL field so the operator can fill it in next.
+      ws_pick_privacy_filter_url || return 1
+      if [[ -z "$PRIVACY_FILTER_URL" ]]; then
+        dialog --title "URL required" --msgbox \
+          "External backend needs a URL. Reverting to previous setting." 8 60
+        # Don't drop to in-process on slim — that's invalid there.
+        if [[ "$supports_inproc" == "true" ]]; then
+          PRIVACY_FILTER_BACKEND=""
+        else
+          PRIVACY_FILTER_BACKEND="service"
+          PRIVACY_FILTER_URL="$PF_SERVICE_URL_LOCAL"
+        fi
+      fi
+      ;;
+  esac
+}
+
+ws_pick_privacy_filter_url() {
+  # When set, the guardrail's RemotePrivacyFilterDetector talks to a
+  # standalone privacy-filter service over HTTP and the in-process model
+  # load is skipped — slim image becomes sufficient. The detector itself
+  # isn't implemented yet; the env var is plumbed now so the menu is
+  # ready when it lands.
+  local r
+  r=$(dialog --title "Remote privacy-filter URL" --inputbox \
+    "PRIVACY_FILTER_URL — empty = in-process detector (current behaviour). Set a URL to talk to a privacy-filter-service container instead. Example: http://privacy-filter-service:8001" \
+    12 70 "$PRIVACY_FILTER_URL" \
+    3>&1 1>&2 2>&3) || return 1
+  PRIVACY_FILTER_URL="$r"
+}
+
 ws_toggle_forwarded_key() {
   if dialog --title "Forward LLM key" --defaultno --yesno \
        "Send the caller's Authorization header to the detection LLM (LLM_USE_FORWARDED_KEY=true)?\n\nOnly meaningful with a custom backend that authenticates against a per-user virtual key (e.g. LiteLLM with extra_headers: [authorization])." \
@@ -295,15 +469,25 @@ ws_toggle_forwarded_key() {
   fi
 }
 
-ws_toggle_fail_closed() {
+ws_toggle_llm_fail_closed() {
   # Default-yes (closed) so the safer choice is the default if the
   # operator just hits Enter.
-  if dialog --title "Fail-closed" --yesno \
-       "Block requests when the LLM detector errors (FAIL_CLOSED=true)?\n\nNo → fall back to regex-only redaction on LLM failure (useful when iterating on the LLM, dangerous in real deployments)." \
+  if dialog --title "LLM fail-closed" --yesno \
+       "Block requests when the LLM detector errors (LLM_FAIL_CLOSED=true)?\n\nNo → coverage falls back to the other detectors on LLM failure (useful when iterating on the LLM, dangerous in real deployments)." \
        11 70; then
-    FAIL_CLOSED=true
+    LLM_FAIL_CLOSED=true
   else
-    FAIL_CLOSED=false
+    LLM_FAIL_CLOSED=false
+  fi
+}
+
+ws_toggle_pf_fail_closed() {
+  if dialog --title "Privacy-filter fail-closed" --yesno \
+       "Block requests when the privacy_filter detector errors (PRIVACY_FILTER_FAIL_CLOSED=true)?\n\nNo → degrade to no privacy_filter matches and proceed with the other detectors (regex / denylist / llm)." \
+       11 70; then
+    PRIVACY_FILTER_FAIL_CLOSED=true
+  else
+    PRIVACY_FILTER_FAIL_CLOSED=false
   fi
 }
 
@@ -351,6 +535,48 @@ llm_prompt_label() {
     "")                          echo "default (bundled)" ;;
     "bundled:llm_pentest.md")    echo "pentest (bundled)" ;;
     *)                           echo "$LLM_SYSTEM_PROMPT_PATH" ;;
+  esac
+}
+
+denylist_path_label() {
+  if [[ -z "$DENYLIST_PATH" ]]; then
+    echo "(none — detector loads empty)"
+  else
+    echo "$DENYLIST_PATH"
+  fi
+}
+
+denylist_backend_label() {
+  if [[ -z "$DENYLIST_BACKEND" ]]; then
+    echo "default (regex)"
+  else
+    echo "$DENYLIST_BACKEND"
+  fi
+}
+
+privacy_filter_url_label() {
+  if [[ -z "$PRIVACY_FILTER_URL" ]]; then
+    echo "(unset — in-process detector)"
+  else
+    echo "$PRIVACY_FILTER_URL"
+  fi
+}
+
+privacy_filter_backend_label() {
+  case "$PRIVACY_FILTER_BACKEND" in
+    "")
+      # Empty means in-process. On slim that's not a valid configuration
+      # (no torch / no model in the image) — flag it as unset instead so
+      # the row reflects what the launch-time validation will say.
+      if [[ "$TYPE" == "slim" ]]; then
+        echo "(unset — pick service or external)"
+      else
+        echo "in-process (model loaded in this container)"
+      fi
+      ;;
+    service)  echo "service (auto-start privacy-filter-service)" ;;
+    external) echo "external (operator-supplied URL)" ;;
+    *)        echo "$PRIVACY_FILTER_BACKEND" ;;
   esac
 }
 
@@ -410,6 +636,61 @@ submenu_regex() {
   done
 }
 
+submenu_denylist() {
+  while true; do
+    local items=()
+    items+=("path"    "$(fmt_row "Denylist path      $(denylist_path_label)")")
+    items+=("backend" "$(fmt_row "Denylist backend   $(denylist_backend_label)")")
+
+    local choice rc=0
+    choice=$(dialog --title "Detectors → Denylist" --no-tags --clear \
+      --ok-label "Edit" --cancel-label "Back" \
+      --menu "" 12 78 4 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
+
+    case "$rc" in
+      0)
+        case "$choice" in
+          path)    ws_pick_denylist_path ;;
+          backend) ws_pick_denylist_backend ;;
+        esac
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+submenu_privacy_filter() {
+  while true; do
+    local items=()
+    items+=("backend" "$(fmt_row "Backend            $(privacy_filter_backend_label)")")
+    # The URL row matters for `external` (operator-supplied) and as a
+    # display-only hint for `service` (auto-derived from the canonical
+    # container name). For in-process (empty backend) the URL is unused.
+    if [[ "$PRIVACY_FILTER_BACKEND" == "external" || -n "$PRIVACY_FILTER_URL" ]]; then
+      items+=("url" "$(fmt_row "Service URL        $(privacy_filter_url_label)")")
+    fi
+    local pf_fc_disp="closed (block on PF error)"
+    [[ "$PRIVACY_FILTER_FAIL_CLOSED" == "false" ]] && pf_fc_disp="open (degrade to no PF matches)"
+    items+=("failmode" "$(fmt_row "Fail mode          $pf_fc_disp")")
+
+    local choice rc=0
+    choice=$(dialog --title "Detectors → Privacy-Filter" --no-tags --clear \
+      --ok-label "Edit" --cancel-label "Back" \
+      --menu "" 13 78 5 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
+
+    case "$rc" in
+      0)
+        case "$choice" in
+          backend)  ws_pick_privacy_filter_backend ;;
+          url)      ws_pick_privacy_filter_url ;;
+          failmode) ws_toggle_pf_fail_closed ;;
+        esac
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 submenu_llm() {
   while true; do
     local items=()
@@ -435,8 +716,8 @@ submenu_llm() {
       items+=("rules" "$(fmt_row "fake-llm rules     $rules_disp")")
     fi
     local fc_disp="closed (block on LLM error)"
-    [[ "$FAIL_CLOSED" == "false" ]] && fc_disp="open (regex fallback)"
-    items+=("failmode" "$(fmt_row "Fail mode          $fc_disp")")
+    [[ "$LLM_FAIL_CLOSED" == "false" ]] && fc_disp="open (fall back to other detectors)"
+    items+=("failmode" "$(fmt_row "LLM fail mode      $fc_disp")")
 
     local choice rc=0
     choice=$(dialog --title "Detectors → LLM" --no-tags --clear \
@@ -450,7 +731,7 @@ submenu_llm() {
           prompt)     ws_pick_llm_prompt ;;
           forwardkey) ws_toggle_forwarded_key ;;
           rules)      ws_pick_rules_file ;;
-          failmode)   ws_toggle_fail_closed ;;
+          failmode)   ws_toggle_llm_fail_closed ;;
         esac
         ;;
       *) return 0 ;;
@@ -466,6 +747,12 @@ submenu_detectors() {
     if [[ "$DETECTOR_HAS_REGEX" == "true" ]]; then
       items+=("regex_sub" "$(fmt_row "Regex options      →")")
     fi
+    if [[ "$DETECTOR_HAS_DENYLIST" == "true" ]]; then
+      items+=("denylist_sub" "$(fmt_row "Denylist options   →")")
+    fi
+    if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" ]]; then
+      items+=("pf_sub" "$(fmt_row "Privacy-filter     →")")
+    fi
     if [[ "$DETECTOR_HAS_LLM" == "true" ]]; then
       items+=("llm_sub"   "$(fmt_row "LLM options        →")")
     fi
@@ -473,14 +760,16 @@ submenu_detectors() {
     local choice rc=0
     choice=$(dialog --title "Detectors" --no-tags --clear \
       --ok-label "Open" --cancel-label "Back" \
-      --menu "" 14 78 6 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
+      --menu "" 16 78 8 "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
 
     case "$rc" in
       0)
         case "$choice" in
-          mode)      ws_pick_detector_mode ;;
-          regex_sub) submenu_regex ;;
-          llm_sub)   submenu_llm ;;
+          mode)         ws_pick_detector_mode ;;
+          regex_sub)    submenu_regex ;;
+          denylist_sub) submenu_denylist ;;
+          pf_sub)       submenu_privacy_filter ;;
+          llm_sub)      submenu_llm ;;
         esac
         ;;
       *) return 0 ;;
@@ -564,6 +853,20 @@ main_menu
 resolve_flavour
 resolve_predicates
 
+# ── privacy_filter on slim requires a remote backend ───────────────────────
+# slim doesn't ship torch + transformers, so the in-process detector
+# can't load. The operator must pick a remote backend (service /
+# external) before launching. Block with a clear pointer rather than
+# letting the container crash at startup with a torch ImportError.
+if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" \
+      && "$TYPE" == "slim" \
+      && -z "$PRIVACY_FILTER_BACKEND" ]]; then
+  dialog --title "Privacy-filter backend required" --msgbox \
+    "DETECTOR_MODE includes 'privacy_filter' on the slim image, but no remote backend is selected.\n\nThe slim image doesn't ship torch + the model, so the in-process detector can't load.\n\nOpen Detectors → Privacy-filter and pick:\n  • service  → auto-start a privacy-filter-service container\n  • external → talk to a service you supply via URL\n\nOr go back and pick the pf / pf-baked flavour instead." \
+    16 72
+  exec "$0"   # restart the menu so the operator can fix it
+fi
+
 # ── Image must exist ─────────────────────────────────────────────────────────
 if ! image_exists "$IMAGE"; then
   if dialog --title "Image not found" --yesno \
@@ -610,6 +913,12 @@ fi
 # ── Auto-start fake-llm if needed ────────────────────────────────────────────
 if [[ "$DETECTOR_HAS_LLM" == "true" && "$LLM_BACKEND" == "fake-llm" ]]; then
   start_fake_llm
+fi
+
+# ── Auto-start privacy-filter-service if needed ─────────────────────────────
+if [[ "$DETECTOR_HAS_PRIVACY_FILTER" == "true" \
+      && "$PRIVACY_FILTER_BACKEND" == "service" ]]; then
+  start_privacy_filter
 fi
 
 print_plan
