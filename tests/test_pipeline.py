@@ -176,6 +176,64 @@ async def test_unexpected_llm_failure_routes_through_fail_closed(
         await p.anonymize(["alice"], call_id="unexpected-fail")
 
 
+async def test_batch_cancels_sibling_texts_on_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When one text in a multi-text batch trips fail-closed, the
+    sibling texts' in-flight detector calls must be cancelled — not
+    left to burn compute and pin concurrency slots until they
+    complete naturally. Locks down the TaskGroup-vs-gather choice in
+    Pipeline.anonymize: switching back to asyncio.gather would silently
+    pass the typed-exception assertion below but blow past the
+    wait_for timeout because the slow tasks would run to completion.
+    """
+    from anonymizer_guardrail.detector.llm import LLMDetector, LLMUnavailableError
+
+    _patch_fail_closed(monkeypatch, True)
+
+    started = 0
+    completed = 0
+
+    bad = LLMDetector.__new__(LLMDetector)
+    bad.name = "llm"
+
+    async def detect(text, *_args, **_kwargs):
+        nonlocal started, completed
+        started += 1
+        if text == "explode":
+            raise LLMUnavailableError("forced")
+        # Long enough that without cancellation the wait_for below
+        # would time out (proving the test catches a regression).
+        await asyncio.sleep(5)
+        completed += 1
+        return []
+
+    bad.detect = detect  # type: ignore[method-assign]
+    p = Pipeline()
+    p._detectors = [bad]
+
+    # Tight timeout — well under the 5s sleep. If cancellation works,
+    # this completes in milliseconds with the typed exception. If it
+    # doesn't, asyncio.wait_for raises TimeoutError instead and the
+    # `pytest.raises(LLMUnavailableError)` assertion fails loudly.
+    with pytest.raises(LLMUnavailableError, match="forced"):
+        await asyncio.wait_for(
+            p.anonymize(
+                ["slow1", "explode", "slow2"], call_id="cancel-test",
+            ),
+            timeout=2,
+        )
+
+    # The failing detector started; the slow ones may or may not have
+    # entered detect() depending on scheduler order. What MUST hold is
+    # that NO slow task ran to completion — they were cancelled.
+    assert completed == 0, (
+        f"slow detector tasks completed despite sibling failure "
+        f"(started={started}, completed={completed}); "
+        f"sibling cancellation is broken."
+    )
+
+
 async def test_privacy_filter_unavailable_propagates_under_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
