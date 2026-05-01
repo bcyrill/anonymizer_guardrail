@@ -84,8 +84,26 @@ against the more interpretive LLM/NER layers. This is the rationale
 behind the recommended ordering above.
 
 Partial overlaps (regex catches `alice@acme.com`, LLM catches just
-`alice`) are NOT merged — they remain distinct spans because the
-matched-text values differ. Each gets its own surrogate.
+`alice`) survive dedup as two distinct entries — `_dedup` keys on
+the matched text, so the differing strings don't collide. Both get
+surrogates generated and both land in the vault.
+
+At **replacement** time, the substitution regex sorts keys
+longest-first and joins them as an alternation
+(`alice@acme\.com|alice`). Python's `re` engine commits to the first
+matching alternative at each position, so the email gets replaced
+whole and the inner `alice` substring is never matched at that
+position. The `alice` surrogate is therefore dead weight when the
+inner text only ever appears *inside* the longer span — generated,
+stored in the vault, but never visible in the anonymised output.
+
+When `alice` appears elsewhere on its own (e.g. `"contact alice@acme.com
+or alice directly"`), both replacements fire — at different positions —
+and you'd see something like `"contact fake_email_1 or fake_name_1
+directly"`. The longest-first sort is what keeps the email-only case
+correct: without it, replacing `alice` first would produce
+`fake_name_1@acme.com`, which then no longer matches the email
+pattern.
 
 ## Common conventions
 
