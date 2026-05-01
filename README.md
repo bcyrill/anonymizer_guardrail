@@ -557,7 +557,7 @@ Pick this when:
 
 Off-loads inference to a standalone container running
 `services/privacy_filter/main.py` — a thin FastAPI wrapper around the
-same HuggingFace pipeline plus identical span-merge post-processing.
+same `transformers` pipeline plus identical span-merge post-processing.
 The guardrail's `RemotePrivacyFilterDetector` posts each request's
 text to `${PRIVACY_FILTER_URL}/detect` and parses the returned span
 list. Output is byte-equivalent to the in-process detector for the
@@ -791,34 +791,69 @@ runtime-download image), and points the guardrail at
 guardrail image to avoid baking torch + the model into the guardrail.
 See `services/privacy_filter/README.md` for the API contract.
 
-### Image flavours
+### Container images
 
-Three guardrail flavours, controlled by two build-args, sharing one
-`Containerfile`. The standalone `privacy-filter-service` is a separate
-package with its own Containerfile and its own CPU/CUDA matrix.
+The repo builds three artifacts: the **guardrail** itself, the
+standalone **privacy-filter-service** (paired with the slim guardrail
+when you don't want torch in the API container), and the **fake-llm**
+test backend. `scripts/build-image.sh` knows about every flavour
+listed below. The *published as* column shows the GHCR tag CI ships;
+flavours marked **local only** are buildable but not on the registry —
+see *Why some flavours aren't published* at the end of this section
+for the rationale.
 
-| flavour | size | model | when to pick it |
-|---|---|---|---|
-| slim | ~200 MB | n/a | DETECTOR_MODE never includes `privacy_filter` |
-| privacy-filter (runtime download) | ~1.3 GB | downloads on first container start | most deployments — pair with a named volume |
-| privacy-filter (model baked in) | ~6.9 GB | shipped inside image | air-gapped or strict cold-start latency |
+#### Guardrail (`anonymizer-guardrail`)
 
-The guardrail's privacy-filter flavours are CPU-only by design — when
-you need GPU acceleration, deploy the standalone `privacy-filter-service`
-on a GPU node and point the slim guardrail at it via
-`PRIVACY_FILTER_URL` (see *Privacy-filter detector* above). The
-service ships in two variants:
+Three flavours, controlled by two build-args, sharing one
+`Containerfile`. The privacy-filter flavours are CPU-only by design —
+when you need GPU acceleration, deploy the standalone
+`privacy-filter-service` on a GPU node and point the slim guardrail at
+it via `PRIVACY_FILTER_URL` (see *Privacy-filter detector* above).
 
-| pf-service variant | torch wheels | runtime needs |
-|---|---|---|
-| CPU (`-cpu`) | CPU-only | none beyond the container |
-| CUDA 13.0 (`-cu130`) | CUDA 13.0 wheels | nvidia GPU + nvidia-container-toolkit at run time |
+| flavour | size | model | published as | when to pick it |
+|---|---|---|---|---|
+| `slim` | ~200 MB | n/a (in-process) | `:vX.Y.Z` | covers regex/llm/denylist; pair with `PRIVACY_FILTER_URL` for remote `privacy_filter` coverage |
+| `pf` | ~1.3 GB | downloads on first container start | `:vX.Y.Z-pf` | in-process `privacy_filter` for most deployments — pair with a named volume |
+| `pf-baked` | ~6.9 GB | shipped inside image | local only | in-process `privacy_filter`, air-gapped or strict cold-start latency |
 
-Both are published from CI (`+pf-service` tag); the baked variants of
-either are local-build only via `scripts/build-image.sh -t
-pf-service-baked` / `-t pf-service-baked-cu130` because the multi-GB
-image cost isn't worth carrying in the registry for what's typically a
-build-once artifact.
+#### Privacy-filter-service (`privacy-filter-service`)
+
+Standalone HTTP wrapper around the same `transformers`
+token-classification pipeline the in-process detector uses. Pair with
+the slim guardrail to keep the heavy ML deps in their own container —
+typically deployed on a GPU node and shared by multiple guardrail
+replicas. Each variant gets an explicit tag suffix (no implicit
+default) so a typoed pull fails loud rather than handing back the
+wrong torch build.
+
+| flavour | torch wheels | model | published as | runtime needs |
+|---|---|---|---|---|
+| `pf-service` | CPU-only | downloads on first start | `:vX.Y.Z-cpu` | none beyond the container |
+| `pf-service-cu130` | CUDA 13.0 | downloads on first start | `:vX.Y.Z-cu130` | nvidia GPU + nvidia-container-toolkit |
+| `pf-service-baked` | CPU-only | shipped inside image | local only | none beyond the container |
+| `pf-service-baked-cu130` | CUDA 13.0 | shipped inside image | local only | nvidia GPU + nvidia-container-toolkit |
+
+#### Fake-llm (`fake-llm`)
+
+OpenAI-compatible Chat Completions server backed by a YAML rules file
+(see `services/fake_llm/README.md`). Used by the test recipes and
+`scripts/cli.sh --llm-backend fake-llm` to exercise the LLM-detector
+path deterministically without an actual LLM. **Local-build only** —
+`scripts/build-image.sh -t fake-llm`. Not for production.
+
+#### Why some flavours aren't published
+
+CI publishes the variants most operators pull. The local-only set is:
+
+- **Baked-model variants** (`pf-baked`, `pf-service-baked`,
+  `pf-service-baked-cu130`) — multi-GB images that store indefinitely
+  on GHCR for what's usually a build-once artifact. A runtime-download
+  image with a persistent HF cache volume gets you to the same place
+  after one cold start, so the registry mass isn't worth it. Build with
+  `scripts/build-image.sh -t pf-baked` (etc.) when you actually need them.
+- **`fake-llm`** — a test/dev tool with no place in a production
+  registry. Operators who need it for their own CI typically build
+  once into their own infra registry.
 
 (CPU sizes assume the default CPU-only PyTorch build. CUDA wheels add
 ~2 GB on top — that's roughly how much `nvidia-cuda-runtime`,
