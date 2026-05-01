@@ -128,6 +128,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Interactive menu when no -t given ────────────────────────────────────────
+# Indexed 1..N so the prompt text and the choice-lookup share one
+# source of truth — keeps the two from drifting when a flavour is
+# added or reordered. The 'a' alias for "all" lives below as a
+# special case (no number).
+declare -a MENU_FLAVOURS=(
+  [1]="slim"
+  [2]="pf"
+  [3]="pf-baked"
+  [4]="pf-service"
+  [5]="pf-service-baked"
+  [6]="pf-service-cu130"
+  [7]="pf-service-baked-cu130"
+  [8]="gliner-service"
+  [9]="gliner-service-baked"
+  [10]="gliner-service-cu130"
+  [11]="gliner-service-baked-cu130"
+  [12]="fake-llm"
+)
+
 if [[ -z "$TYPE" ]]; then
   say ""
   say "Which image flavour do you want to build?"
@@ -146,23 +165,34 @@ if [[ -z "$TYPE" ]]; then
   say "  ${c_grn}12)${c_rst} fake-llm                   companion test backend ${c_dim}(deterministic LLM)${c_rst}"
   say "  ${c_grn} a)${c_rst} all                        build every CPU non-experimental flavour ${c_dim}(skips CUDA + gliner)${c_rst}"
   say ""
-  read -r -p "Choose [1-12/a, default 1]: " choice || true
-  case "${choice:-1}" in
-    1)   TYPE="slim" ;;
-    2)   TYPE="pf" ;;
-    3)   TYPE="pf-baked" ;;
-    4)   TYPE="pf-service" ;;
-    5)   TYPE="pf-service-baked" ;;
-    6)   TYPE="pf-service-cu130" ;;
-    7)   TYPE="pf-service-baked-cu130" ;;
-    8)   TYPE="gliner-service" ;;
-    9)   TYPE="gliner-service-baked" ;;
-    10)  TYPE="gliner-service-cu130" ;;
-    11)  TYPE="gliner-service-baked-cu130" ;;
-    12)  TYPE="fake-llm" ;;
-    a|A) TYPE="all" ;;
-    *) err "Invalid choice."; exit 1 ;;
-  esac
+  read -r -p "Choose [1-12/a, comma-separated for multiple e.g. 1,4,8, default 1]: " choice || true
+  choice="${choice:-1}"
+
+  # Translate the comma-separated menu input (e.g. "1,4,8") into the
+  # comma-joined flavour-name form (e.g. "slim,pf-service,gliner-service")
+  # the existing -t parsing below already handles. A single token works
+  # exactly as before.
+  declare -a _menu_flavours=()
+  IFS=',' read -ra _menu_tokens <<< "$choice"
+  for raw in "${_menu_tokens[@]}"; do
+    tok="${raw#"${raw%%[![:space:]]*}"}"   # ltrim
+    tok="${tok%"${tok##*[![:space:]]}"}"   # rtrim
+    [[ -z "$tok" ]] && continue
+    if [[ "$tok" == "a" || "$tok" == "A" ]]; then
+      _menu_flavours+=("all")
+    elif [[ "$tok" =~ ^[0-9]+$ ]] && [[ -n "${MENU_FLAVOURS[$tok]:-}" ]]; then
+      _menu_flavours+=("${MENU_FLAVOURS[$tok]}")
+    else
+      err "Invalid choice: '$tok'."
+      exit 1
+    fi
+  done
+  if [[ ${#_menu_flavours[@]} -eq 0 ]]; then
+    err "No valid choices."
+    exit 1
+  fi
+  TYPE="$(IFS=,; echo "${_menu_flavours[*]}")"
+  unset _menu_tokens _menu_flavours
 fi
 
 # Comma-separated TYPE → list of flavours. One value works exactly as
