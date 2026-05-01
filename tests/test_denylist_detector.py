@@ -327,22 +327,21 @@ async def test_pipeline_uses_denylist_alongside_regex(
         encoding="utf-8",
     )
 
-    # Wire DENYLIST_PATH into the module-level config so a freshly-built
-    # Pipeline sees it. The Config dataclass is frozen at import; we
-    # rebuild it via a SimpleNamespace shim and patch the references.
+    # Wire DENYLIST_PATH into the denylist detector's CONFIG so a
+    # freshly-built Pipeline sees it. Detector_mode lives on the central
+    # Config; denylist's own fields live on deny_mod.CONFIG.
+    from dataclasses import replace
     import anonymizer_guardrail.config as cfg_mod
     import anonymizer_guardrail.pipeline as pipeline_mod
 
-    new_cfg = SimpleNamespace(
-        **{**cfg_mod.config.__dict__, "denylist_path": str(p),
-           "detector_mode": "denylist,regex"},
+    new_central_cfg = SimpleNamespace(
+        **{**cfg_mod.config.__dict__, "detector_mode": "denylist,regex"},
     )
-    monkeypatch.setattr(cfg_mod, "config", new_cfg)
-    monkeypatch.setattr(pipeline_mod, "config", new_cfg)
-    # The denylist module reads from its own `from ..config import config`
-    # binding, so we have to patch that too AND reload its module-level
-    # cache so the new path is picked up.
-    monkeypatch.setattr(deny_mod, "config", new_cfg)
+    monkeypatch.setattr(cfg_mod, "config", new_central_cfg)
+    monkeypatch.setattr(pipeline_mod, "config", new_central_cfg)
+    # Patch the per-detector CONFIG and reload its module-level cache so
+    # the new path is picked up at the next Pipeline construction.
+    monkeypatch.setattr(deny_mod, "CONFIG", replace(deny_mod.CONFIG, path=str(p)))
     monkeypatch.setattr(deny_mod, "_LOADED_ENTRIES", deny_mod._load_entries())
     monkeypatch.setattr(
         deny_mod, "_DEFAULT_INDEX",
@@ -503,21 +502,21 @@ def test_aho_word_boundary_helper_allows_at_string_boundaries() -> None:
 
 def test_invalid_backend_value_crashes_at_import(monkeypatch) -> None:
     """An unknown DENYLIST_BACKEND value must surface immediately at boot
-    so a typo doesn't ship with a silent regex fallback. Re-import the
-    detector module against a fake config (the real Config dataclass is
-    frozen, so we swap the binding the module reads from)."""
+    so a typo doesn't ship with a silent regex fallback. After the
+    config-by-detector refactor, DenylistConfig reads DENYLIST_BACKEND
+    directly from os.environ at instantiation, so we set the env var
+    and re-import the module (forcing a fresh DenylistConfig + the
+    module-top backend validation)."""
     import importlib
     import sys
-    from types import SimpleNamespace
-    import anonymizer_guardrail.config as cfg_mod
+    import anonymizer_guardrail.detector
 
-    fake_cfg = SimpleNamespace(
-        denylist_path="",
-        denylist_registry="",
-        denylist_backend="bogus",
-    )
-    monkeypatch.setattr(cfg_mod, "config", fake_cfg)
+    monkeypatch.setenv("DENYLIST_BACKEND", "bogus")
     sys.modules.pop("anonymizer_guardrail.detector.denylist", None)
+    # detector/__init__.py imports the SPEC from denylist; it's also
+    # cached in sys.modules and would shadow our re-import. Clear it
+    # (and restore the parent attribute after).
+    original_pkg_attr = anonymizer_guardrail.detector.denylist
     try:
         with pytest.raises(RuntimeError, match="Invalid DENYLIST_BACKEND"):
             importlib.import_module("anonymizer_guardrail.detector.denylist")
@@ -528,6 +527,9 @@ def test_invalid_backend_value_crashes_at_import(monkeypatch) -> None:
         sys.modules.pop("anonymizer_guardrail.detector.denylist", None)
         monkeypatch.undo()
         importlib.import_module("anonymizer_guardrail.detector.denylist")
+        # Restore the parent-package attribute (see test_module_import in
+        # test_privacy_filter.py for the same restoration rationale).
+        anonymizer_guardrail.detector.denylist = original_pkg_attr
 
 
 def test_aho_backend_without_pyahocorasick_fails_with_clear_message(

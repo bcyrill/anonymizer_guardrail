@@ -22,12 +22,45 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import sys
+from dataclasses import dataclass
 from typing import Any
 
-from .base import Match
+from ..config import _env_bool, _env_int
+from .base import Detector, Match
+from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.privacy_filter")
+
+
+# ── Per-detector config ───────────────────────────────────────────────────
+# Covers BOTH the in-process variant (PrivacyFilterDetector) and the
+# remote variant (RemotePrivacyFilterDetector) — they share a
+# DETECTOR_MODE token, fail-closed flag, and concurrency cap.
+@dataclass(frozen=True)
+class PrivacyFilterConfig:
+    # Empty (default) → DETECTOR_MODE=privacy_filter loads the model
+    # in-process. Set to an HTTP URL → the detector becomes
+    # RemotePrivacyFilterDetector and posts to {URL}/detect on every
+    # request. The standalone privacy-filter-service container (see
+    # services/privacy_filter/) is the canonical other end.
+    url: str = os.getenv("PRIVACY_FILTER_URL", "").strip()
+    # Per-call timeout on the remote detector's HTTP requests.
+    timeout_s: int = _env_int("PRIVACY_FILTER_TIMEOUT_S", 30)
+    # Failure mode for the privacy_filter detector. true (default) →
+    # block the request on PF outage; false → degrade to no PF matches
+    # and proceed with the other detectors. Independent from
+    # llm.CONFIG.fail_closed and gliner_pii.CONFIG.fail_closed.
+    fail_closed: bool = _env_bool("PRIVACY_FILTER_FAIL_CLOSED", True)
+    # Max concurrent PF detector calls (in-process AND remote).
+    # Independent from LLM_MAX_CONCURRENCY: a saturated PF queue
+    # shouldn't reduce LLM headroom or vice versa.
+    max_concurrency: int = _env_int("PRIVACY_FILTER_MAX_CONCURRENCY", 10)
+
+
+CONFIG = PrivacyFilterConfig()
 
 # Map the model's BIO-decoded labels to our ENTITY_TYPES. Source:
 # https://huggingface.co/openai/privacy-filter — labels described in the
@@ -197,4 +230,61 @@ class PrivacyFilterDetector:
         return out
 
 
-__all__ = ["PrivacyFilterDetector"]
+def _privacy_filter_factory() -> Detector:
+    """Pick in-process or remote based on PRIVACY_FILTER_URL.
+
+    Empty (default) → in-process PrivacyFilterDetector (torch +
+    transformers loaded in this container; image must be `pf` /
+    `pf-baked`). URL set → RemotePrivacyFilterDetector talks to a
+    standalone privacy-filter-service over HTTP and the slim image
+    is sufficient.
+
+    Evaluated at instantiation, not at module import, so a test that
+    monkeypatches `privacy_filter.CONFIG` (e.g. via `dataclasses.replace`)
+    then rebuilds the pipeline picks up the new value. Lives here
+    (rather than in pipeline.py) so the SPEC declaration below can
+    reference it without pipeline.py needing to know about either
+    concrete class.
+    """
+    # Lazy import — pulling RemotePrivacyFilterDetector at module top
+    # would create a meaningless edge in the import graph for the
+    # in-process-only deployments. The remote class is small and
+    # imports only httpx, so the cost is negligible when actually used.
+    if CONFIG.url:
+        from .remote_privacy_filter import RemotePrivacyFilterDetector
+        return RemotePrivacyFilterDetector()
+    return PrivacyFilterDetector()
+
+
+# A single SPEC covers both the in-process and remote variants —
+# they share a DETECTOR_MODE token (`privacy_filter`), a fail-closed
+# flag (PRIVACY_FILTER_FAIL_CLOSED), a stats prefix (`pf`), and the
+# typed error (PrivacyFilterUnavailableError, raised only by the
+# remote variant). The factory above picks which class to construct.
+def _import_pf_unavailable_error() -> type[Exception]:
+    """Lazy import to avoid pulling httpx + the remote module just to
+    set up the SPEC. The error class is defined in remote_privacy_filter
+    because that's where it's raised."""
+    from .remote_privacy_filter import PrivacyFilterUnavailableError
+    return PrivacyFilterUnavailableError
+
+
+SPEC = DetectorSpec(
+    name="privacy_filter",
+    factory=_privacy_filter_factory,
+    module=sys.modules[__name__],
+    has_semaphore=True,
+    # Stats prefix shortens to "pf" because operators have Grafana
+    # queries pinned to that name from before the registry existed.
+    # Changing it would silently break those queries.
+    stats_prefix="pf",
+    unavailable_error=_import_pf_unavailable_error(),
+    blocked_reason=(
+        "Anonymization privacy-filter is unreachable; request "
+        "blocked to prevent unredacted data from reaching the "
+        "upstream model."
+    ),
+)
+
+
+__all__ = ["PrivacyFilterDetector", "SPEC"]

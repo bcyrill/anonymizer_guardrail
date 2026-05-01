@@ -8,6 +8,14 @@ Wires the detectors, surrogate generator, and vault together. Two entry points:
 
   * deanonymize(texts, call_id) → restored texts. Looks up the mapping and
     substitutes surrogates back to originals.
+
+Detector wiring is driven by `detector.REGISTERED_SPECS` — a list of
+`DetectorSpec` constants, one per DETECTOR_MODE token. The pipeline
+iterates the registry to build its semaphores, in-flight counters,
+factory dispatch table, exception handlers, and `/health` stats
+payload. Adding a new detector is a one-line append to the registry
+plus the spec definition in the detector's own module — no edits in
+this file. See `detector/spec.py` for the descriptor shape.
 """
 
 from __future__ import annotations
@@ -19,84 +27,24 @@ from typing import Callable, Iterable
 
 from .api import Overrides
 from .config import config
+from .detector import (
+    REGISTERED_SPECS,
+    SPECS_BY_NAME,
+    SPECS_WITH_SEMAPHORE,
+    TYPED_UNAVAILABLE_ERRORS,
+)
 from .detector.base import Detector, Match
-from .detector.denylist import DenylistDetector
-from .detector.llm import LLMDetector, LLMUnavailableError
-from .detector.privacy_filter import PrivacyFilterDetector
-from .detector.regex import RegexDetector
-from .detector.remote_gliner_pii import (
-    GlinerPIIUnavailableError,
-    RemoteGlinerPIIDetector,
-)
-from .detector.remote_privacy_filter import (
-    PrivacyFilterUnavailableError,
-    RemotePrivacyFilterDetector,
-)
 from .surrogate import SurrogateGenerator
 from .vault import Vault
 
 log = logging.getLogger("anonymizer.pipeline")
 
 
-def _privacy_filter_factory() -> Detector:
-    """Pick in-process or remote based on PRIVACY_FILTER_URL.
-
-    Empty (default) → in-process PrivacyFilterDetector (torch +
-    transformers loaded in this container; image must be `pf` /
-    `pf-baked`). URL set → RemotePrivacyFilterDetector talks to a
-    standalone privacy-filter-service over HTTP and the slim image
-    is sufficient.
-
-    The branch is evaluated at instantiation, not at module import,
-    so a test that monkeypatches `config.privacy_filter_url` then
-    rebuilds the pipeline picks up the new value.
-    """
-    if config.privacy_filter_url:
-        return RemotePrivacyFilterDetector()
-    return PrivacyFilterDetector()
-
-
-def _gliner_pii_factory() -> Detector:
-    """Construct the gliner-pii detector, requiring GLINER_PII_URL.
-
-    Unlike privacy_filter, there is no in-process fallback — the
-    gliner library + ~570M weights would defeat the slim guardrail.
-    An empty URL therefore raises at construction time so an operator
-    who set DETECTOR_MODE=...,gliner_pii without setting GLINER_PII_URL
-    sees a clear error at boot rather than the request-time confusion
-    of a silently-skipped detector.
-    """
-    if not config.gliner_pii_url:
-        raise RuntimeError(
-            "DETECTOR_MODE includes 'gliner_pii' but GLINER_PII_URL is unset. "
-            "Deploy the gliner-pii-service container (see services/gliner_pii/) "
-            "and set GLINER_PII_URL=http://<host>:<port>."
-        )
-    return RemoteGlinerPIIDetector()
-
-
-_DETECTOR_FACTORIES: dict[str, Callable[[], Detector]] = {
-    "regex":          RegexDetector,
-    "llm":            LLMDetector,
-    # Literal-string match against an operator-supplied YAML denylist.
-    # Loads with no entries when DENYLIST_PATH is unset, so registering
-    # it here unconditionally is safe.
-    "denylist":       DenylistDetector,
-    # Dispatches between in-process (torch in this container) and
-    # remote (HTTP to a privacy-filter-service) at instantiation time.
-    "privacy_filter": _privacy_filter_factory,
-    # Remote-only — no in-process variant. Crashes loud at boot if the
-    # URL isn't set, since silently skipping it would mislead operators
-    # who deliberately enabled it in DETECTOR_MODE.
-    "gliner_pii":     _gliner_pii_factory,
-}
-
-
 def _build_detectors() -> list[Detector]:
     """Parse DETECTOR_MODE as a comma-separated list of detector names.
 
     Order is preserved — it determines the order detectors run in (parallel
-    via asyncio.gather, but `_dedup` keeps first-seen entity_type, so a
+    via TaskGroup, but `_dedup` keeps first-seen entity_type, so a
     duplicate match will adopt the type from the detector listed earlier).
     Whitespace around names is tolerated; duplicates are collapsed with
     a warning.
@@ -104,6 +52,9 @@ def _build_detectors() -> list[Detector]:
     The historical `both` value is no longer accepted — use `regex,llm`.
     Unknown names log a warning and are skipped; if nothing valid remains,
     we fall back to regex-only so the service still boots.
+
+    Factory lookup goes via the registry — the per-detector `SPEC.factory`
+    is the single source of truth for how to construct a given token.
     """
     raw = config.detector_mode or ""
     names = [n.strip() for n in raw.split(",") if n.strip()]
@@ -120,22 +71,22 @@ def _build_detectors() -> list[Detector]:
         if name in seen:
             log.warning("DETECTOR_MODE: duplicate detector %r — collapsed", name)
             continue
-        factory = _DETECTOR_FACTORIES.get(name)
-        if factory is None:
+        spec = SPECS_BY_NAME.get(name)
+        if spec is None:
             log.warning(
                 "DETECTOR_MODE: unknown detector %r (valid names: %s)",
-                name, ", ".join(sorted(_DETECTOR_FACTORIES)),
+                name, ", ".join(sorted(SPECS_BY_NAME)),
             )
             continue
         seen.add(name)
-        detectors.append(factory())
+        detectors.append(spec.factory())
 
     if not detectors:
         log.warning(
             "DETECTOR_MODE=%r produced no valid detectors — falling back to regex.",
             raw,
         )
-        detectors = [RegexDetector()]
+        detectors = [SPECS_BY_NAME["regex"].factory()]
     return detectors
 
 
@@ -175,57 +126,62 @@ class Pipeline:
         self._detectors: list[Detector] = _build_detectors()
         self._surrogates = SurrogateGenerator()
         self._vault = Vault()
-        self._llm_semaphore = asyncio.Semaphore(config.llm_max_concurrency)
-        # Privacy-filter shares the same throttling rationale as LLM:
-        # in-process inference is CPU/GPU-bound, remote inference is one
-        # HTTP call per text and a chatty request can fan out far past
-        # the service's safe concurrency. Independent semaphore so a
-        # saturated PF queue doesn't reduce LLM headroom (or vice versa).
-        self._pf_semaphore = asyncio.Semaphore(config.privacy_filter_max_concurrency)
-        # GLiNER-PII gets the same independent semaphore for the same
-        # reason — its inference service has finite worker capacity and
-        # a chatty request shouldn't be able to drown it. Sharing a
-        # semaphore with PF would couple their failure modes (a slow
-        # PF queue would starve gliner of slots), which we don't want.
-        self._gliner_pii_semaphore = asyncio.Semaphore(config.gliner_pii_max_concurrency)
-        # In-flight call counters. We increment/decrement around the
-        # detect() call rather than reading Semaphore._value (private)
-        # because the asyncio.Semaphore API doesn't expose a stable
-        # "current waiters" attribute. Single-threaded asyncio means
-        # plain int mutation is safe between await points.
-        self._llm_in_flight = 0
-        self._pf_in_flight = 0
-        self._gliner_pii_in_flight = 0
+
+        # Concurrency caps and in-flight counters live in dicts keyed
+        # by spec name — one entry per detector that opted into a
+        # semaphore. Reading via `spec.config.max_concurrency` so test
+        # monkeypatches of the detector's CONFIG take effect on
+        # Pipeline rebuild.
+        self._semaphores: dict[str, asyncio.Semaphore] = {
+            spec.name: asyncio.Semaphore(spec.config.max_concurrency)
+            for spec in SPECS_WITH_SEMAPHORE
+        }
+        # Per-detector in-flight counters. Single-threaded asyncio means
+        # plain int mutation between await points is safe — no lock
+        # needed. Surface via `stats()` for the /health probe.
+        self._inflight_counters: dict[str, int] = {
+            spec.name: 0 for spec in SPECS_WITH_SEMAPHORE
+        }
+
+        # Build the startup log line dynamically so adding a detector
+        # doesn't require touching the format string. Keeps the message
+        # operator-readable (`fail_closed=…` per detector, `max_conc=…`
+        # per detector).
+        fc_parts = [
+            f"{spec.name}_fail_closed={spec.config.fail_closed}"
+            for spec in REGISTERED_SPECS
+            if spec.unavailable_error is not None
+        ]
+        cap_parts = [
+            f"{spec.name}_max_conc={spec.config.max_concurrency}"
+            for spec in SPECS_WITH_SEMAPHORE
+        ]
         log.info(
-            "Pipeline ready — detectors=[%s], vault_ttl=%ds, "
-            "llm_fail_closed=%s, pf_fail_closed=%s, gliner_pii_fail_closed=%s, "
-            "llm_max_concurrency=%d, pf_max_concurrency=%d, "
-            "gliner_pii_max_concurrency=%d",
+            "Pipeline ready — detectors=[%s], vault_ttl=%ds, %s, %s",
             ", ".join(d.name for d in self._detectors),
             config.vault_ttl_s,
-            config.llm_fail_closed,
-            config.privacy_filter_fail_closed,
-            config.gliner_pii_fail_closed,
-            config.llm_max_concurrency,
-            config.privacy_filter_max_concurrency,
-            config.gliner_pii_max_concurrency,
+            ", ".join(fc_parts),
+            ", ".join(cap_parts),
         )
 
     def stats(self) -> dict[str, int]:
         """Snapshot of pipeline-internal counters for the /health probe.
         All reads are cheap and lock-free."""
         cache_size, cache_max = self._surrogates.cache_stats()
-        return {
+        out: dict[str, int] = {
             "vault_size": self._vault.size(),
             "surrogate_cache_size": cache_size,
             "surrogate_cache_max": cache_max,
-            "llm_in_flight": self._llm_in_flight,
-            "llm_max_concurrency": config.llm_max_concurrency,
-            "pf_in_flight": self._pf_in_flight,
-            "pf_max_concurrency": config.privacy_filter_max_concurrency,
-            "gliner_pii_in_flight": self._gliner_pii_in_flight,
-            "gliner_pii_max_concurrency": config.gliner_pii_max_concurrency,
         }
+        # Per-detector concurrency snapshot. Key names use the spec's
+        # `stats_prefix` (e.g. `pf_in_flight`) rather than the raw
+        # detector name (`privacy_filter_in_flight`) for legacy
+        # compatibility — operators have Grafana dashboards pinned to
+        # the short names.
+        for spec in SPECS_WITH_SEMAPHORE:
+            out[f"{spec.stats_prefix}_in_flight"] = self._inflight_counters[spec.name]
+            out[f"{spec.stats_prefix}_max_concurrency"] = spec.config.max_concurrency
+        return out
 
     @property
     def vault(self) -> Vault:
@@ -283,160 +239,89 @@ class Pipeline:
         llm)` instead of `regex + llm`. Cheap regardless — and if a second
         slow detector ever gets added, the win compounds.
 
-        The LLM concurrency semaphore is acquired ONLY around LLM detector
-        calls — throttling regex would just serialize work that wasn't a
-        problem. Process-wide cap protects the upstream LLM service from
-        thundering-herd.
+        Concurrency caps (LLM, privacy_filter, gliner_pii) are independent
+        per-detector semaphores keyed by spec name; throttling one doesn't
+        starve the others. CPU-cheap detectors (regex, denylist) skip
+        gating entirely.
 
         Per-detector exceptions are handled inside the inner runner so one
-        detector crashing doesn't poison the gather. LLMUnavailableError
-        still propagates under LLM_FAIL_CLOSED, in which case asyncio
-        cancels the other in-flight detectors — the right behaviour
-        because we're about to BLOCK the request anyway.
-
-        `overrides` is plumbed through to the detectors that care:
-        regex picks up the overlap-strategy override, LLM picks up the
-        model override.
+        detector crashing doesn't poison the gather. Typed unavailable
+        errors still propagate under fail-closed — the TaskGroup then
+        cancels the in-flight siblings (saving wasted work since the
+        request is about to BLOCK) and re-raises the typed error so
+        main.py's BLOCKED handler matches.
         """
         active = self._resolve_active_detectors(overrides)
 
         async def _run(det: Detector) -> list[Match]:
+            spec = SPECS_BY_NAME[det.name]
+            kwargs = spec.prepare_call_kwargs(overrides, api_key)
             try:
-                if isinstance(det, LLMDetector):
-                    # Only the LLM layer takes an api_key (for forwarded
-                    # virtual-key auth). Regex doesn't talk to any backend.
-                    async with self._llm_semaphore:
-                        self._llm_in_flight += 1
+                if spec.has_semaphore:
+                    # Gate the call behind the per-spec semaphore. The
+                    # in-flight counter increment is the first statement
+                    # after acquisition — no statement between acquire
+                    # and `try` can raise, so the finally always fires.
+                    async with self._semaphores[spec.name]:
+                        self._inflight_counters[spec.name] += 1
                         try:
-                            return await det.detect(
-                                text,
-                                api_key=api_key,
-                                model=overrides.llm_model,
-                                prompt_name=overrides.llm_prompt,
-                            )
+                            return await det.detect(text, **kwargs)
                         finally:
-                            self._llm_in_flight -= 1
-                if isinstance(det, RegexDetector):
-                    return await det.detect(
-                        text,
-                        overlap_strategy=overrides.regex_overlap_strategy,
-                        patterns_name=overrides.regex_patterns,
+                            self._inflight_counters[spec.name] -= 1
+                return await det.detect(text, **kwargs)
+            except Exception as exc:
+                # Single error path. Two cases:
+                #   1. Typed unavailable error → fail-closed re-raises
+                #      so main.py BLOCKs; fail-open logs + degrades to [].
+                #   2. Anything else (programmer error, transient bug)
+                #      under fail-closed → re-wrap as the typed error so
+                #      the BLOCKED path fires. The asymmetry is on
+                #      purpose: an operator who set fail-closed wanted
+                #      to BLOCK on any problem from this detector, not
+                #      just availability ones.
+                if (
+                    spec.unavailable_error is not None
+                    and isinstance(exc, spec.unavailable_error)
+                ):
+                    if spec.config.fail_closed:
+                        raise
+                    log.warning(
+                        "%s detector unavailable, proceeding fail-open: %s",
+                        spec.name, exc,
                     )
-                if isinstance(det, DenylistDetector):
-                    return await det.detect(
-                        text, denylist_name=overrides.denylist,
-                    )
-                # Privacy-filter (in-process or remote) goes through its
-                # own concurrency cap. In-process inference is CPU/GPU-
-                # bound and benefits from serialization the same way LLM
-                # does; remote PF is one HTTP call per text and the
-                # service has finite worker capacity, so unbounded fan-
-                # out from a chatty request is the same thundering-herd
-                # the LLM cap was added to prevent.
-                if isinstance(det, (PrivacyFilterDetector, RemotePrivacyFilterDetector)):
-                    async with self._pf_semaphore:
-                        self._pf_in_flight += 1
-                        try:
-                            return await det.detect(text)
-                        finally:
-                            self._pf_in_flight -= 1
-                # GLiNER-PII gets the same treatment as remote PF for
-                # the same reason — its inference service has finite
-                # worker capacity that a chatty request shouldn't be
-                # able to drown.
-                if isinstance(det, RemoteGlinerPIIDetector):
-                    async with self._gliner_pii_semaphore:
-                        self._gliner_pii_in_flight += 1
-                        try:
-                            return await det.detect(text)
-                        finally:
-                            self._gliner_pii_in_flight -= 1
-                return await det.detect(text)
-            except LLMUnavailableError as exc:
-                if config.llm_fail_closed:
-                    raise
-                log.warning("LLM detector unavailable, proceeding fail-open: %s", exc)
-                return []
-            except PrivacyFilterUnavailableError as exc:
-                if config.privacy_filter_fail_closed:
-                    raise
-                log.warning(
-                    "Privacy-filter detector unavailable, proceeding fail-open: %s", exc,
-                )
-                return []
-            except GlinerPIIUnavailableError as exc:
-                if config.gliner_pii_fail_closed:
-                    raise
-                log.warning(
-                    "GLiNER-PII detector unavailable, proceeding fail-open: %s", exc,
-                )
-                return []
-            except Exception as exc:  # defensive: a buggy detector shouldn't kill us
+                    return []
+
                 log.exception("Detector %s crashed: %s", det.name, exc)
-                # Asymmetry on purpose: a buggy regex pattern can degrade to
-                # empty matches without taking the request down — the LLM
-                # layer still runs. But an unexpected LLM failure under
-                # LLM_FAIL_CLOSED is not safely degradable; if we silently
-                # returned [] here, an operator who set LLM_FAIL_CLOSED=true
-                # specifically to BLOCK on any LLM problem would instead
-                # see the request quietly proceed with regex-only redaction.
-                # Re-raise as LLMUnavailableError so the BLOCKED path fires.
-                if isinstance(det, LLMDetector) and config.llm_fail_closed:
-                    raise LLMUnavailableError(
-                        f"Unexpected failure in LLM detector "
-                        f"({type(exc).__name__}): {exc}"
-                    ) from exc
-                # Same asymmetry for the privacy-filter detector — both
-                # in-process (PrivacyFilterDetector) and remote
-                # (RemotePrivacyFilterDetector). An operator who set
-                # PRIVACY_FILTER_FAIL_CLOSED=true wants to BLOCK on any
-                # PF problem, including unexpected crashes from the
-                # in-process pipeline (torch OOM, tokenizer drift, etc.)
-                # that wouldn't otherwise raise our typed error.
                 if (
-                    isinstance(det, (PrivacyFilterDetector, RemotePrivacyFilterDetector))
-                    and config.privacy_filter_fail_closed
+                    spec.unavailable_error is not None
+                    and spec.config.fail_closed
                 ):
-                    raise PrivacyFilterUnavailableError(
-                        f"Unexpected failure in privacy-filter detector "
+                    raise spec.unavailable_error(
+                        f"Unexpected failure in {spec.name} detector "
                         f"({type(exc).__name__}): {exc}"
                     ) from exc
-                # Same asymmetry for the gliner-pii detector. Operator
-                # who set GLINER_PII_FAIL_CLOSED=true wants to BLOCK on
-                # any unexpected crash from the remote service path,
-                # not silently degrade.
-                if (
-                    isinstance(det, RemoteGlinerPIIDetector)
-                    and config.gliner_pii_fail_closed
-                ):
-                    raise GlinerPIIUnavailableError(
-                        f"Unexpected failure in gliner-pii detector "
-                        f"({type(exc).__name__}): {exc}"
-                    ) from exc
+                # Detectors with no availability concept (regex,
+                # denylist) just degrade to []. A buggy regex pattern
+                # shouldn't take the request down — the LLM/PF/etc.
+                # layers still run and provide coverage.
                 return []
 
         # TaskGroup (vs asyncio.gather) cancels in-flight sibling tasks
-        # the moment one detector raises. Matters under fail-closed: when
-        # the LLM detector raises LLMUnavailableError we're going to BLOCK
-        # the whole request, and a still-running privacy_filter call (which
-        # can take hundreds of ms locally or seconds remotely) is wasted
-        # work. gather() left the siblings running until completion and
-        # discarded their results; TaskGroup short-circuits.
+        # the moment one detector raises a fail-closed error. Matters
+        # because the request is about to BLOCK; a still-running
+        # privacy_filter call (hundreds of ms locally, seconds remotely)
+        # would just be wasted work. gather() left siblings running
+        # until completion and discarded their results.
         #
         # The except* unwrap re-raises the first matching typed exception
-        # so main.py's `except LLMUnavailableError / PrivacyFilterUnavailableError`
-        # clauses still match — they wouldn't catch the BaseExceptionGroup
-        # TaskGroup raises by default. `_run` is the only place in this
-        # function that lets typed exceptions escape, so the group will
-        # contain at most these two types.
+        # so main.py's typed-error handler matches — it wouldn't catch
+        # the BaseExceptionGroup TaskGroup raises by default. The tuple
+        # comes from the registry, so adding a new detector with its
+        # own typed error doesn't require an edit here.
         try:
             async with asyncio.TaskGroup() as tg:
                 tasks = [tg.create_task(_run(d)) for d in active]
-        except* LLMUnavailableError as eg:
-            raise eg.exceptions[0] from None
-        except* PrivacyFilterUnavailableError as eg:
-            raise eg.exceptions[0] from None
-        except* GlinerPIIUnavailableError as eg:
+        except* TYPED_UNAVAILABLE_ERRORS as eg:
             raise eg.exceptions[0] from None
 
         results = [t.result() for t in tasks]

@@ -21,17 +21,25 @@ from anonymizer_guardrail.detector import llm as llm_mod
 from anonymizer_guardrail.detector.llm import LLMDetector, LLMUnavailableError
 
 
-def _fake_config(**overrides: object) -> SimpleNamespace:
-    base: dict[str, object] = dict(
-        llm_api_base="http://test",
-        llm_api_key="",
-        llm_model="test",
-        llm_timeout_s=5,
-        llm_max_chars=100,
-        llm_system_prompt_path="",
+from dataclasses import replace
+
+
+def _fake_config(**overrides: object) -> "llm_mod.LLMConfig":
+    """Build an LLMConfig from a small test-friendly baseline plus any
+    overrides. Tests apply via
+    `monkeypatch.setattr(llm_mod, "CONFIG", _fake_config(...))`.
+    Field names lost the `llm_` prefix when LLMConfig moved into the
+    detector module — overrides use the new names (e.g. `api_base`,
+    `system_prompt_path`, `max_chars`)."""
+    base = llm_mod.LLMConfig(
+        api_base="http://test",
+        api_key="",
+        model="test",
+        timeout_s=5,
+        max_chars=100,
+        system_prompt_path="",
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    return replace(base, **overrides) if overrides else base
 
 
 def _ok_response(entities: list[dict[str, str]]) -> MagicMock:
@@ -51,7 +59,7 @@ def _ok_response(entities: list[dict[str, str]]) -> MagicMock:
 
 @pytest.fixture
 def detector(monkeypatch: pytest.MonkeyPatch) -> LLMDetector:
-    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    monkeypatch.setattr(llm_mod, "CONFIG", _fake_config())
     return LLMDetector(
         api_base="http://test", api_key="", model="test", timeout_s=5
     )
@@ -204,7 +212,7 @@ def test_override_path_loads_custom_prompt(
     custom = tmp_path / "custom.md"
     custom.write_text("CUSTOM PROMPT CONTENTS", encoding="utf-8")
     monkeypatch.setattr(
-        llm_mod, "config", _fake_config(llm_system_prompt_path=str(custom))
+        llm_mod, "CONFIG", _fake_config(system_prompt_path=str(custom))
     )
 
     assert llm_mod._load_system_prompt() == "CUSTOM PROMPT CONTENTS"
@@ -216,7 +224,7 @@ def test_override_path_missing_file_raises_at_load(
     """Typos in LLM_SYSTEM_PROMPT_PATH should crash loudly, not fall back
     silently to the bundled prompt — operator intent is unambiguous."""
     monkeypatch.setattr(
-        llm_mod, "config", _fake_config(llm_system_prompt_path="/no/such/file.md")
+        llm_mod, "CONFIG", _fake_config(system_prompt_path="/no/such/file.md")
     )
     with pytest.raises(RuntimeError, match="could not be read"):
         llm_mod._load_system_prompt()
@@ -230,7 +238,7 @@ def test_empty_prompt_file_rejected(
     empty = tmp_path / "empty.md"
     empty.write_text("   \n\n  \t\n", encoding="utf-8")
     monkeypatch.setattr(
-        llm_mod, "config", _fake_config(llm_system_prompt_path=str(empty))
+        llm_mod, "CONFIG", _fake_config(system_prompt_path=str(empty))
     )
     with pytest.raises(RuntimeError, match="empty"):
         llm_mod._load_system_prompt()
@@ -242,7 +250,7 @@ def test_bundled_prefix_resolves_to_packaged_prompt(
     """`bundled:llm_pentest.md` should load the file shipped under
     prompts/, regardless of the Python install location."""
     monkeypatch.setattr(
-        llm_mod, "config", _fake_config(llm_system_prompt_path="bundled:llm_pentest.md")
+        llm_mod, "CONFIG", _fake_config(system_prompt_path="bundled:llm_pentest.md")
     )
     text = llm_mod._load_system_prompt()
     # Stable phrase from the DontFeedTheAI prompt.
@@ -253,7 +261,7 @@ def test_bundled_prefix_unknown_name_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        llm_mod, "config", _fake_config(llm_system_prompt_path="bundled:does_not_exist.md")
+        llm_mod, "CONFIG", _fake_config(system_prompt_path="bundled:does_not_exist.md")
     )
     with pytest.raises(RuntimeError, match="not found in bundled prompts"):
         llm_mod._load_system_prompt()
@@ -264,7 +272,7 @@ def test_bundled_prefix_rejects_path_separators(
 ) -> None:
     """`bundled:` is for bare filenames only — disallow path traversal."""
     monkeypatch.setattr(
-        llm_mod, "config", _fake_config(llm_system_prompt_path="bundled:../etc/passwd")
+        llm_mod, "CONFIG", _fake_config(system_prompt_path="bundled:../etc/passwd")
     )
     with pytest.raises(RuntimeError, match="bare filename"):
         llm_mod._load_system_prompt()
@@ -274,7 +282,7 @@ async def test_per_call_api_key_overrides_configured_key(
     monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
 ) -> None:
     """A per-call api_key (forwarded user key) wins over the configured one."""
-    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    monkeypatch.setattr(llm_mod, "CONFIG", _fake_config())
     detector = LLMDetector(
         api_base="http://test", api_key="configured-key", model="test", timeout_s=5
     )
@@ -290,7 +298,7 @@ async def test_per_call_api_key_none_falls_back_to_configured(
     monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
 ) -> None:
     """No forwarded key → configured key is still used."""
-    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    monkeypatch.setattr(llm_mod, "CONFIG", _fake_config())
     detector = LLMDetector(
         api_base="http://test", api_key="configured-key", model="test", timeout_s=5
     )
@@ -306,7 +314,7 @@ async def test_no_key_anywhere_omits_authorization_header(
     monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
 ) -> None:
     """Both keys empty → no Authorization header sent (some local backends need this)."""
-    monkeypatch.setattr(llm_mod, "config", _fake_config())
+    monkeypatch.setattr(llm_mod, "CONFIG", _fake_config())
     detector = LLMDetector(
         api_base="http://test", api_key="", model="test", timeout_s=5
     )

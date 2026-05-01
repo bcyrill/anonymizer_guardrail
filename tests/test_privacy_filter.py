@@ -139,9 +139,9 @@ def test_load_pipeline_wraps_import_error(monkeypatch: pytest.MonkeyPatch) -> No
 def test_detector_registered_in_pipeline() -> None:
     """`privacy_filter` is a known detector name — DETECTOR_MODE can list
     it without falling through to the unknown-name warning path."""
-    from anonymizer_guardrail import pipeline as pipeline_mod
+    from anonymizer_guardrail.detector import SPECS_BY_NAME
 
-    assert "privacy_filter" in pipeline_mod._DETECTOR_FACTORIES
+    assert "privacy_filter" in SPECS_BY_NAME
 
 
 async def test_split_person_name_is_merged(mock_load: MagicMock) -> None:
@@ -270,8 +270,27 @@ def test_module_import_does_not_pull_transformers(
     """Importing the detector module on a slim install must NOT touch
     transformers — that's the whole point of the lazy-import design.
     Catches a regression where someone hoists the import to the top."""
+    import anonymizer_guardrail.detector as detector_pkg
+
+    # Capture the originals so we can restore them after the re-import.
+    # monkeypatch reverts `sys.modules` entries but does NOT restore the
+    # parent package's `.privacy_filter` attribute, which `import x.y`
+    # silently rebinds to the freshly-loaded module. Without restoring
+    # that attribute, later `from anonymizer_guardrail.detector import
+    # privacy_filter as pf` calls in OTHER test files would receive a
+    # detached module whose `config` attribute the test patched but
+    # whose factory still references the original module's globals —
+    # a silent split that surfaces as confusing failures downstream.
+    original_pf_module = sys.modules["anonymizer_guardrail.detector.privacy_filter"]
+    original_pf_attr = detector_pkg.privacy_filter
+
     monkeypatch.setitem(sys.modules, "transformers", None)
-    # Force a re-import to test cleanly.
     monkeypatch.delitem(sys.modules, "anonymizer_guardrail.detector.privacy_filter", raising=False)
-    # Should not raise.
-    import anonymizer_guardrail.detector.privacy_filter  # noqa: F401
+    try:
+        # Should not raise.
+        import anonymizer_guardrail.detector.privacy_filter  # noqa: F401
+    finally:
+        # Restore both the sys.modules entry and the parent-package
+        # attribute so other tests can reuse the original module.
+        sys.modules["anonymizer_guardrail.detector.privacy_filter"] = original_pf_module
+        detector_pkg.privacy_filter = original_pf_attr

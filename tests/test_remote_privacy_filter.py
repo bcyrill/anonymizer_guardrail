@@ -19,20 +19,27 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 import httpx
 import pytest
 
+from dataclasses import replace
+
+from anonymizer_guardrail.detector import privacy_filter as pf_mod
 from anonymizer_guardrail.detector import remote_privacy_filter as rpf_mod
+from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterConfig
 from anonymizer_guardrail.detector.remote_privacy_filter import (
     PrivacyFilterUnavailableError,
     RemotePrivacyFilterDetector,
 )
 
 
-def _fake_config(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(
-        privacy_filter_url="http://privacy-filter-service:8001",
-        privacy_filter_timeout_s=5,
+def _fake_config(**overrides: Any) -> PrivacyFilterConfig:
+    """Build a PrivacyFilterConfig with a small test-friendly baseline
+    plus per-test overrides. Field names lost the `privacy_filter_`
+    prefix when PrivacyFilterConfig moved into the detector module —
+    overrides use `url`, `timeout_s`, etc."""
+    base = PrivacyFilterConfig(
+        url="http://privacy-filter-service:8001",
+        timeout_s=5,
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    return replace(base, **overrides) if overrides else base
 
 
 def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:
@@ -45,7 +52,7 @@ def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:
 
 @pytest.fixture
 def detector(monkeypatch: pytest.MonkeyPatch) -> RemotePrivacyFilterDetector:
-    monkeypatch.setattr(rpf_mod, "config", _fake_config())
+    monkeypatch.setattr(pf_mod, "CONFIG", _fake_config())
     return RemotePrivacyFilterDetector(
         url="http://privacy-filter-service:8001", timeout_s=5,
     )
@@ -66,7 +73,7 @@ def test_empty_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """The factory in pipeline.py only constructs this class when the
     URL is set. If a caller bypasses the factory, fail loud rather than
     POST to '/detect' with no host."""
-    monkeypatch.setattr(rpf_mod, "config", _fake_config(privacy_filter_url=""))
+    monkeypatch.setattr(pf_mod, "CONFIG", _fake_config(url=""))
     with pytest.raises(RuntimeError, match="PRIVACY_FILTER_URL"):
         RemotePrivacyFilterDetector(url="")
 
@@ -74,7 +81,7 @@ def test_empty_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_url_trailing_slash_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
     """A trailing slash on PRIVACY_FILTER_URL would otherwise produce
     `host:port//detect` — strip it so callers can't trip on that."""
-    monkeypatch.setattr(rpf_mod, "config", _fake_config())
+    monkeypatch.setattr(pf_mod, "CONFIG", _fake_config())
     det = RemotePrivacyFilterDetector(url="http://service:8001/")
     assert det.url == "http://service:8001"
 
@@ -260,28 +267,27 @@ async def test_response_with_top_level_list_degrades_to_empty(
 def test_factory_picks_remote_when_url_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pipeline's privacy_filter factory checks config at every
-    instantiation, so flipping PRIVACY_FILTER_URL flips which detector
-    backs DETECTOR_MODE=privacy_filter on the next pipeline build."""
-    from anonymizer_guardrail import pipeline as pipeline_mod
-    from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterDetector
-
-    fake_cfg = SimpleNamespace(
-        **{**pipeline_mod.config.__dict__,
-           "privacy_filter_url": "http://privacy-filter-service:8001"},
+    """The privacy_filter factory reads CONFIG.url at every
+    instantiation, so flipping it flips which detector backs
+    DETECTOR_MODE=privacy_filter on the next pipeline build."""
+    from anonymizer_guardrail.detector.privacy_filter import (
+        PrivacyFilterDetector,
+        _privacy_filter_factory,
     )
-    monkeypatch.setattr(pipeline_mod, "config", fake_cfg)
-    monkeypatch.setattr(rpf_mod, "config", fake_cfg)
 
-    det = pipeline_mod._privacy_filter_factory()
+    monkeypatch.setattr(
+        pf_mod, "CONFIG",
+        replace(pf_mod.CONFIG, url="http://privacy-filter-service:8001"),
+    )
+
+    det = _privacy_filter_factory()
     assert isinstance(det, RemotePrivacyFilterDetector)
 
     # Now flip the URL off and confirm the factory dispatches to the
     # in-process class. PrivacyFilterDetector's __init__ does heavy
     # work (loads torch + the model), so we mock it out — the test is
     # about *which class the factory picks*, not about constructing it.
-    fake_cfg.privacy_filter_url = ""
-    monkeypatch.setattr(pipeline_mod, "config", fake_cfg)
+    monkeypatch.setattr(pf_mod, "CONFIG", replace(pf_mod.CONFIG, url=""))
     constructed: list[str] = []
 
     def fake_init(self, *_args, **_kwargs):
@@ -289,6 +295,6 @@ def test_factory_picks_remote_when_url_set(
         self.name = "privacy_filter"
 
     monkeypatch.setattr(PrivacyFilterDetector, "__init__", fake_init)
-    det = pipeline_mod._privacy_filter_factory()
+    det = _privacy_filter_factory()
     assert isinstance(det, PrivacyFilterDetector)
     assert constructed == ["PrivacyFilterDetector"]

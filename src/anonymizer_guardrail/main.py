@@ -16,9 +16,8 @@ from fastapi import FastAPI
 
 from .api import GuardrailRequest, GuardrailResponse, parse_overrides
 from .config import config
-from .detector.llm import LLMUnavailableError
-from .detector.remote_gliner_pii import GlinerPIIUnavailableError
-from .detector.remote_privacy_filter import PrivacyFilterUnavailableError
+from .detector import REGISTERED_SPECS, TYPED_UNAVAILABLE_ERRORS
+from .detector import llm as llm_mod
 from .pipeline import Pipeline
 
 logging.basicConfig(
@@ -99,9 +98,9 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
         return GuardrailResponse(action="NONE")
 
     forwarded_key: str | None = None
-    if config.llm_use_forwarded_key and req.input_type == "request":
+    if llm_mod.CONFIG.use_forwarded_key and req.input_type == "request":
         forwarded_key = _forwarded_bearer(req.request_headers)
-        if forwarded_key is None and not config.llm_api_key:
+        if forwarded_key is None and not llm_mod.CONFIG.api_key:
             # Bump to WARNING (not DEBUG) when there's no fallback — this path
             # produces a 401 from the detection LLM with a confusing "no api
             # key" message, so the operator deserves a pointer to the actual
@@ -158,42 +157,23 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
                 return GuardrailResponse(action="NONE")
             return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=restored)
 
-    except LLMUnavailableError as exc:
-        # Reached only when llm_fail_closed=True; otherwise the pipeline swallows it.
-        log.error("Blocking request — LLM detector unavailable: %s", exc)
-        return GuardrailResponse(
-            action="BLOCKED",
-            blocked_reason=(
-                "Anonymization LLM is unreachable; request blocked to prevent "
-                "unredacted data from reaching the upstream model."
-            ),
+    except TYPED_UNAVAILABLE_ERRORS as exc:
+        # Reached only when the matching detector's fail_closed flag is
+        # true; otherwise the pipeline swallows the error and degrades.
+        # The spec lookup picks the right BLOCKED message — adding a new
+        # detector with its own typed error doesn't require an edit
+        # here, just a new entry in REGISTERED_SPECS.
+        spec = next(
+            s for s in REGISTERED_SPECS
+            if s.unavailable_error is not None and isinstance(exc, s.unavailable_error)
         )
-    except PrivacyFilterUnavailableError as exc:
-        # Reached only when privacy_filter_fail_closed=True; otherwise the
-        # pipeline swallows it. Same risk shape as the LLM case — silent
-        # downgrade of redaction coverage is the failure mode we're guarding
-        # against.
-        log.error("Blocking request — privacy-filter detector unavailable: %s", exc)
-        return GuardrailResponse(
-            action="BLOCKED",
-            blocked_reason=(
-                "Anonymization privacy-filter is unreachable; request "
-                "blocked to prevent unredacted data from reaching the "
-                "upstream model."
-            ),
+        log.error(
+            "Blocking request — %s detector unavailable: %s",
+            spec.name, exc,
         )
-    except GlinerPIIUnavailableError as exc:
-        # Reached only when gliner_pii_fail_closed=True. Same risk shape
-        # as the other detector outages — silent coverage downgrade is
-        # exactly what fail-closed exists to prevent.
-        log.error("Blocking request — gliner-pii detector unavailable: %s", exc)
         return GuardrailResponse(
             action="BLOCKED",
-            blocked_reason=(
-                "Anonymization gliner-pii is unreachable; request "
-                "blocked to prevent unredacted data from reaching the "
-                "upstream model."
-            ),
+            blocked_reason=spec.blocked_reason,
         )
     except Exception as exc:
         # Unexpected failure → block. LiteLLM's `unreachable_fallback` setting

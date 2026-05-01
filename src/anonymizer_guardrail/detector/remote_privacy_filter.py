@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from ..config import config
+from . import privacy_filter as _pf_mod
 from .base import Match
 
 log = logging.getLogger("anonymizer.privacy_filter.remote")
@@ -46,7 +46,7 @@ class PrivacyFilterUnavailableError(RuntimeError):
     for an availability reason — service unreachable, timeout, transport
     error, non-200 status. Caught by the pipeline; whether it propagates
     (BLOCKED) or degrades to empty matches is decided by
-    config.privacy_filter_fail_closed.
+    privacy_filter.CONFIG.fail_closed.
 
     Mirrors LLMUnavailableError. We deliberately keep the two distinct
     so an operator can fail closed on the LLM but open on PF (or vice
@@ -69,7 +69,7 @@ class RemotePrivacyFilterDetector:
         url: str | None = None,
         timeout_s: int | None = None,
     ) -> None:
-        self.url = (url or config.privacy_filter_url).rstrip("/")
+        self.url = (url or _pf_mod.CONFIG.url).rstrip("/")
         if not self.url:
             # The factory in pipeline.py only constructs this class when
             # the URL is set, so reaching here means a caller bypassed
@@ -78,7 +78,7 @@ class RemotePrivacyFilterDetector:
                 "RemotePrivacyFilterDetector requires PRIVACY_FILTER_URL "
                 "to be set. Leave it unset to use the in-process detector."
             )
-        self.timeout_s = timeout_s or config.privacy_filter_timeout_s
+        self.timeout_s = timeout_s or _pf_mod.CONFIG.timeout_s
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
         log.info(
             "Privacy-filter detector wired to remote service at %s "

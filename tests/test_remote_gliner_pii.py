@@ -19,22 +19,28 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 import httpx
 import pytest
 
+from dataclasses import replace
+
 from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
 from anonymizer_guardrail.detector.remote_gliner_pii import (
+    GlinerPIIConfig,
     GlinerPIIUnavailableError,
     RemoteGlinerPIIDetector,
 )
 
 
-def _fake_config(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(
-        gliner_pii_url="http://gliner-pii-service:8002",
-        gliner_pii_timeout_s=5,
-        gliner_pii_labels="",
-        gliner_pii_threshold="",
+def _fake_config(**overrides: Any) -> GlinerPIIConfig:
+    """Build a GlinerPIIConfig with a small test-friendly baseline plus
+    per-test overrides. Field names lost the `gliner_pii_` prefix when
+    GlinerPIIConfig moved into the detector module — overrides use
+    `url`, `labels`, `threshold`, etc."""
+    base = GlinerPIIConfig(
+        url="http://gliner-pii-service:8002",
+        timeout_s=5,
+        labels="",
+        threshold="",
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    return replace(base, **overrides) if overrides else base
 
 
 def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:
@@ -47,7 +53,7 @@ def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:
 
 @pytest.fixture
 def detector(monkeypatch: pytest.MonkeyPatch) -> RemoteGlinerPIIDetector:
-    monkeypatch.setattr(gp_mod, "config", _fake_config())
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config())
     return RemoteGlinerPIIDetector(
         url="http://gliner-pii-service:8002", timeout_s=5,
     )
@@ -68,7 +74,7 @@ def test_empty_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """The factory in pipeline.py only constructs this class when the
     URL is set. If a caller bypasses the factory, fail loud rather than
     POST to '/detect' with no host."""
-    monkeypatch.setattr(gp_mod, "config", _fake_config(gliner_pii_url=""))
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config(url=""))
     with pytest.raises(RuntimeError, match="GLINER_PII_URL"):
         RemoteGlinerPIIDetector(url="")
 
@@ -76,7 +82,7 @@ def test_empty_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_url_trailing_slash_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
     """A trailing slash on GLINER_PII_URL would otherwise produce
     `host:port//detect` — strip it so callers can't trip on that."""
-    monkeypatch.setattr(gp_mod, "config", _fake_config())
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config())
     det = RemoteGlinerPIIDetector(url="http://service:8002/")
     assert det.url == "http://service:8002"
 
@@ -84,8 +90,8 @@ def test_url_trailing_slash_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_labels_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """GLINER_PII_LABELS is parsed comma-separated and stripped."""
     monkeypatch.setattr(
-        gp_mod, "config",
-        _fake_config(gliner_pii_labels=" person , email, ssn  "),
+        gp_mod, "CONFIG",
+        _fake_config(labels=" person , email, ssn  "),
     )
     det = RemoteGlinerPIIDetector(url="http://service:8002")
     assert det.labels == ["person", "email", "ssn"]
@@ -94,14 +100,14 @@ def test_labels_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_empty_labels_means_server_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Empty GLINER_PII_LABELS → None, which the request body omits the
     field entirely so the service's DEFAULT_LABELS apply."""
-    monkeypatch.setattr(gp_mod, "config", _fake_config())
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config())
     det = RemoteGlinerPIIDetector(url="http://service:8002")
     assert det.labels is None
 
 
 def test_threshold_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        gp_mod, "config", _fake_config(gliner_pii_threshold="0.7"),
+        gp_mod, "CONFIG", _fake_config(threshold="0.7"),
     )
     det = RemoteGlinerPIIDetector(url="http://service:8002")
     assert det.threshold == 0.7
@@ -113,7 +119,7 @@ def test_invalid_threshold_warn_and_fall_back(
     """A garbage threshold value warns and behaves as 'use server default'.
     Crashing on a bad threshold would block the detector from loading."""
     monkeypatch.setattr(
-        gp_mod, "config", _fake_config(gliner_pii_threshold="not-a-float"),
+        gp_mod, "CONFIG", _fake_config(threshold="not-a-float"),
     )
     import logging
     caplog.set_level(logging.WARNING)
@@ -178,8 +184,8 @@ async def test_request_includes_labels_and_threshold_when_set(
     the request body so the server uses them. Lets operators tune
     per-deployment without redeploying the service."""
     monkeypatch.setattr(
-        gp_mod, "config",
-        _fake_config(gliner_pii_labels="email,ssn", gliner_pii_threshold="0.6"),
+        gp_mod, "CONFIG",
+        _fake_config(labels="email,ssn", threshold="0.6"),
     )
     det = RemoteGlinerPIIDetector(url="http://service:8002")
     mock_post.return_value = _ok_response([])

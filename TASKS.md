@@ -394,3 +394,63 @@ Or when the per-detector edit list crosses ~10 files.
   use case appears.
 - Not a refactor of `Match` / `Detector` Protocol / `_dedup`. The
   shared types stay. This is wiring-level cleanup only.
+
+---
+
+## Document the GLiNER-PII detector + service in README
+
+**What:** the GLiNER-PII detector (`RemoteGlinerPIIDetector`) and the
+companion `gliner-pii-service` container exist with full code, tests,
+build-image.sh flavours, cli.sh / menu.sh wiring, and detailed
+service-level docs at `services/gliner_pii/README.md` — but the
+top-level README only documents the GLINER_PII_* env vars in the
+config table. The rest of the user-facing surface isn't there yet:
+
+  * no overview mention alongside the other detectors in the intro
+  * no `### GLiNER-PII detector` section parallel to the existing
+    `### Privacy-filter detector` (in-process / remote split, when
+    to pick it, label / threshold semantics, license note about
+    NVIDIA Open Model License)
+  * no entry in the *Container images* section for `gliner-pii-service`
+    (CPU + CUDA matrix, baked variants, "local-only — not yet
+    CI-published" note)
+  * no mention in the *Capping detector concurrency* section that
+    `GLINER_PII_MAX_CONCURRENCY` exists alongside the LLM and PF caps
+  * `DETECTOR_MODE` examples don't include `gliner_pii`
+
+**Why deferred:** the README was already getting unwieldy at 800+
+lines, and the user has flagged a docs split (multi-file `docs/`
+folder) as the next docs project. Adding more to the existing README
+before that split makes the eventual reorganization more painful.
+Better to add the GLiNER content as part of the docs split, in the
+right new home.
+
+**Why it matters:** the detector is fully functional — operators
+discovering it via `cli.sh --help` or the menu can run it, but they
+won't find the design docs (when to pick it vs privacy_filter, the
+license caveat, the experimental status) without reading the source.
+
+**Sketch:**
+
+1. Wait for the README → `docs/` split (separate task — see the
+   notes in the user conversation; not yet logged here as it's a
+   broader docs reorg, not a defined deliverable).
+2. In the new structure, add a `docs/detectors.md` (or similar)
+   GLiNER-PII section mirroring the privacy_filter section's shape:
+   what the model is, where it differs, how to run the service,
+   how to wire the detector, when to pick it, the license note.
+3. Add a `gliner-pii-service` row to the *Container images* section
+   noting it's local-build-only.
+4. Extend the *Capping detector concurrency* section with
+   `GLINER_PII_MAX_CONCURRENCY`.
+5. Update DETECTOR_MODE examples that currently list
+   `regex,denylist,privacy_filter,llm` to mention the gliner_pii
+   token as an option.
+
+**Concrete trigger:** the README docs split lands.
+
+**Non-goals:**
+
+- Don't move the existing `services/gliner_pii/README.md` into the
+  top-level docs — keep the service-specific README colocated with
+  its code. The top-level README links there for the deep-dive.

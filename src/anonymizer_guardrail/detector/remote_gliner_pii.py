@@ -34,14 +34,49 @@ default-fallback the LLM and remote PF detectors use.
 from __future__ import annotations
 
 import logging
+import os
+import sys
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from ..config import config
-from .base import Match
+from ..config import _env_bool, _env_int
+from .base import Detector, Match
+from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.gliner_pii.remote")
+
+
+# ── Per-detector config ───────────────────────────────────────────────────
+@dataclass(frozen=True)
+class GlinerPIIConfig:
+    # Empty (default) → DETECTOR_MODE=gliner_pii is rejected at boot
+    # with a clear error: there's no in-process fallback, so an empty
+    # URL means "this detector isn't deployable in this process."
+    # Set to an HTTP URL → the detector posts to {URL}/detect on every
+    # request. The standalone gliner-pii-service container (see
+    # services/gliner_pii/) is the canonical other end.
+    url: str = os.getenv("GLINER_PII_URL", "").strip()
+    # Per-call timeout on the remote detector's HTTP requests.
+    timeout_s: int = _env_int("GLINER_PII_TIMEOUT_S", 30)
+    # Failure mode. Independent of llm.CONFIG.fail_closed and
+    # privacy_filter.CONFIG.fail_closed — operators can fail closed on
+    # one detector and open on another without coupling.
+    fail_closed: bool = _env_bool("GLINER_PII_FAIL_CLOSED", True)
+    # Default zero-shot label list to send with every request. Empty
+    # falls back to whatever the gliner-pii-service has configured as
+    # *its* DEFAULT_LABELS.
+    labels: str = os.getenv("GLINER_PII_LABELS", "")
+    # Confidence cutoff sent with every request. Empty → use whatever
+    # the gliner-pii-service has configured as its DEFAULT_THRESHOLD.
+    threshold: str = os.getenv("GLINER_PII_THRESHOLD", "")
+    # Max number of concurrent gliner-pii calls. Same rationale as
+    # privacy_filter.CONFIG.max_concurrency.
+    max_concurrency: int = _env_int("GLINER_PII_MAX_CONCURRENCY", 10)
+
+
+CONFIG = GlinerPIIConfig()
 
 
 class GlinerPIIUnavailableError(RuntimeError):
@@ -49,7 +84,7 @@ class GlinerPIIUnavailableError(RuntimeError):
     work for an availability reason — service unreachable, timeout,
     transport error, non-200 status. Caught by the pipeline; whether
     it propagates (BLOCKED) or degrades to empty matches is decided by
-    config.gliner_pii_fail_closed.
+    CONFIG.fail_closed.
 
     Mirrors LLMUnavailableError / PrivacyFilterUnavailableError. We
     deliberately keep them distinct so an operator can fail closed on
@@ -136,7 +171,7 @@ class RemoteGlinerPIIDetector:
         labels: list[str] | None = None,
         threshold: float | None = None,
     ) -> None:
-        self.url = (url or config.gliner_pii_url).rstrip("/")
+        self.url = (url or CONFIG.url).rstrip("/")
         if not self.url:
             # The factory in pipeline.py only constructs this class when
             # the URL is set, so reaching here means a caller bypassed
@@ -147,10 +182,10 @@ class RemoteGlinerPIIDetector:
                 "deploy the gliner-pii-service container and set "
                 "GLINER_PII_URL=http://<host>:<port>."
             )
-        self.timeout_s = timeout_s or config.gliner_pii_timeout_s
-        self.labels = labels if labels is not None else _parse_labels(config.gliner_pii_labels)
+        self.timeout_s = timeout_s or CONFIG.timeout_s
+        self.labels = labels if labels is not None else _parse_labels(CONFIG.labels)
         self.threshold = (
-            threshold if threshold is not None else _parse_threshold(config.gliner_pii_threshold)
+            threshold if threshold is not None else _parse_threshold(CONFIG.threshold)
         )
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
         log.info(
@@ -277,4 +312,44 @@ def _parse_matches(body: Any, source_text: str) -> list[Match]:
     return out
 
 
-__all__ = ["RemoteGlinerPIIDetector", "GlinerPIIUnavailableError"]
+def _gliner_pii_factory() -> Detector:
+    """Construct the gliner-pii detector, requiring GLINER_PII_URL.
+
+    Unlike privacy_filter, there is no in-process fallback — the
+    gliner library + ~570M weights would defeat the slim guardrail.
+    An empty URL therefore raises at construction time so an operator
+    who set DETECTOR_MODE=...,gliner_pii without setting GLINER_PII_URL
+    sees a clear error at boot rather than the request-time confusion
+    of a silently-skipped detector.
+
+    Lives here (rather than in pipeline.py) so the SPEC declaration
+    below can reference it without pipeline.py needing to import
+    this module's internals.
+    """
+    if not CONFIG.url:
+        raise RuntimeError(
+            "DETECTOR_MODE includes 'gliner_pii' but GLINER_PII_URL is unset. "
+            "Deploy the gliner-pii-service container (see services/gliner_pii/) "
+            "and set GLINER_PII_URL=http://<host>:<port>."
+        )
+    return RemoteGlinerPIIDetector()
+
+
+SPEC = DetectorSpec(
+    name="gliner_pii",
+    factory=_gliner_pii_factory,
+    module=sys.modules[__name__],
+    # No prepare_call_kwargs yet: per-request labels/threshold overrides
+    # are deferred (TASKS.md). Defaults to the no-op kwargs builder.
+    has_semaphore=True,
+    stats_prefix="gliner_pii",
+    unavailable_error=GlinerPIIUnavailableError,
+    blocked_reason=(
+        "Anonymization gliner-pii is unreachable; request "
+        "blocked to prevent unredacted data from reaching the "
+        "upstream model."
+    ),
+)
+
+
+__all__ = ["RemoteGlinerPIIDetector", "GlinerPIIUnavailableError", "SPEC"]

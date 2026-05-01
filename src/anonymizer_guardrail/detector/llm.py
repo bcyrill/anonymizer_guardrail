@@ -13,17 +13,85 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import sys
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from ..bundled_resource import read_bundled_default, resolve_spec
 from ..registry import parse_named_path_registry
-from ..config import config
+from ..config import _env_bool, _env_int
 from .base import Match
+from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.llm")
+
+
+def _llm_fail_closed_default() -> bool:
+    """Read LLM_FAIL_CLOSED, fall back to the deprecated FAIL_CLOSED with
+    a loud warning, default true.
+
+    `FAIL_CLOSED` was renamed to `LLM_FAIL_CLOSED` once the privacy-filter
+    detector got its own `PRIVACY_FILTER_FAIL_CLOSED` knob — the old name
+    misled operators into thinking it governed both. Existing deployments
+    setting `FAIL_CLOSED=…` keep working for one release cycle, but get a
+    rename hint at boot so the migration is impossible to miss.
+
+    Lives here (not in central config.py) so the deprecation shim stays
+    next to the LLM detector code that consumes it. Will be removed
+    once the deprecation cycle ends — see TASKS.md.
+    """
+    raw = os.getenv("LLM_FAIL_CLOSED")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    legacy = os.getenv("FAIL_CLOSED")
+    if legacy is not None:
+        logging.getLogger("anonymizer.config").warning(
+            "FAIL_CLOSED is deprecated; rename to LLM_FAIL_CLOSED. "
+            "It governs the LLM detector only — the privacy-filter "
+            "detector has its own PRIVACY_FILTER_FAIL_CLOSED. The old "
+            "name will be removed in a future release."
+        )
+        return legacy.strip().lower() in ("1", "true", "yes", "on")
+    return True
+
+
+# ── Per-detector config ───────────────────────────────────────────────────
+@dataclass(frozen=True)
+class LLMConfig:
+    # OpenAI-compatible endpoint. When pointed at LiteLLM, ensure the
+    # model used here does NOT have this guardrail attached (otherwise
+    # → infinite recursion).
+    api_base: str = os.getenv("LLM_API_BASE", "http://litellm:4000/v1")
+    api_key: str = os.getenv("LLM_API_KEY", "")
+    model: str = os.getenv("LLM_MODEL", "anonymize")
+    timeout_s: int = _env_int("LLM_TIMEOUT_S", 30)
+    # When true, prefer the Authorization bearer token forwarded by
+    # LiteLLM (via `extra_headers: [authorization]` on the guardrail)
+    # over LLM_API_KEY. Falls back to LLM_API_KEY if the header is absent.
+    use_forwarded_key: bool = _env_bool("LLM_USE_FORWARDED_KEY", False)
+    # Path to the system prompt for the LLM detector. Empty → bundled
+    # default (prompts/llm_default.md).
+    system_prompt_path: str = os.getenv("LLM_SYSTEM_PROMPT_PATH", "")
+    # Optional registry of NAMED alternative LLM prompts that callers
+    # can opt into per-request via additional_provider_specific_params.llm_prompt.
+    system_prompt_registry: str = os.getenv("LLM_SYSTEM_PROMPT_REGISTRY", "")
+    # Hard cap on input size sent to the LLM in one call. Inputs above
+    # this are REFUSED (LLMUnavailableError → fail-closed policy
+    # applies), never silently truncated.
+    max_chars: int = _env_int("LLM_MAX_CHARS", 200_000)
+    # Max number of concurrent LLM calls.
+    max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
+    # Failure mode when the LLM detector errors out. true (default) →
+    # block; false → fall back to coverage from the other detectors.
+    # Honours the deprecated FAIL_CLOSED env var via the shim above.
+    fail_closed: bool = _llm_fail_closed_default()
+
+
+CONFIG = LLMConfig()
 
 
 class LLMUnavailableError(RuntimeError):
@@ -40,7 +108,7 @@ def _load_system_prompt(
     """Load one system prompt.
 
     `override` is the path/bundled-name string. None (the default)
-    means "read config.llm_system_prompt_path" so callers that haven't
+    means "read CONFIG.system_prompt_path" so callers that haven't
     been updated for the registry refactor (e.g. tests that monkey-
     patch config) keep working. Empty string → bundled default.
     `label` names the source for error messages — defaults to the env
@@ -57,7 +125,7 @@ def _load_system_prompt(
     input, which is a silent regex-only fallback masquerading as success.
     """
     if override is None:
-        override = config.llm_system_prompt_path
+        override = CONFIG.system_prompt_path
     override = override.strip()
     if override:
         text, _source, _file_dir = resolve_spec(
@@ -86,7 +154,7 @@ def _load_system_prompt_registry() -> dict[str, str]:
     as the default path: typos / unreadable files / empty prompts crash
     boot loudly.
     """
-    raw = config.llm_system_prompt_registry
+    raw = CONFIG.system_prompt_registry
     pairs = parse_named_path_registry(raw, "LLM_SYSTEM_PROMPT_REGISTRY")
     return {
         name: _load_system_prompt(path, f"LLM_SYSTEM_PROMPT_REGISTRY[{name}]")
@@ -155,10 +223,10 @@ class LLMDetector:
         model: str | None = None,
         timeout_s: int | None = None,
     ) -> None:
-        self.api_base = (api_base or config.llm_api_base).rstrip("/")
-        self.api_key = api_key if api_key is not None else config.llm_api_key
-        self.model = model or config.llm_model
-        self.timeout_s = timeout_s or config.llm_timeout_s
+        self.api_base = (api_base or CONFIG.api_base).rstrip("/")
+        self.api_key = api_key if api_key is not None else CONFIG.api_key
+        self.model = model or CONFIG.model
+        self.timeout_s = timeout_s or CONFIG.timeout_s
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
 
     async def detect(
@@ -205,10 +273,10 @@ class LLMDetector:
         # opposite of what a guardrail should do. Raised as
         # LLMUnavailableError so the LLM_FAIL_CLOSED policy in the pipeline
         # decides: block the request, or fall back to regex-only.
-        if len(text) > config.llm_max_chars:
+        if len(text) > CONFIG.max_chars:
             raise LLMUnavailableError(
                 f"Input too large for LLM detection: {len(text)} chars > "
-                f"LLM_MAX_CHARS ({config.llm_max_chars}). Raise the cap or "
+                f"LLM_MAX_CHARS ({CONFIG.max_chars}). Raise the cap or "
                 f"point at a model with a larger context window."
             )
 
@@ -267,4 +335,30 @@ class LLMDetector:
         await self._client.aclose()
 
 
-__all__ = ["LLMDetector", "LLMUnavailableError"]
+def _llm_call_kwargs(overrides: Any, api_key: str | None) -> dict[str, Any]:
+    """Per-call kwargs. The forwarded api_key from the request flows
+    through to the detector's per-request override so detection cost
+    can attribute back to the user's virtual key."""
+    return {
+        "api_key": api_key,
+        "model": overrides.llm_model,
+        "prompt_name": overrides.llm_prompt,
+    }
+
+
+SPEC = DetectorSpec(
+    name="llm",
+    factory=LLMDetector,
+    module=sys.modules[__name__],
+    prepare_call_kwargs=_llm_call_kwargs,
+    has_semaphore=True,
+    stats_prefix="llm",
+    unavailable_error=LLMUnavailableError,
+    blocked_reason=(
+        "Anonymization LLM is unreachable; request blocked to prevent "
+        "unredacted data from reaching the upstream model."
+    ),
+)
+
+
+__all__ = ["LLMDetector", "LLMUnavailableError", "SPEC"]

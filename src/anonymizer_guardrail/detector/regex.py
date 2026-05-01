@@ -13,7 +13,10 @@ schema documentation in the YAML files themselves.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,10 +30,39 @@ from ..bundled_resource import (
     resolve_spec,
 )
 from ..registry import parse_named_path_registry
-from ..config import config
 from .base import Match
+from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.regex")
+
+
+# ── Per-detector config ───────────────────────────────────────────────────
+# Lives here (not in central config.py) so the env-var fields are
+# colocated with the code that reads them. Tests can monkeypatch
+# `regex.CONFIG = dataclasses.replace(CONFIG, …)` to override per-test;
+# the SPEC's `config` property reads the module attribute live.
+@dataclass(frozen=True)
+class RegexConfig:
+    # Path to the YAML file defining the regex detector's patterns. If
+    # unset, the bundled default (patterns/regex_default.yaml) is used.
+    # Pre-built alternatives also ship with the package
+    # (e.g. patterns/regex_pentest.yaml) — point this at any of them
+    # or at your own file.
+    patterns_path: str = os.getenv("REGEX_PATTERNS_PATH", "")
+    # Optional registry of NAMED alternative regex pattern files that
+    # callers can opt into per-request via
+    # additional_provider_specific_params.regex_patterns. Comma-separated
+    # `name=path` pairs.
+    patterns_registry: str = os.getenv("REGEX_PATTERNS_REGISTRY", "")
+    # How the regex detector resolves overlapping matches between patterns:
+    #   - "longest"  pick the longest match span (default).
+    #   - "priority" first pattern in YAML order wins.
+    # Validated at startup; a typo crashes loudly rather than silently
+    # falling through to a default.
+    overlap_strategy: str = os.getenv("REGEX_OVERLAP_STRATEGY", "longest").lower()
+
+
+CONFIG = RegexConfig()
 
 # Map YAML flag names → re module flags. Restricted to the subset that's
 # meaningful for detection (Python's UNICODE/LOCALE etc. are intentionally
@@ -149,16 +181,16 @@ def _read_root_patterns_yaml(
     """Return (yaml_text, source_label, file_dir) for one root patterns file.
 
     `override` is the path/bundled-name string. None (the default) means
-    "read from config.regex_patterns_path" so callers that haven't been
-    updated for the registry refactor (e.g. tests that monkey-patch
-    config) keep working. Empty string is treated the same as None →
-    bundled default. `label` is used in error messages.
+    "read from CONFIG.patterns_path" so callers that haven't been
+    updated for the registry refactor keep working. Empty string is
+    treated the same as None → bundled default. `label` is used in
+    error messages.
 
     file_dir is the parent directory if the source is on-disk, else None
     (used to resolve relative `extends:` paths).
     """
     if override is None:
-        override = config.regex_patterns_path
+        override = CONFIG.patterns_path
     override = override.strip()
     if override:
         return resolve_spec(
@@ -249,7 +281,7 @@ def _load_recursive(
 def _load_patterns(
     path: str | None = None, label: str = "REGEX_PATTERNS_PATH"
 ) -> list[tuple[str, re.Pattern[str]]]:
-    """Load + compile one pattern file. None → read config.regex_patterns_path."""
+    """Load + compile one pattern file. None → read CONFIG.patterns_path."""
     text, source, current_dir = _read_root_patterns_yaml(path, label)
     compiled = _load_recursive(text, source, current_dir, set(), depth=0)
     if not compiled:
@@ -267,7 +299,7 @@ def _load_patterns_registry() -> dict[str, list[tuple[str, re.Pattern[str]]]]:
     Validation is the same as the default path: typos / unreadable
     files / missing patterns crash boot loudly.
     """
-    raw = config.regex_patterns_registry
+    raw = CONFIG.patterns_registry
     pairs = parse_named_path_registry(raw, "REGEX_PATTERNS_REGISTRY")
     out: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
     for name, path in pairs.items():
@@ -394,9 +426,9 @@ _VALIDATORS: dict[str, Callable[[str], bool]] = {
 
 
 _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
-if config.regex_overlap_strategy not in _VALID_OVERLAP_STRATEGIES:
+if CONFIG.overlap_strategy not in _VALID_OVERLAP_STRATEGIES:
     raise RuntimeError(
-        f"Invalid REGEX_OVERLAP_STRATEGY={config.regex_overlap_strategy!r}. "
+        f"Invalid REGEX_OVERLAP_STRATEGY={CONFIG.overlap_strategy!r}. "
         f"Allowed: {', '.join(sorted(_VALID_OVERLAP_STRATEGIES))}."
     )
 
@@ -425,7 +457,7 @@ class RegexDetector:
         """Run every compiled pattern and return the resolved match list.
 
         `overlap_strategy` is a per-call override; None means "use
-        config.regex_overlap_strategy". Validated up front so a typo
+        CONFIG.overlap_strategy". Validated up front so a typo
         from a per-request override surfaces as a clear error rather
         than silently behaving like the default.
 
@@ -437,7 +469,7 @@ class RegexDetector:
         """
         if not text:
             return []
-        strategy = overlap_strategy or config.regex_overlap_strategy
+        strategy = overlap_strategy or CONFIG.overlap_strategy
         if strategy not in _VALID_OVERLAP_STRATEGIES:
             raise ValueError(
                 f"Invalid overlap_strategy={strategy!r}. "
@@ -523,4 +555,29 @@ class RegexDetector:
         return results
 
 
-__all__ = ["RegexDetector"]
+def _regex_call_kwargs(overrides: Any, _api_key: str | None) -> dict[str, Any]:
+    """Per-call kwargs for RegexDetector.detect(). Pulled out so the
+    SPEC declaration stays declarative — the closure over `overrides`
+    is the only thing that varies between calls."""
+    return {
+        "overlap_strategy": overrides.regex_overlap_strategy,
+        "patterns_name": overrides.regex_patterns,
+    }
+
+
+SPEC = DetectorSpec(
+    name="regex",
+    factory=RegexDetector,
+    module=sys.modules[__name__],
+    prepare_call_kwargs=_regex_call_kwargs,
+    # Regex is microseconds per call — gating it would only serialize
+    # work that wasn't a problem. No semaphore.
+    has_semaphore=False,
+    # Regex doesn't have an availability concept: a bad pattern is a
+    # programmer error, not an outage. The pipeline catches generic
+    # exceptions and degrades to []; no typed error is raised.
+    unavailable_error=None,
+)
+
+
+__all__ = ["RegexDetector", "SPEC"]

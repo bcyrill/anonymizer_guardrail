@@ -21,17 +21,48 @@ these lists are org-specific).
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import yaml
 
 from ..bundled_resource import resolve_spec
-from ..config import config
 from ..registry import parse_named_path_registry
 from .base import Match
+from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.denylist")
+
+
+# ── Per-detector config ───────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DenylistConfig:
+    # Path to the YAML file defining the denylist detector's literal-
+    # string entries. If unset, the detector still loads under
+    # DETECTOR_MODE=denylist but matches nothing — useful for boot-order
+    # independence (operator can set DETECTOR_MODE first and DENYLIST_PATH
+    # later). Accepts the same `bundled:NAME` / filesystem-path
+    # conventions as REGEX_PATTERNS_PATH.
+    path: str = os.getenv("DENYLIST_PATH", "")
+    # Optional registry of NAMED alternative denylists that callers can
+    # opt into per-request via additional_provider_specific_params.denylist.
+    registry: str = os.getenv("DENYLIST_REGISTRY", "")
+    # Matching backend for the denylist detector:
+    #   - "regex" (default) — Python `re` alternation. Pure stdlib, fast
+    #                          for low-thousands of entries.
+    #   - "aho"             — Aho-Corasick via pyahocorasick. Sub-linear
+    #                          in pattern count; pays off above ~5k entries
+    #                          or when match latency matters more than
+    #                          install size. Requires the
+    #                          `denylist-aho` optional extra.
+    # Validated at startup; an unknown value crashes loud.
+    backend: str = os.getenv("DENYLIST_BACKEND", "regex").strip().lower()
+
+
+CONFIG = DenylistConfig()
 
 
 _BUNDLED_DENYLISTS_DIR = "denylists"
@@ -48,7 +79,7 @@ def _read_yaml(
     the operator has gotten around to writing a list yet.
     """
     if override is None:
-        override = config.denylist_path
+        override = CONFIG.path
     override = override.strip()
     if not override:
         return None
@@ -125,7 +156,7 @@ def _compile_entries(
 def _load_entries(
     path: str | None = None, label: str = "DENYLIST_PATH"
 ) -> list[dict[str, Any]]:
-    """Load + parse one denylist YAML file. None → read config.denylist_path.
+    """Load + parse one denylist YAML file. None → read CONFIG.path.
     Returns the list of validated entry dicts (with normalized defaults).
     Empty file or missing path returns an empty list.
     """
@@ -346,9 +377,9 @@ def _build_index_aho(entries: list[dict[str, Any]]) -> _CandidatesFn:
 # ── Backend dispatch ───────────────────────────────────────────────────────
 _VALID_BACKENDS = frozenset({"regex", "aho"})
 
-if config.denylist_backend not in _VALID_BACKENDS:
+if CONFIG.backend not in _VALID_BACKENDS:
     raise RuntimeError(
-        f"Invalid DENYLIST_BACKEND={config.denylist_backend!r}. "
+        f"Invalid DENYLIST_BACKEND={CONFIG.backend!r}. "
         f"Allowed: {', '.join(sorted(_VALID_BACKENDS))}."
     )
 
@@ -356,13 +387,12 @@ if config.denylist_backend not in _VALID_BACKENDS:
 def _build_index(entries: list[dict[str, Any]]) -> _CandidatesFn:
     """Compile entries via the configured backend.
 
-    Backend is read from `config.denylist_backend` (validated at module
-    import). Each call to `_build_index` honours the *current* config —
-    tests that monkeypatch the backend can re-build a registry from
-    scratch and exercise the alternative path without restarting the
-    interpreter.
+    Backend is read from `CONFIG.backend` (validated at module import).
+    Each call to `_build_index` honours the *current* CONFIG — tests
+    that monkeypatch the backend can re-build a registry from scratch
+    and exercise the alternative path without restarting the interpreter.
     """
-    if config.denylist_backend == "aho":
+    if CONFIG.backend == "aho":
         return _build_index_aho(entries)
     return _build_index_regex(entries)
 
@@ -374,7 +404,7 @@ def _load_registry() -> dict[str, _CandidatesFn]:
     Validation is the same as the default path: typos / unreadable
     files / bad schemas crash boot loudly rather than at first request.
     """
-    raw = config.denylist_registry
+    raw = CONFIG.registry
     pairs = parse_named_path_registry(raw, "DENYLIST_REGISTRY")
     out: dict[str, _CandidatesFn] = {}
     for name, path in pairs.items():
@@ -416,13 +446,13 @@ class DenylistDetector:
                 "Denylist detector loaded with no default entries (DENYLIST_PATH "
                 "is unset or the file has no entries). %d named alternative(s) "
                 "registered. Backend=%s.",
-                len(_REGISTRY), config.denylist_backend,
+                len(_REGISTRY), CONFIG.backend,
             )
         else:
             log.info(
                 "Denylist detector ready — %d default entries, %d named "
                 "alternative(s). Backend=%s.",
-                len(_LOADED_ENTRIES), len(_REGISTRY), config.denylist_backend,
+                len(_LOADED_ENTRIES), len(_REGISTRY), CONFIG.backend,
             )
 
     async def detect(
@@ -475,4 +505,22 @@ class DenylistDetector:
         return results
 
 
-__all__ = ["DenylistDetector"]
+def _denylist_call_kwargs(overrides: Any, _api_key: str | None) -> dict[str, Any]:
+    return {"denylist_name": overrides.denylist}
+
+
+SPEC = DetectorSpec(
+    name="denylist",
+    factory=DenylistDetector,
+    module=sys.modules[__name__],
+    prepare_call_kwargs=_denylist_call_kwargs,
+    # Pure regex / Aho-Corasick scan against a small literal-string
+    # set — no semaphore needed; same rationale as RegexSpec.
+    has_semaphore=False,
+    # Like regex, the denylist has no availability concept; a bad
+    # entry is operator config, not an outage. No typed error.
+    unavailable_error=None,
+)
+
+
+__all__ = ["DenylistDetector", "SPEC"]

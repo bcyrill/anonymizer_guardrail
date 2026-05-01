@@ -11,18 +11,22 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 
 import pytest
 
+from dataclasses import replace
+
 from anonymizer_guardrail.detector import regex as regex_mod
+from anonymizer_guardrail.detector.regex import RegexConfig
 
 
-def _fake_config(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(
-        regex_patterns_path="",
-        # Default detect()'s overlap strategy. Tests that exercise the
-        # opposite strategy override per-test.
-        regex_overlap_strategy="longest",
+def _fake_config(**overrides: Any) -> RegexConfig:
+    """Build a RegexConfig with a small test-friendly baseline plus
+    per-test overrides. Field names lost the `regex_` prefix when
+    RegexConfig moved into the detector module — overrides use
+    `patterns_path`, `overlap_strategy`, etc."""
+    base = RegexConfig(
+        patterns_path="",
+        overlap_strategy="longest",
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    return replace(base, **overrides) if overrides else base
 
 
 def test_default_yaml_loads_at_import_time() -> None:
@@ -99,7 +103,7 @@ async def test_pentest_yaml_relabels_brazilian_docs_as_national_id(
     the surrogate generator picks Faker's locale-aware ssn() for them.
     Pin that down."""
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path="bundled:regex_pentest.yaml")
+        regex_mod, "CONFIG", _fake_config(patterns_path="bundled:regex_pentest.yaml")
     )
     regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
     detector = regex_mod.RegexDetector()
@@ -111,7 +115,7 @@ async def test_pentest_yaml_relabels_brazilian_docs_as_national_id(
     finally:
         # Restore the default-bundled patterns so other tests stay isolated.
         monkeypatch.setattr(
-            regex_mod, "config", _fake_config(regex_patterns_path="")
+            regex_mod, "CONFIG", _fake_config(patterns_path="")
         )
         regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
 
@@ -127,7 +131,7 @@ def test_override_path_replaces_patterns(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
 
     compiled = regex_mod._load_patterns()
@@ -150,7 +154,7 @@ def test_override_with_bundled_extends_merges(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
 
     compiled = regex_mod._load_patterns()
@@ -178,15 +182,15 @@ def test_pentest_yaml_extends_default_yaml() -> None:
 
 def test_missing_override_path_raises() -> None:
     """Typo in REGEX_PATTERNS_PATH crashes loud, not silent fall-back."""
-    cfg = _fake_config(regex_patterns_path="/no/such/file.yaml")
+    cfg = _fake_config(patterns_path="/no/such/file.yaml")
     # Patch via the module attribute the loader reads.
-    orig = regex_mod.config
-    regex_mod.config = cfg  # type: ignore[assignment]
+    orig = regex_mod.CONFIG
+    regex_mod.CONFIG = cfg  # type: ignore[assignment]
     try:
         with pytest.raises(RuntimeError, match="could not be read"):
             regex_mod._load_patterns()
     finally:
-        regex_mod.config = orig  # type: ignore[assignment]
+        regex_mod.CONFIG = orig  # type: ignore[assignment]
 
 
 def test_invalid_regex_fails_at_load(
@@ -202,7 +206,7 @@ def test_invalid_regex_fails_at_load(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
     with pytest.raises(RuntimeError, match="did not compile"):
         regex_mod._load_patterns()
@@ -220,7 +224,7 @@ def test_unknown_flag_name_fails_at_load(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
     with pytest.raises(RuntimeError, match="unknown regex flag"):
         regex_mod._load_patterns()
@@ -236,7 +240,7 @@ def test_known_flags_apply(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
     compiled = regex_mod._load_patterns()
     import re as _re
@@ -251,7 +255,7 @@ def test_extends_cycle_detected(
     a.write_text(f"extends: {b}\npatterns: []\n", encoding="utf-8")
     b.write_text(f"extends: {a}\npatterns: []\n", encoding="utf-8")
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(a))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(a))
     )
     with pytest.raises(RuntimeError, match="cycle|exceeded depth"):
         regex_mod._load_patterns()
@@ -271,7 +275,7 @@ async def test_capture_group_narrows_match_to_value(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
     # Force the module-level _COMPILED_PATTERNS to refresh against the new config.
     regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
@@ -297,7 +301,7 @@ async def test_no_capture_group_preserves_full_match(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(custom))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
     regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
     detector = regex_mod.RegexDetector()
@@ -320,7 +324,7 @@ def test_pentest_yaml_loads_with_full_pattern_count(
         .joinpath("patterns/regex_pentest.yaml")
     )
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path=str(path))
+        regex_mod, "CONFIG", _fake_config(patterns_path=str(path))
     )
     compiled = regex_mod._load_patterns()
     # 173 patterns from DontFeedTheAI + 14 from the bundled defaults via extends.
@@ -334,7 +338,7 @@ def test_bundled_prefix_resolves_to_packaged_yaml(
     """`bundled:regex_pentest.yaml` should resolve via importlib.resources,
     so the env var works the same regardless of Python install layout."""
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path="bundled:regex_pentest.yaml")
+        regex_mod, "CONFIG", _fake_config(patterns_path="bundled:regex_pentest.yaml")
     )
     compiled = regex_mod._load_patterns()
     assert len(compiled) >= 180
@@ -344,7 +348,7 @@ def test_bundled_prefix_unknown_name_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path="bundled:no_such.yaml")
+        regex_mod, "CONFIG", _fake_config(patterns_path="bundled:no_such.yaml")
     )
     with pytest.raises(RuntimeError, match="not found in bundled patterns"):
         regex_mod._load_patterns()
@@ -354,7 +358,7 @@ def test_bundled_prefix_rejects_path_separators(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        regex_mod, "config", _fake_config(regex_patterns_path="bundled:../etc/passwd")
+        regex_mod, "CONFIG", _fake_config(patterns_path="bundled:../etc/passwd")
     )
     with pytest.raises(RuntimeError, match="bare filename"):
         regex_mod._load_patterns()
@@ -371,10 +375,10 @@ async def test_overlap_strategy_longest_picks_uuid_over_aws_account_id(
 ) -> None:
     monkeypatch.setattr(
         regex_mod,
-        "config",
+        "CONFIG",
         _fake_config(
-            regex_patterns_path="bundled:regex_pentest.yaml",
-            regex_overlap_strategy="longest",
+            patterns_path="bundled:regex_pentest.yaml",
+            overlap_strategy="longest",
         ),
     )
     monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
@@ -398,10 +402,10 @@ async def test_overlap_strategy_priority_keeps_legacy_first_match_wins(
 ) -> None:
     monkeypatch.setattr(
         regex_mod,
-        "config",
+        "CONFIG",
         _fake_config(
-            regex_patterns_path="bundled:regex_pentest.yaml",
-            regex_overlap_strategy="priority",
+            patterns_path="bundled:regex_pentest.yaml",
+            overlap_strategy="priority",
         ),
     )
     monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
@@ -424,10 +428,10 @@ async def test_overlap_strategy_longest_does_not_drop_unrelated_matches(
     """A 12-digit AWS account ID NOT inside a UUID must still be caught."""
     monkeypatch.setattr(
         regex_mod,
-        "config",
+        "CONFIG",
         _fake_config(
-            regex_patterns_path="bundled:regex_pentest.yaml",
-            regex_overlap_strategy="longest",
+            patterns_path="bundled:regex_pentest.yaml",
+            overlap_strategy="longest",
         ),
     )
     monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())

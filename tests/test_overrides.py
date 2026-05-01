@@ -206,15 +206,15 @@ def test_surrogate_override_invalid_locale_warns_and_falls_back(
 async def test_regex_overlap_strategy_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`overlap_strategy` kwarg overrides config.regex_overlap_strategy
+    """`overlap_strategy` kwarg overrides CONFIG.overlap_strategy
     for one call."""
-    from types import SimpleNamespace
+    from dataclasses import replace
     monkeypatch.setattr(
-        regex_mod,
-        "config",
-        SimpleNamespace(
-            regex_patterns_path="bundled:regex_pentest.yaml",
-            regex_overlap_strategy="priority",
+        regex_mod, "CONFIG",
+        replace(
+            regex_mod.CONFIG,
+            patterns_path="bundled:regex_pentest.yaml",
+            overlap_strategy="priority",
         ),
     )
     monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
@@ -379,14 +379,15 @@ def test_denylist_registry_loader_compiles_each_entry(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    from types import SimpleNamespace
-    fake_cfg = SimpleNamespace(
-        denylist_path="",
-        denylist_registry=f"legal={p_legal},marketing={p_mkt}",
-        denylist_backend="regex",
-    )
+    from dataclasses import replace
     import unittest.mock
-    with unittest.mock.patch.object(deny_mod, "config", fake_cfg):
+    fake_cfg = replace(
+        deny_mod.CONFIG,
+        path="",
+        registry=f"legal={p_legal},marketing={p_mkt}",
+        backend="regex",
+    )
+    with unittest.mock.patch.object(deny_mod, "CONFIG", fake_cfg):
         registry = deny_mod._load_registry()
     assert set(registry) == {"legal", "marketing"}
     # Each compiled index is a candidate-generator function — calling it

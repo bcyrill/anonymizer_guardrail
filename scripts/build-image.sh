@@ -249,9 +249,7 @@ resolve_flavour() {
       RESOLVED_TYPE="pf-service-baked-cu130"
       ;;
     # Companion service for nvidia/gliner-pii. Same four-variant grid
-    # as pf-service (CPU/CUDA × runtime/baked). Experimental — not yet
-    # wired into the guardrail's detector pipeline; built locally for
-    # model evaluation.
+    # as pf-service (CPU/CUDA × runtime/baked).
     gliner-service|gliner-pii-service)
       BUILD_ARGS=()
       DEFAULT_TAG="$TAG_GLINER_SERVICE"

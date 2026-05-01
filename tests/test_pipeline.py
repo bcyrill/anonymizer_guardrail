@@ -75,36 +75,35 @@ async def test_vault_evicts_after_pop(pipeline: Pipeline) -> None:
 
 
 def _patch_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    """Replace the frozen Config singleton in pipeline.py for one test.
-    Wraps the real config so all OTHER fields keep their values.
-    Governs the LLM detector specifically (config.llm_fail_closed)."""
-    from types import SimpleNamespace
-    from anonymizer_guardrail import pipeline as pipeline_mod
+    """Flip the LLM detector's fail_closed flag for one test by patching
+    `llm_mod.CONFIG`. The pipeline reads `spec.config.fail_closed` live,
+    so the patch takes effect immediately."""
+    from dataclasses import replace
+    from anonymizer_guardrail.detector import llm as llm_mod
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["llm_fail_closed"] = value
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+    monkeypatch.setattr(
+        llm_mod, "CONFIG", replace(llm_mod.CONFIG, fail_closed=value),
+    )
 
 
 def _patch_pf_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    """Same shim for privacy_filter_fail_closed. Independent from the
-    LLM flag — operators can fail closed on one and open on the other."""
-    from types import SimpleNamespace
-    from anonymizer_guardrail import pipeline as pipeline_mod
+    """Same shim for the privacy_filter detector's fail_closed flag."""
+    from dataclasses import replace
+    from anonymizer_guardrail.detector import privacy_filter as pf_mod
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["privacy_filter_fail_closed"] = value
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+    monkeypatch.setattr(
+        pf_mod, "CONFIG", replace(pf_mod.CONFIG, fail_closed=value),
+    )
 
 
 def _patch_gliner_pii_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    """Same shim for gliner_pii_fail_closed."""
-    from types import SimpleNamespace
-    from anonymizer_guardrail import pipeline as pipeline_mod
+    """Same shim for the gliner_pii detector's fail_closed flag."""
+    from dataclasses import replace
+    from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["gliner_pii_fail_closed"] = value
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+    monkeypatch.setattr(
+        gp_mod, "CONFIG", replace(gp_mod.CONFIG, fail_closed=value),
+    )
 
 
 def _gliner_detector_that_raises(exc_factory):
@@ -255,18 +254,10 @@ async def test_pf_and_llm_fail_modes_are_independent(
         PrivacyFilterUnavailableError,
     )
 
-    # Apply both flags via one config shim; _patch_*_fail_closed replaces
-    # the whole config, so calling both in sequence would only keep the
-    # last patch's value for the field that matters.
-    from types import SimpleNamespace
-    from anonymizer_guardrail import pipeline as pipeline_mod
-    fields = {
-        f: getattr(pipeline_mod.config, f)
-        for f in pipeline_mod.config.__dataclass_fields__
-    }
-    fields["llm_fail_closed"] = False           # LLM open
-    fields["privacy_filter_fail_closed"] = True  # PF closed
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
+    # Each per-detector CONFIG is independent now, so the two patches
+    # are simply applied in sequence to their respective modules.
+    _patch_fail_closed(monkeypatch, False)        # LLM open
+    _patch_pf_fail_closed(monkeypatch, True)      # PF closed
 
     # PF detector raising → propagates (PF is fail-closed).
     p = Pipeline()

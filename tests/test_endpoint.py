@@ -259,16 +259,18 @@ def test_unexpected_exception_returns_blocked_with_internal_error(
 # ── Forwarded-key path ───────────────────────────────────────────────────────
 
 
-def _patch_config(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
-    """Replace main_mod.config with a SimpleNamespace mirroring the real
-    Config plus overrides. Config is a frozen dataclass, so we can't
-    mutate it directly."""
-    fields = {
-        f: getattr(main_mod.config, f)
-        for f in main_mod.config.__dataclass_fields__
-    }
-    fields.update(overrides)
-    monkeypatch.setattr(main_mod, "config", SimpleNamespace(**fields))
+def _patch_llm_config(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
+    """Patch the LLM detector's CONFIG with the given field overrides.
+    Tests that previously called `_patch_config(llm_use_forwarded_key=True)`
+    against the central Config now patch `llm_mod.CONFIG.use_forwarded_key`
+    — same effect via the new per-detector config layout."""
+    from dataclasses import replace
+    from anonymizer_guardrail.detector import llm as llm_mod
+
+    # Drop the legacy `llm_` prefix from override keys so test call
+    # sites don't have to track which prefix the central Config used.
+    cleaned = {k.removeprefix("llm_"): v for k, v in overrides.items()}
+    monkeypatch.setattr(llm_mod, "CONFIG", replace(llm_mod.CONFIG, **cleaned))
 
 
 class _CapturingPipeline:
@@ -321,7 +323,7 @@ def test_forwarded_bearer_extracted_when_feature_enabled(
     request_headers → the token reaches Pipeline.anonymize as api_key."""
     cap = _CapturingPipeline()
     monkeypatch.setattr(main_mod, "_pipeline", cap)
-    _patch_config(monkeypatch, llm_use_forwarded_key=True)
+    _patch_llm_config(monkeypatch, llm_use_forwarded_key=True)
 
     client.post(
         "/beta/litellm_basic_guardrail_api",
@@ -342,7 +344,7 @@ def test_forwarded_bearer_ignored_when_feature_disabled(
     when LLM_USE_FORWARDED_KEY is false. Default behaviour."""
     cap = _CapturingPipeline()
     monkeypatch.setattr(main_mod, "_pipeline", cap)
-    _patch_config(monkeypatch, llm_use_forwarded_key=False)
+    _patch_llm_config(monkeypatch, llm_use_forwarded_key=False)
 
     client.post(
         "/beta/litellm_basic_guardrail_api",
@@ -364,7 +366,7 @@ def test_redacted_authorization_does_not_become_bearer(
     detection LLM and produce a confusing 401."""
     cap = _CapturingPipeline()
     monkeypatch.setattr(main_mod, "_pipeline", cap)
-    _patch_config(monkeypatch, llm_use_forwarded_key=True)
+    _patch_llm_config(monkeypatch, llm_use_forwarded_key=True)
 
     client.post(
         "/beta/litellm_basic_guardrail_api",

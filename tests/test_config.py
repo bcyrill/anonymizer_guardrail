@@ -12,7 +12,7 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 
 import pytest
 
-from anonymizer_guardrail.config import _llm_fail_closed_default
+from anonymizer_guardrail.detector.llm import _llm_fail_closed_default
 
 
 # ── LLM_FAIL_CLOSED / FAIL_CLOSED deprecation shim ─────────────────────────

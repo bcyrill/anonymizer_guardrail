@@ -968,6 +968,109 @@ scripts/test-examples.sh --preset pentest      # pf + privacy_filter + pentest c
 scripts/test-examples.sh                       # connect to BASE_URL (already-running guardrail)
 ```
 
+### Adding a new detector
+
+Detectors are wired through a registry — `detector/__init__.py` holds an
+ordered list of `DetectorSpec` constants, and `Pipeline` / `main.py`
+iterate that list to build semaphores, in-flight counters, the factory
+dispatch table, exception handlers, and the `/health` stats payload.
+Adding a new detector is a four-step change in three Python files (plus
+tests). The bash launchers (`cli.sh` / `menu.sh` / `_lib.sh`) are
+deliberately not registry-driven — bash can't consume Python state — so
+they need separate hand-wiring; details below.
+
+**1. Write the detector class.** New file under
+`src/anonymizer_guardrail/detector/`. Implement the `Detector` Protocol
+from `detector/base.py`: a `name: str` class attribute and an
+`async def detect(self, text: str, **kwargs) -> list[Match]`. If the
+detector talks to an external service, raise a typed
+`<Yours>UnavailableError` on availability failures (connect / timeout /
+non-200). Mirror `RemoteGlinerPIIDetector` for shape.
+
+**2. Define a `CONFIG` dataclass in the same module.** Frozen
+`@dataclass` with the env-var-derived fields the detector needs.
+Conventional field names: `url`, `timeout_s`, `max_concurrency`,
+`fail_closed` for backend-style detectors. Use `_env_bool` /
+`_env_int` from `..config` for the env helpers.
+
+```python
+from dataclasses import dataclass
+from ..config import _env_bool, _env_int
+
+@dataclass(frozen=True)
+class MyDetectorConfig:
+    url: str = os.getenv("MY_DETECTOR_URL", "")
+    timeout_s: int = _env_int("MY_DETECTOR_TIMEOUT_S", 30)
+    max_concurrency: int = _env_int("MY_DETECTOR_MAX_CONCURRENCY", 10)
+    fail_closed: bool = _env_bool("MY_DETECTOR_FAIL_CLOSED", True)
+
+CONFIG = MyDetectorConfig()
+```
+
+The pipeline reads `spec.config.fail_closed` and `spec.config.max_concurrency`
+live, so test monkeypatches via `dataclasses.replace(MOD.CONFIG, …)`
+take effect immediately for all consumers.
+
+**3. Define a `SPEC` constant in the same module.**
+
+```python
+import sys
+from .spec import DetectorSpec
+
+SPEC = DetectorSpec(
+    name="my_detector",                  # DETECTOR_MODE token
+    factory=MyDetector,                  # () -> Detector
+    module=sys.modules[__name__],        # for live CONFIG lookup
+    has_semaphore=True,                  # gate detect() behind a semaphore?
+    stats_prefix="my_detector",          # /health key prefix
+    unavailable_error=MyDetectorUnavailableError,
+    blocked_reason=(
+        "My detector is unreachable; request blocked to prevent "
+        "unredacted data from reaching the upstream model."
+    ),
+)
+```
+
+Optional `prepare_call_kwargs=fn` if `detect()` takes per-request
+overrides from the `Overrides` dataclass — see `llm.py` for the
+shape (LLM passes `api_key`, `model`, `prompt_name`).
+
+**4. Register in `detector/__init__.py`.** Append to `REGISTERED_SPECS`
+in canonical priority order (regex → denylist → privacy_filter → … → llm):
+
+```python
+from .my_detector import SPEC as _MY_DETECTOR_SPEC
+REGISTERED_SPECS = (..., _MY_DETECTOR_SPEC, ...)
+```
+
+That's it for the Python side. `Pipeline.__init__` picks up the new
+spec automatically — its semaphore + counter are allocated, the log
+line includes its fail-mode and cap, `_run` dispatches to it via
+`SPECS_BY_NAME[det.name]`, and `main.py`'s `BLOCKED` handler maps the
+typed error via the `TYPED_UNAVAILABLE_ERRORS` tuple. `/health`
+gains `<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency`
+keys.
+
+**Tests:** copy the shape of `tests/test_remote_gliner_pii.py` (detector
+unit tests) and the per-detector blocks in `tests/test_pipeline.py`
+(in-flight counter, fail-closed propagation, fail-open swallowing).
+Patch via `dataclasses.replace(MOD.CONFIG, ...)` — never reach into the
+central `Config`.
+
+**Bash launchers (still hand-wired):** if operators should be able to
+configure the detector through the menu/cli, also update
+`scripts/_lib.sh` (env-var globals docs at the top, `DETECTOR_HAS_X`
+predicate in `resolve_predicates`, optional `start_x` / `cleanup_x`
+helpers, env passthroughs in `build_run_args`, plan rows in
+`print_plan`, run wiring in `run_guardrail`), `scripts/menu.sh`
+(globals at top, checklist entry in `ws_pick_detector_mode`, submenu
++ widgets, validation msgbox, auto-start hook), and `scripts/cli.sh`
+(flag globals, parser cases, validation, auto-start hook). See the
+gliner_pii migration in commit history for the full pattern. Long
+term, this fan-out is targeted by the *Detector registration API*
+TASKS.md entry — eventually a generated manifest will replace the
+hand-wiring.
+
 ## Limitations
 
 - **Single replica.** The vault is in-memory; mappings written on one replica
