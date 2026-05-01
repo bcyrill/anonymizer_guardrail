@@ -196,9 +196,30 @@ class RemoteGlinerPIIDetector:
             self.threshold if self.threshold is not None else "<server default>",
         )
 
-    async def detect(self, text: str) -> list[Match]:
+    async def detect(
+        self,
+        text: str,
+        *,
+        labels: list[str] | None = None,
+        threshold: float | None = None,
+    ) -> list[Match]:
+        """Per-call `labels` / `threshold` override the detector's
+        configured defaults for this request only — same shape as
+        `LLMDetector.detect(model=…, prompt_name=…)`. Lets the
+        per-request override path (`additional_provider_specific_params`)
+        pin a different label vocabulary per route without redeploying.
+        """
         if not text or not text.strip():
             return []
+
+        # Per-call overrides win; otherwise use what was configured at
+        # construction time (which itself fell back to the env defaults).
+        # Local variables — never mutate self.labels / self.threshold,
+        # the detector instance is shared across requests.
+        effective_labels = labels if labels is not None else self.labels
+        effective_threshold = (
+            threshold if threshold is not None else self.threshold
+        )
 
         endpoint = f"{self.url}/detect"
         # Build the request body with only the fields the operator
@@ -207,10 +228,10 @@ class RemoteGlinerPIIDetector:
         # keeps both ends decoupled — operators can tune the vocabulary
         # on either side without coordinating.
         body: dict[str, Any] = {"text": text}
-        if self.labels is not None:
-            body["labels"] = self.labels
-        if self.threshold is not None:
-            body["threshold"] = self.threshold
+        if effective_labels is not None:
+            body["labels"] = effective_labels
+        if effective_threshold is not None:
+            body["threshold"] = effective_threshold
 
         # Availability errors (transport-layer + non-200) raise so the
         # pipeline's GLINER_PII_FAIL_CLOSED policy decides whether
@@ -312,6 +333,21 @@ def _parse_matches(body: Any, source_text: str) -> list[Match]:
     return out
 
 
+def _gliner_call_kwargs(overrides: Any, api_key: str | None) -> dict[str, Any]:  # noqa: ARG001
+    """Per-call kwargs from the request's `additional_provider_specific_params`.
+    `api_key` is unused (the gliner-pii service is unauthenticated by
+    design — it sits inside the trust boundary alongside the
+    guardrail) but kept in the signature for the DetectorSpec contract.
+
+    Overrides.gliner_labels is a tuple (frozen for Overrides hashability);
+    converted to a list here because the JSON request body uses lists.
+    """
+    return {
+        "labels": list(overrides.gliner_labels) if overrides.gliner_labels is not None else None,
+        "threshold": overrides.gliner_threshold,
+    }
+
+
 def _gliner_pii_factory() -> Detector:
     """Construct the gliner-pii detector, requiring GLINER_PII_URL.
 
@@ -339,8 +375,7 @@ SPEC = DetectorSpec(
     name="gliner_pii",
     factory=_gliner_pii_factory,
     module=sys.modules[__name__],
-    # No prepare_call_kwargs yet: per-request labels/threshold overrides
-    # are deferred (TASKS.md). Defaults to the no-op kwargs builder.
+    prepare_call_kwargs=_gliner_call_kwargs,
     has_semaphore=True,
     stats_prefix="gliner_pii",
     unavailable_error=GlinerPIIUnavailableError,

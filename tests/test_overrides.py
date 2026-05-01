@@ -151,6 +151,110 @@ def test_parse_overrides_oversize_detector_list_rejected(
     assert any("exceeds cap" in r.message for r in caplog.records)
 
 
+# ── gliner_labels / gliner_threshold overrides ──────────────────────────────
+
+
+def test_parse_overrides_gliner_labels_string_form() -> None:
+    """Comma-separated string normalizes to a tuple. Whitespace stripped."""
+    o = parse_overrides({"gliner_labels": " email, ssn ,phone"})
+    assert o.gliner_labels == ("email", "ssn", "phone")
+
+
+def test_parse_overrides_gliner_labels_list_form() -> None:
+    """JSON array form — what the LiteLLM client typically sends."""
+    o = parse_overrides({"gliner_labels": ["email", "ssn", "phone"]})
+    assert o.gliner_labels == ("email", "ssn", "phone")
+
+
+def test_parse_overrides_gliner_labels_empty_string_means_default() -> None:
+    """Empty / whitespace-only string → None (server-side default applies)."""
+    assert parse_overrides({"gliner_labels": ""}).gliner_labels is None
+    assert parse_overrides({"gliner_labels": "   "}).gliner_labels is None
+    assert parse_overrides({"gliner_labels": []}).gliner_labels is None
+
+
+def test_parse_overrides_gliner_labels_wrong_type_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    o = parse_overrides({"gliner_labels": 42})
+    assert o.gliner_labels is None
+    assert any("gliner_labels" in r.message for r in caplog.records)
+
+
+def test_parse_overrides_gliner_labels_non_string_item_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A list with a non-string item → warn + drop the whole override."""
+    caplog.set_level(logging.WARNING)
+    o = parse_overrides({"gliner_labels": ["email", 123, "ssn"]})
+    assert o.gliner_labels is None
+    assert any("gliner_labels" in r.message for r in caplog.records)
+
+
+def test_parse_overrides_gliner_labels_oversize_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Defensive cap protects the model from runaway label vocabularies."""
+    caplog.set_level(logging.WARNING)
+    huge = ",".join(f"label{i}" for i in range(60))
+    o = parse_overrides({
+        "gliner_labels": huge,
+        "gliner_threshold": 0.5,  # valid override in same dict
+    })
+    assert o.gliner_labels is None
+    # Other overrides in the same dict still apply — warn-and-drop policy.
+    assert o.gliner_threshold == 0.5
+    assert any("exceeds cap" in r.message for r in caplog.records)
+
+
+def test_parse_overrides_gliner_threshold_float() -> None:
+    o = parse_overrides({"gliner_threshold": 0.7})
+    assert o.gliner_threshold == 0.7
+
+
+def test_parse_overrides_gliner_threshold_int_promoted_to_float() -> None:
+    """`0` and `1` are valid endpoints — accept ints and promote."""
+    assert parse_overrides({"gliner_threshold": 0}).gliner_threshold == 0.0
+    assert parse_overrides({"gliner_threshold": 1}).gliner_threshold == 1.0
+
+
+def test_parse_overrides_gliner_threshold_out_of_range_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    o = parse_overrides({"gliner_threshold": 1.5})
+    assert o.gliner_threshold is None
+    o = parse_overrides({"gliner_threshold": -0.1})
+    assert o.gliner_threshold is None
+    msgs = " | ".join(r.message for r in caplog.records)
+    assert "gliner_threshold" in msgs
+
+
+def test_parse_overrides_gliner_threshold_bool_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Python `bool` is a subclass of `int`, so `True` would otherwise
+    slip through as 1.0. Reject explicitly — a boolean threshold is a
+    type error, not a confidence value."""
+    caplog.set_level(logging.WARNING)
+    assert parse_overrides({"gliner_threshold": True}).gliner_threshold is None
+    assert parse_overrides({"gliner_threshold": False}).gliner_threshold is None
+
+
+def test_parse_overrides_gliner_threshold_string_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The env-var form (`GLINER_PII_THRESHOLD="0.5"`) is parsed inside
+    the detector. The per-request override comes from JSON, where 0.5
+    is already a number — accepting strings would just hide
+    misconfigured clients."""
+    caplog.set_level(logging.WARNING)
+    o = parse_overrides({"gliner_threshold": "0.5"})
+    assert o.gliner_threshold is None
+    assert any("gliner_threshold" in r.message for r in caplog.records)
+
+
 # ── Surrogate cache key with overrides ──────────────────────────────────────
 def test_surrogate_override_use_faker_separates_cache_buckets() -> None:
     """use_faker=False forces opaque tokens regardless of the configured

@@ -66,6 +66,13 @@ class Overrides:
     llm_model: str | None = None
     llm_prompt: str | None = None
     denylist: str | None = None
+    # Per-request zero-shot vocabulary for the gliner_pii detector.
+    # Tuple (frozen) so Overrides stays hashable; the detector
+    # converts back to a list when building the request body.
+    gliner_labels: tuple[str, ...] | None = None
+    # Per-request confidence cutoff for gliner_pii (0..1). None →
+    # detector falls back to its configured default.
+    gliner_threshold: float | None = None
 
     @classmethod
     def empty(cls) -> Overrides:
@@ -83,6 +90,12 @@ _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
 # construction time.
 _MAX_LOCALE_CHAIN = 3
 _MAX_DETECTOR_LIST = len(REGISTERED_SPECS)
+# Cap on per-request gliner labels. The model can technically take
+# more, but a runaway list balloons the request body, the model's
+# attention cost, and per-call latency. 50 covers any realistic
+# vocabulary; anything larger smells like an authoring mistake or
+# abuse. Same defensive shape as `_MAX_LOCALE_CHAIN`.
+_MAX_GLINER_LABELS = 50
 
 
 def _parse_locale(value: Any) -> tuple[str, ...] | None:
@@ -105,6 +118,46 @@ def _parse_locale(value: Any) -> tuple[str, ...] | None:
             f"locale chain length {len(parts)} exceeds cap of {_MAX_LOCALE_CHAIN}"
         )
     return tuple(parts) if parts else None
+
+
+def _parse_label_list(value: Any) -> tuple[str, ...] | None:
+    """Accept either ``"email,ssn,phone"`` (string) or
+    ``["email", "ssn", "phone"]`` (array) and normalize to a tuple.
+    Empty input → None (the detector then falls back to its
+    configured default labels). Capped at `_MAX_GLINER_LABELS`."""
+    if isinstance(value, str):
+        parts = [s.strip() for s in value.split(",") if s.strip()]
+    elif isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError(
+                    f"label list item must be string, got {type(item).__name__}"
+                )
+            s = item.strip()
+            if s:
+                parts.append(s)
+    else:
+        raise TypeError(f"expected string or list, got {type(value).__name__}")
+    if len(parts) > _MAX_GLINER_LABELS:
+        raise ValueError(
+            f"gliner_labels length {len(parts)} exceeds cap of {_MAX_GLINER_LABELS}"
+        )
+    return tuple(parts) if parts else None
+
+
+def _parse_threshold(value: Any) -> float | None:
+    """Accept int or float in [0, 1]. JSON booleans are rejected
+    (Python `bool` is a subclass of `int` so we have to test for it
+    first or `True` slips through as `1.0`)."""
+    if isinstance(value, bool):
+        raise TypeError(f"expected number, got bool")
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"expected number, got {type(value).__name__}")
+    f = float(value)
+    if not 0.0 <= f <= 1.0:
+        raise ValueError(f"gliner_threshold {f} not in [0, 1]")
+    return f
 
 
 def _parse_detector_mode(value: Any) -> tuple[str, ...] | None:
@@ -147,6 +200,8 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
     llm_model: str | None = None
     llm_prompt: str | None = None
     denylist: str | None = None
+    gliner_labels: tuple[str, ...] | None = None
+    gliner_threshold: float | None = None
 
     for key, value in raw.items():
         try:
@@ -174,6 +229,10 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
                 stripped = value.strip()
                 if stripped:
                     llm_model = stripped
+            elif key == "gliner_labels":
+                gliner_labels = _parse_label_list(value)
+            elif key == "gliner_threshold":
+                gliner_threshold = _parse_threshold(value)
             elif key in ("regex_patterns", "llm_prompt", "denylist"):
                 # Each names a registered alternative
                 # (REGEX_PATTERNS_REGISTRY / LLM_SYSTEM_PROMPT_REGISTRY /
@@ -213,4 +272,6 @@ def parse_overrides(raw: dict[str, Any] | None) -> Overrides:
         llm_model=llm_model,
         llm_prompt=llm_prompt,
         denylist=denylist,
+        gliner_labels=gliner_labels,
+        gliner_threshold=gliner_threshold,
     )

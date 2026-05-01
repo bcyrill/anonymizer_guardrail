@@ -214,6 +214,104 @@ async def test_request_omits_labels_when_unset(
     assert "threshold" not in body
 
 
+# ── Per-request labels / threshold overrides ───────────────────────────────
+
+
+async def test_per_call_labels_override_construction_default(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Detector constructed with labels=["email","ssn"] but the per-call
+    kwargs pass labels=["medical_record_number"] — the call should use
+    the per-call value, not the construction default. Mirrors how
+    LLMDetector lets per-call `model` override `self.model`."""
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config(labels="email,ssn"))
+    det = RemoteGlinerPIIDetector(url="http://service:8002")
+    mock_post.return_value = _ok_response([])
+
+    await det.detect("anything", labels=["medical_record_number"])
+
+    _, call_kwargs = mock_post.call_args
+    body = call_kwargs["json"]
+    assert body["labels"] == ["medical_record_number"]
+
+
+async def test_per_call_threshold_overrides_construction_default(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config(threshold="0.5"))
+    det = RemoteGlinerPIIDetector(url="http://service:8002")
+    mock_post.return_value = _ok_response([])
+
+    await det.detect("anything", threshold=0.9)
+
+    _, call_kwargs = mock_post.call_args
+    body = call_kwargs["json"]
+    assert body["threshold"] == 0.9
+
+
+async def test_per_call_none_falls_back_to_self_state(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Passing labels=None / threshold=None doesn't UNSET — it means
+    'no override, use the configured default'. Important: the pipeline
+    passes None when there's no Overrides value, and we don't want
+    that to wipe out a server-side configured label list."""
+    monkeypatch.setattr(
+        gp_mod, "CONFIG", _fake_config(labels="email,ssn", threshold="0.6"),
+    )
+    det = RemoteGlinerPIIDetector(url="http://service:8002")
+    mock_post.return_value = _ok_response([])
+
+    await det.detect("anything", labels=None, threshold=None)
+
+    _, call_kwargs = mock_post.call_args
+    body = call_kwargs["json"]
+    assert body["labels"] == ["email", "ssn"]
+    assert body["threshold"] == 0.6
+
+
+async def test_per_call_doesnt_mutate_detector_state(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """The detector instance is shared across requests. A per-call
+    override must NOT stick to subsequent calls — would be a privacy
+    bug if route A's labels leaked into route B."""
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config(labels="email"))
+    det = RemoteGlinerPIIDetector(url="http://service:8002")
+    mock_post.return_value = _ok_response([])
+
+    await det.detect("a", labels=["ssn"])
+    await det.detect("b")  # no override → should fall back to ["email"]
+
+    second_call_body = mock_post.call_args_list[1].kwargs["json"]
+    assert second_call_body["labels"] == ["email"]
+
+
+def test_gliner_call_kwargs_unwraps_overrides() -> None:
+    """The `prepare_call_kwargs` helper turns an Overrides into the
+    kwargs the detector expects. List → tuple at the Overrides
+    boundary (frozen-dataclass requirement); back to list here."""
+    from anonymizer_guardrail.api import Overrides
+    from anonymizer_guardrail.detector.remote_gliner_pii import _gliner_call_kwargs
+
+    o = Overrides(
+        gliner_labels=("email", "ssn"),
+        gliner_threshold=0.4,
+    )
+    kwargs = _gliner_call_kwargs(o, api_key=None)
+    assert kwargs == {"labels": ["email", "ssn"], "threshold": 0.4}
+
+
+def test_gliner_call_kwargs_passes_none_when_unset() -> None:
+    """Empty Overrides → both kwargs are None, telling the detector
+    'no override, use construction defaults'."""
+    from anonymizer_guardrail.api import Overrides
+    from anonymizer_guardrail.detector.remote_gliner_pii import _gliner_call_kwargs
+
+    kwargs = _gliner_call_kwargs(Overrides.empty(), api_key=None)
+    assert kwargs == {"labels": None, "threshold": None}
+
+
 # ── Hallucination guard ────────────────────────────────────────────────────
 
 
