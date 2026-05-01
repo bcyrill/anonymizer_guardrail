@@ -145,9 +145,14 @@ must be set when `gliner_pii` is in `DETECTOR_MODE`.
 `LLM_FAIL_CLOSED` / `PRIVACY_FILTER_FAIL_CLOSED` flags — operators
 can fail closed on one detector and open on another. When the
 detector raises `GlinerPIIUnavailableError` (service unreachable,
-timeout, non-200, or any unexpected exception under fail-closed), the
-guardrail returns `BLOCKED`. With fail-open, the error is logged and
-the request proceeds with coverage from the remaining detectors.
+timeout, non-200, unparseable 200 OK body or wrong-shape payload, or
+any unexpected exception under fail-closed), the guardrail returns
+`BLOCKED`. With fail-open, the error is logged and the request
+proceeds with coverage from the remaining detectors. A 200 OK with
+garbage in it counts as unavailable — soft-failing those would let
+unredacted text through under fail-closed. Per-entry malformed
+entries inside an otherwise-valid `{"matches": [...]}` payload still
+drop silently.
 
 ## License note
 

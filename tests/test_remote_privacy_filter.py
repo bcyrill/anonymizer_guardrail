@@ -219,12 +219,16 @@ async def test_non_200_raises_unavailable(
         await detector.detect("hello")
 
 
-# ── Content failure modes — non-fatal, log + return [] ─────────────────────
-# A 200 with a malformed body is the service responding badly, not an
-# outage. Same split LLMDetector uses.
+# ── Whole-response content errors → raise PrivacyFilterUnavailableError ───
+# A 200 with an unparseable / wrong-shape body means the service replied
+# but didn't say anything we can act on. fail_closed=True is explicitly
+# the "block rather than risk leakage" posture, so soft-failing these
+# would silently violate it. Per-entry malformed entries (covered above
+# by the hallucination-guard test) still drop quietly — those are local
+# to one entity, not the whole response.
 
 
-async def test_non_json_body_degrades_to_empty(
+async def test_non_json_body_raises_unavailable(
     detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
 ) -> None:
     resp = MagicMock(spec=httpx.Response)
@@ -232,33 +236,50 @@ async def test_non_json_body_degrades_to_empty(
     resp.json.side_effect = ValueError("Expecting value")
     resp.text = "not json"
     mock_post.return_value = resp
-    assert await detector.detect("hello") == []
+    with pytest.raises(PrivacyFilterUnavailableError, match="non-JSON"):
+        await detector.detect("hello")
 
 
-async def test_malformed_response_shape_degrades_to_empty(
+async def test_malformed_response_shape_raises_unavailable(
     detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
 ) -> None:
-    """`matches` field present but the wrong type — drop quietly rather
-    than crash. Same warn-and-empty policy as every other HTTP failure."""
+    """`matches` field present but the wrong type — schema violation,
+    raise so PRIVACY_FILTER_FAIL_CLOSED applies."""
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
     resp.json.return_value = {"matches": "not a list"}
     resp.text = ""
     mock_post.return_value = resp
-    assert await detector.detect("hello") == []
+    with pytest.raises(PrivacyFilterUnavailableError, match="matches"):
+        await detector.detect("hello")
 
 
-async def test_response_with_top_level_list_degrades_to_empty(
+async def test_response_with_top_level_list_raises_unavailable(
     detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
 ) -> None:
     """A service that sent a bare list at the top instead of a JSON
-    object → defensive: drop quietly. Documents the expected shape."""
+    object — schema violation, raise."""
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
     resp.json.return_value = ["unexpected", "shape"]
     resp.text = ""
     mock_post.return_value = resp
-    assert await detector.detect("hello") == []
+    with pytest.raises(PrivacyFilterUnavailableError, match="isn't an object"):
+        await detector.detect("hello")
+
+
+async def test_per_entry_malformed_entries_drop_silently(
+    detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
+) -> None:
+    """Per-entry failures invalidate ONE entity; the rest of the response
+    is still good. Different from whole-response failures, which raise."""
+    mock_post.return_value = _ok_response([
+        "not a dict",                               # bad entry → drop
+        {"text": "alice@example.com", "entity_type": "EMAIL_ADDRESS"},
+        {"entity_type": "PERSON"},                  # missing text → drop
+    ])
+    matches = await detector.detect("Email alice@example.com please")
+    assert [m.text for m in matches] == ["alice@example.com"]
 
 
 # ── Pipeline factory dispatch ───────────────────────────────────────────────

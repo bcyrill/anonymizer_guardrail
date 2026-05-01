@@ -191,8 +191,16 @@ policy:
 
 ```python
 class MyDetectorUnavailableError(RuntimeError):
-    """Raised on availability failure (connect / timeout / non-200)."""
+    """Raised on availability failure (connect / timeout / non-200 /
+    unparseable 200 OK body)."""
 ```
+
+A 200 OK that the detector can't parse counts as an availability
+failure: the backend replied but said nothing actionable, and
+soft-failing to `[]` would silently violate `*_FAIL_CLOSED=true`
+(the explicit "block rather than risk leakage" posture). Per-entry
+malformed entries within an otherwise-parseable payload still drop
+silently — those only invalidate one match, not the whole response.
 
 ### 2. Define a `CONFIG` dataclass
 

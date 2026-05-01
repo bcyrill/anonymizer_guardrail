@@ -21,8 +21,13 @@ Behaviour mirrors RemotePrivacyFilterDetector:
     errors) raise GlinerPIIUnavailableError so the pipeline's
     GLINER_PII_FAIL_CLOSED policy decides — block the request, or
     fall back to coverage from the other detectors.
-  * Content errors (non-JSON body, malformed `matches` field,
-    hallucinated text) are non-fatal and log+return-[] without raising.
+  * Whole-response content errors on a 200 (non-JSON body, top-level
+    type mismatch, `matches` field not a list) raise the same typed
+    error: the service replied but didn't say anything we can act on,
+    which fail_closed=True is meant to catch. Per-entry malformed
+    entries (entry not a dict, missing text, hallucinated text not in
+    source) are dropped silently — those are local to one entity, the
+    rest of the response is still usable.
 
 The label-to-ENTITY_TYPES mapping below normalizes gliner's lowercase
 snake_case labels (e.g. "ssn", "email") to the guardrail's canonical
@@ -263,20 +268,19 @@ class RemoteGlinerPIIDetector:
                 f"{resp.status_code}: {resp.text[:300]}"
             )
 
-        # Content errors below are non-fatal: log and return []. The
-        # service is reachable and replied 200, so this is a malformed
-        # response, not an outage. Same split LLMDetector / remote PF
-        # use for unexpected JSON shapes inside a 200 response.
+        # Whole-response failures on a 200 still raise so
+        # GLINER_PII_FAIL_CLOSED applies. The service is reachable but
+        # its reply is unusable — soft-failing to [] would let
+        # unredacted text through under fail_closed=True.
         try:
             payload = resp.json()
         except ValueError as exc:
-            log.warning(
-                "GLiNER-PII at %s returned non-JSON: %s | body=%r",
-                endpoint, exc, resp.text[:300],
-            )
-            return []
+            raise GlinerPIIUnavailableError(
+                f"GLiNER-PII at {endpoint} returned non-JSON body on "
+                f"HTTP 200: {exc} | body={resp.text[:300]!r}"
+            ) from exc
 
-        return _parse_matches(payload, text)
+        return _parse_matches(payload, text, endpoint)
 
     async def aclose(self) -> None:
         """Drain the httpx connection pool. Wired to Pipeline.aclose
@@ -284,24 +288,29 @@ class RemoteGlinerPIIDetector:
         await self._client.aclose()
 
 
-def _parse_matches(body: Any, source_text: str) -> list[Match]:
+def _parse_matches(body: Any, source_text: str, endpoint: str) -> list[Match]:
     """Translate `{"matches": [{...}, ...]}` from the service into Match
-    objects. Drops malformed entries and any whose `text` field doesn't
-    actually appear in the source — defensive against a future service
-    version returning bad offsets, mirroring the LLM / remote PF
-    detectors' hallucination guard."""
+    objects.
+
+    Whole-response shape failures (body not a JSON object, `matches`
+    field present but not a list) raise GlinerPIIUnavailableError so
+    GLINER_PII_FAIL_CLOSED decides. Per-entry malformed entries (entry
+    not a dict, missing/empty text, text not in source) are dropped
+    silently because they only invalidate one entity; the rest of the
+    response is still usable.
+    """
     if not isinstance(body, dict):
-        log.warning(
-            "GLiNER-PII response wasn't a JSON object: %r", body,
+        raise GlinerPIIUnavailableError(
+            f"GLiNER-PII at {endpoint} returned a JSON value that isn't "
+            f"an object (got {type(body).__name__}): {body!r}"
         )
-        return []
     matches_field = body.get("matches", [])
     if not isinstance(matches_field, list):
-        log.warning(
-            "GLiNER-PII response `matches` wasn't a list: %r",
-            matches_field,
+        raise GlinerPIIUnavailableError(
+            f"GLiNER-PII at {endpoint} returned `matches` of type "
+            f"{type(matches_field).__name__}, expected list: "
+            f"{matches_field!r}"
         )
-        return []
 
     out: list[Match] = []
     dropped: list[tuple[str, str]] = []

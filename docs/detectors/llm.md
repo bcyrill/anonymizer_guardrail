@@ -111,10 +111,16 @@ will likely return 401, which routes through `LLM_FAIL_CLOSED`).
 
 `LLM_FAIL_CLOSED` (default `true`) governs what happens when the LLM
 detector errors out. When the detector raises `LLMUnavailableError`
-(connect / timeout / non-200 / oversized input / any unexpected
-exception under fail-closed), the guardrail returns `BLOCKED`. With
-fail-open, the error is logged and the request proceeds with
-coverage from the remaining detectors.
+(connect / timeout / non-200 / oversized input / unparseable 200 OK
+body or content / any unexpected exception under fail-closed), the
+guardrail returns `BLOCKED`. With fail-open, the error is logged and
+the request proceeds with coverage from the remaining detectors.
+
+A 200 OK with garbage in it counts as unavailable: the backend
+replied but didn't say anything actionable. Per-entry malformed
+entries inside an otherwise-valid `{"entities": [...]}` payload still
+drop silently — those only invalidate one match, not the whole
+response.
 
 The flag is independent from `PRIVACY_FILTER_FAIL_CLOSED` and
 `GLINER_PII_FAIL_CLOSED` — operators can fail closed on the LLM and

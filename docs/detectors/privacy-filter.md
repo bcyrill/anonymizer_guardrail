@@ -89,9 +89,13 @@ switching to remote.
 `LLM_FAIL_CLOSED` and `GLINER_PII_FAIL_CLOSED` — operators can fail
 closed on one detector and open on another. When the privacy-filter
 detector raises `PrivacyFilterUnavailableError` (service unreachable,
-timeout, non-200, or any unexpected exception under fail-closed), the
-guardrail returns `BLOCKED`. With fail-open, the error is logged and
-the request proceeds with coverage from the remaining detectors. The
-flag applies to both the in-process and remote variants — a torch
-crash inside the in-process detector triggers the same fail-closed
-path as a connection error to the remote service.
+timeout, non-200, unparseable 200 OK body or wrong-shape payload, or
+any unexpected exception under fail-closed), the guardrail returns
+`BLOCKED`. With fail-open, the error is logged and the request
+proceeds with coverage from the remaining detectors. A 200 OK with
+garbage in it counts as unavailable — soft-failing those would let
+unredacted text through under fail-closed. Per-entry malformed
+entries inside an otherwise-valid `{"matches": [...]}` payload still
+drop silently. The flag applies to both the in-process and remote
+variants — a torch crash inside the in-process detector triggers the
+same fail-closed path as a connection error to the remote service.

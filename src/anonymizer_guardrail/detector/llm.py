@@ -151,16 +151,41 @@ def _extract_json_object(raw: str) -> str:
 
 
 def _parse_entities(raw: str, source_text: str) -> list[Match]:
+    """Parse the model's content payload into Match objects.
+
+    Whole-response failures (non-JSON content, top-level type mismatch,
+    `entities` field present but not a list) raise LLMUnavailableError
+    so the LLM_FAIL_CLOSED policy decides — a 200 carrying garbage means
+    the detector can't do its job, which is the case fail-closed exists
+    to catch. Per-entry malformed entries (entry not a dict, missing
+    text) are still dropped silently — those are local to one entity;
+    the rest of the response is still good. The hallucination guard
+    (text not in source) is the same kind of per-entry drop.
+    """
     try:
         cleaned = _extract_json_object(_strip_thinking(raw))
         data = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError) as exc:
-        log.warning("LLM returned non-JSON response: %s | raw=%r", exc, raw[:300])
-        return []
+        raise LLMUnavailableError(
+            f"LLM returned non-JSON content: {exc} | raw={raw[:300]!r}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise LLMUnavailableError(
+            f"LLM content was JSON but not an object (got "
+            f"{type(data).__name__}): raw={raw[:300]!r}"
+        )
+
+    entities = data.get("entities", [])
+    if not isinstance(entities, list):
+        raise LLMUnavailableError(
+            f"LLM content `entities` field is not a list (got "
+            f"{type(entities).__name__}): raw={raw[:300]!r}"
+        )
 
     out: list[Match] = []
     dropped: list[tuple[str, str]] = []
-    for entry in data.get("entities", []):
+    for entry in entities:
         if not isinstance(entry, dict):
             continue
         text = str(entry.get("text", "")).strip()
@@ -290,12 +315,26 @@ class LLMDetector:
                 f"LLM at {url} returned {resp.status_code}: {resp.text[:300]}"
             )
 
+        # 200 OK with an unparseable body or a missing
+        # choices/message/content path means the backend replied but the
+        # detector can't act on what came back. Treat it as an
+        # availability failure so LLM_FAIL_CLOSED decides — soft-failing
+        # to [] would silently let unredacted text through under
+        # fail_closed=True, defeating the policy.
         try:
             body = resp.json()
+        except ValueError as exc:
+            raise LLMUnavailableError(
+                f"LLM at {url} returned non-JSON body on HTTP 200: "
+                f"{exc} | body={resp.text[:300]!r}"
+            ) from exc
+        try:
             content = body["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError, ValueError) as exc:
-            log.warning("Unexpected LLM response shape: %s | body=%r", exc, resp.text[:300])
-            return []
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMUnavailableError(
+                f"LLM at {url} returned unexpected response shape: {exc} | "
+                f"body={resp.text[:300]!r}"
+            ) from exc
 
         return _parse_entities(content, text)
 

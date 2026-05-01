@@ -194,6 +194,127 @@ async def test_remote_protocol_error_routes_through_llm_unavailable(
         await detector.detect("hello")
 
 
+# ── Whole-response content errors on a 200 → raise LLMUnavailableError ────
+# A 200 OK whose body or content payload we can't parse means the
+# backend replied but said nothing actionable. Soft-failing to [] under
+# LLM_FAIL_CLOSED=True would silently let unredacted text through —
+# routing through the typed error means the policy decides.
+
+
+async def test_non_json_envelope_raises_unavailable(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """200 OK but the outer body isn't JSON at all (proxy returning
+    HTML, etc.). Must raise so LLM_FAIL_CLOSED applies."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.side_effect = ValueError("Expecting value")
+    resp.text = "<html>oops</html>"
+    mock_post.return_value = resp
+    with pytest.raises(LLMUnavailableError, match="non-JSON"):
+        await detector.detect("hello")
+
+
+async def test_unexpected_envelope_shape_raises_unavailable(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """JSON body but no `choices[0].message.content` path — backend
+    misbehaving (or LiteLLM's response-shape contract drifted)."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {"unexpected": "shape"}
+    resp.text = ""
+    mock_post.return_value = resp
+    with pytest.raises(LLMUnavailableError, match="unexpected response shape"):
+        await detector.detect("hello")
+
+
+async def test_non_json_content_raises_unavailable(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """Envelope is fine but the model's `content` payload isn't JSON
+    we can extract. The LLM is misbehaving — block under fail-closed
+    rather than silently treat as 'no entities'."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {
+        "choices": [{"message": {"content": "this is just plain prose, no JSON anywhere"}}]
+    }
+    resp.text = ""
+    mock_post.return_value = resp
+    with pytest.raises(LLMUnavailableError, match="non-JSON content"):
+        await detector.detect("hello")
+
+
+async def test_content_top_level_not_object_raises_unavailable(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """Content parses as JSON but the top-level value is a list, not
+    an object — schema violation."""
+    import json as _json
+
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {
+        "choices": [{"message": {"content": _json.dumps(["a", "b"])}}]
+    }
+    resp.text = ""
+    mock_post.return_value = resp
+    with pytest.raises(LLMUnavailableError, match="not an object"):
+        await detector.detect("hello")
+
+
+async def test_content_entities_field_not_a_list_raises_unavailable(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """`entities` field exists but is the wrong type."""
+    import json as _json
+
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {
+        "choices": [{"message": {"content": _json.dumps({"entities": "not a list"})}}]
+    }
+    resp.text = ""
+    mock_post.return_value = resp
+    with pytest.raises(LLMUnavailableError, match="not a list"):
+        await detector.detect("hello")
+
+
+async def test_content_missing_entities_treated_as_empty(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """`entities` missing entirely → the model said 'no PII' in the
+    object form. That's a valid, parseable response — return []."""
+    import json as _json
+
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {
+        "choices": [{"message": {"content": _json.dumps({"other_field": 42})}}]
+    }
+    resp.text = ""
+    mock_post.return_value = resp
+    assert await detector.detect("hello") == []
+
+
+async def test_per_entry_malformed_entries_drop_silently(
+    detector: LLMDetector, mock_post: AsyncMock,
+) -> None:
+    """Per-entry failures invalidate ONE entity; the rest of the
+    `entities` list is still good. Distinct from whole-response
+    failures, which raise."""
+    mock_post.return_value = _ok_response(
+        [
+            "not a dict",                              # bad entry → drop
+            {"text": "alice", "type": "PERSON"},
+            {"type": "PERSON"},                        # missing text → drop
+        ]
+    )
+    result = await detector.detect("hello alice")
+    assert [m.text for m in result] == ["alice"]
+
+
 def test_default_system_prompt_loads_from_bundled_file() -> None:
     """The bundled prompt must be readable at import-time — if hatchling
     stops packaging the prompts/ directory, this fails loudly."""

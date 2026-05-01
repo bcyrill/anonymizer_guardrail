@@ -371,30 +371,65 @@ async def test_non_200_raises(
         await detector.detect("hello")
 
 
-# ── Content errors → log and return [] ─────────────────────────────────────
+# ── Whole-response content errors → raise GlinerPIIUnavailableError ──────
+# A 200 with an unparseable / wrong-shape body means the service replied
+# but didn't say anything we can act on. Routing through the typed error
+# means GLINER_PII_FAIL_CLOSED applies — soft-failing to [] would
+# silently violate fail_closed=True. Per-entry malformed entries still
+# drop quietly (see test_drops_text_not_in_source above for the
+# hallucination-guard variant).
 
 
-async def test_non_json_returns_empty(
+async def test_non_json_raises_unavailable(
     detector: RemoteGlinerPIIDetector, mock_post: AsyncMock,
 ) -> None:
-    """Service is reachable (200) but body isn't JSON. Don't BLOCK over
-    a bad payload — log it and proceed with no PII matches from this
-    detector. Other detectors still run."""
+    """Service is reachable (200) but body isn't JSON. Treat as an
+    availability failure so GLINER_PII_FAIL_CLOSED decides."""
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
     resp.json.side_effect = ValueError("not json")
     resp.text = "garbage"
     mock_post.return_value = resp
-    assert await detector.detect("hello") == []
+    with pytest.raises(GlinerPIIUnavailableError, match="non-JSON"):
+        await detector.detect("hello")
 
 
-async def test_malformed_payload_returns_empty(
+async def test_malformed_payload_raises_unavailable(
     detector: RemoteGlinerPIIDetector, mock_post: AsyncMock,
 ) -> None:
-    """Body is JSON but doesn't have the expected `matches` list shape."""
+    """Body is JSON but doesn't have the expected `matches` list shape —
+    schema violation, raise."""
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
     resp.json.return_value = {"matches": "not a list"}
     resp.text = ""
     mock_post.return_value = resp
-    assert await detector.detect("hello") == []
+    with pytest.raises(GlinerPIIUnavailableError, match="matches"):
+        await detector.detect("hello")
+
+
+async def test_top_level_list_raises_unavailable(
+    detector: RemoteGlinerPIIDetector, mock_post: AsyncMock,
+) -> None:
+    """Bare list at the top instead of a JSON object — schema violation."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = ["unexpected", "shape"]
+    resp.text = ""
+    mock_post.return_value = resp
+    with pytest.raises(GlinerPIIUnavailableError, match="isn't an object"):
+        await detector.detect("hello")
+
+
+async def test_per_entry_malformed_entries_drop_silently(
+    detector: RemoteGlinerPIIDetector, mock_post: AsyncMock,
+) -> None:
+    """Per-entry failures invalidate ONE entity; the rest of the response
+    is still good. Different from whole-response failures, which raise."""
+    mock_post.return_value = _ok_response([
+        "not a dict",                               # bad entry → drop
+        {"text": "alice@example.com", "entity_type": "email"},
+        {"entity_type": "person"},                  # missing text → drop
+    ])
+    matches = await detector.detect("Email alice@example.com please")
+    assert [m.text for m in matches] == ["alice@example.com"]
