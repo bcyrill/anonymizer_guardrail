@@ -64,16 +64,23 @@ podman run --rm --name anonymizer \
   anonymizer-guardrail:latest
 ```
 
-`scripts/run_container.sh` accepts passthrough args after `--`, so the
-same wiring works through the helper script:
+`scripts/cli.sh` exposes `--llm-backend fake-llm` which auto-starts
+this service on a shared network and points the guardrail at it — no
+manual `-v` / `--network` plumbing needed:
 
 ```bash
-scripts/run_container.sh -t slim -- \
+scripts/cli.sh -t slim -d regex,llm --llm-backend fake-llm
+```
+
+If you'd rather wire it manually, `scripts/cli.sh` also accepts
+passthrough args after `--`:
+
+```bash
+scripts/cli.sh -t slim -d regex,llm -- \
   --network anonymizer-net \
   -e LLM_API_BASE=http://fake-llm:4000/v1 \
   -e LLM_API_KEY=any \
   -e LLM_MODEL=fake \
-  -e DETECTOR_MODE=regex,llm \
   -e LOG_LEVEL=debug
 ```
 

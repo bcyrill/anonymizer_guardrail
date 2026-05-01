@@ -7,16 +7,17 @@ whichever `DETECTOR_MODE` matches the example you want to try:
 
 ```bash
 # Regex-only (covers most examples below).
-scripts/run_container.sh -t slim --no-faker
+scripts/cli.sh -t slim -d regex --no-faker
 
 # Add the privacy-filter NER for the address / name examples.
-scripts/run_container.sh -t pf
+scripts/cli.sh -t pf -d regex,privacy_filter
 
 # Full stack, requires LLM_API_BASE / LLM_API_KEY for the LLM examples.
-DETECTOR_MODE=regex,privacy_filter,llm scripts/run_container.sh -t pf -- \
-  -e LLM_API_BASE=http://litellm:4000/v1 \
-  -e LLM_API_KEY=sk-litellm-master \
-  -e LLM_MODEL=anonymize
+scripts/cli.sh -t pf -d regex,privacy_filter,llm \
+  --llm-backend custom \
+  --llm-api-base http://litellm:4000/v1 \
+  --llm-api-key sk-litellm-master \
+  --llm-model anonymize
 ```
 
 The `--no-faker` flag in the first line makes surrogates opaque
@@ -41,9 +42,18 @@ curl -s http://localhost:8000/health | python -m json.tool
   "status": "ok",
   "detector_mode": "regex",
   "vault_size": 0,
-  "surrogate_cache_size": 0
+  "surrogate_cache_size": 0,
+  "surrogate_cache_max": 100000,
+  "llm_in_flight": 0,
+  "llm_max_concurrency": 10
 }
 ```
+
+The cache + concurrency caps come from `SURROGATE_CACHE_MAX_SIZE`
+and `LLM_MAX_CONCURRENCY` — useful for an ops dashboard that wants
+to alert on saturation (`llm_in_flight` approaching
+`llm_max_concurrency`) without having to know the configured cap
+separately.
 
 ## Anonymize / deanonymize round-trip
 
@@ -222,11 +232,70 @@ curl -s -X POST http://localhost:8000/beta/litellm_basic_guardrail_api \
   }' | python -m json.tool
 ```
 
+## Denylist — known sensitive terms
+
+Requires `DETECTOR_MODE` to include `denylist` and a YAML file at
+`DENYLIST_PATH`. Use this when you have a stable, well-known set of
+sensitive strings (employee names, project codenames, customer
+identifiers) — pure dictionary lookup is more reliable than regex
+shapes or LLM inference for those.
+
+A small example list:
+
+```yaml
+# /etc/anonymizer/deny.yaml
+entries:
+  - type: ORGANIZATION
+    value: AcmeCorp
+  - type: PERSON
+    value: alice smith
+    case_sensitive: false
+  - type: IDENTIFIER
+    value: project zephyr
+    case_sensitive: false
+```
+
+Pass it via `--denylist-path`, or set `DENYLIST_PATH` directly:
+
+```bash
+scripts/cli.sh -t slim -d denylist,regex --denylist-path /etc/anonymizer/deny.yaml
+```
+
+Then a request mentioning any of the entries gets them flagged:
+
+```bash
+curl -s -X POST http://localhost:8000/beta/litellm_basic_guardrail_api \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "texts": ["Alice Smith from AcmeCorp shipped Project Zephyr today."],
+    "input_type": "request",
+    "litellm_call_id": "demo-denylist"
+  }' | python -m json.tool
+```
+
+Two backends are available — `regex` (default, stdlib alternation,
+fast up to low thousands of entries) and `aho` (Aho-Corasick via
+`pyahocorasick`, sub-linear in pattern count) — controlled by
+`DENYLIST_BACKEND` / `--denylist-backend`. See the README's
+*Customising the denylist* section for the full schema.
+
 ## Privacy-filter NER — addresses and names
 
-Requires `DETECTOR_MODE` to include `privacy_filter` (use the `pf` or
-`pf-baked` image). Catches contextual entities the regex layer misses
-— full names, street addresses, free-text dates.
+Requires `DETECTOR_MODE` to include `privacy_filter`. Two
+deployment options work:
+
+- **In-process** — pick the `pf` or `pf-baked` guardrail image; the
+  model loads inside the guardrail container.
+- **Remote** — pick the `slim` image, set `PRIVACY_FILTER_URL` to a
+  running `privacy-filter-service` (or pass
+  `--privacy-filter-backend service` to auto-start one).
+
+Both produce byte-equivalent output; pick by deployment topology, not
+detection behaviour. See the README's *Privacy-filter detector*
+section for the trade-offs.
+
+Catches contextual entities the regex layer misses — full names,
+street addresses, free-text dates.
 
 ```bash
 curl -s -X POST http://localhost:8000/beta/litellm_basic_guardrail_api \

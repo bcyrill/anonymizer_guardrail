@@ -319,10 +319,10 @@ case "$TYPE" in
     say "  ${c_dim}# it via PRIVACY_FILTER_URL once RemotePrivacyFilterDetector lands.${c_rst}"
     ;;
   fake-llm)
-    say "  ${c_dim}# fake-llm is auto-started by run_container.sh when you${c_rst}"
+    say "  ${c_dim}# fake-llm is auto-started by scripts/cli.sh when you${c_rst}"
     say "  ${c_dim}# pick a DETECTOR_MODE that includes llm and choose the${c_rst}"
     say "  ${c_dim}# fake-llm backend. Just run a guardrail flavour:${c_rst}"
-    say "  scripts/run_container.sh -t slim -d regex,llm"
+    say "  scripts/cli.sh -t slim -d regex,llm --llm-backend fake-llm"
     say ""
     say "  ${c_dim}# To run it standalone (e.g. to probe rules directly):${c_rst}"
     say "  ${ENGINE} run --rm -p 4000:4000 ${TAG}"

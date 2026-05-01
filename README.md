@@ -724,11 +724,13 @@ matches are resolved at adoption time.
 Two helper scripts live under `scripts/`. They wrap `podman build` /
 `podman run` with sensible defaults, the `--format=docker` quirk for
 HEALTHCHECK preservation, the volume + shared-network plumbing, and
-auto-start of the fake-llm test backend.
+auto-start of both the fake-llm test backend and the privacy-filter
+inference service when the operator opts into them.
 
 ```bash
-# Build all four image flavours (slim, pf, pf-baked, fake-llm).
-# Pass -t to build a single one (e.g. -t slim).
+# Build every flavour: three guardrail images (slim, pf, pf-baked)
+# plus the auxiliary services (privacy-filter-service in two
+# variants, fake-llm). Pass -t to build a single one (e.g. -t slim).
 scripts/build-image.sh -t all
 
 # Interactive launcher — single-screen menuconfig-style UI, every
@@ -753,6 +755,19 @@ incoming chat-completion requests against a YAML rules file
 (`services/fake_llm/rules.example.yaml` by default; `--rules PATH`
 overrides), which is what makes the test recipes deterministic. See
 `services/fake_llm/README.md` for the rules schema.
+
+The same auto-start pattern applies to the privacy-filter inference
+service: when `DETECTOR_MODE` includes `privacy_filter` and the
+backend is set to `service` (`--privacy-filter-backend service`, or
+the matching menu choice), the launcher starts a
+`privacy-filter-service` container on the same shared network, mounts
+the shared `anonymizer-hf-cache` volume so the model isn't
+re-downloaded if you've used the `pf` guardrail flavour before, waits
+for `/health` to flip to `ok` (which can take minutes on a cold
+runtime-download image), and points the guardrail at
+`http://privacy-filter-service:8001`. Use this on top of the slim
+guardrail image to avoid baking torch + the model into the guardrail.
+See `services/privacy_filter/README.md` for the API contract.
 
 ### Image flavours
 
