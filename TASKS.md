@@ -198,7 +198,7 @@ limit.
 
 ---
 
-## Allowlist / denylist detector
+## Denylist detector
 
 **What:** a new `Detector` implementation that matches text against a
 configured list of literal strings (or simple patterns) and returns
@@ -221,19 +221,19 @@ database, customer CRM) that needs periodic refresh without restart.
 
 **Sketch:**
 
-1. Add an `AllowlistDetector` (the name's a misnomer — these are
-   *deny*-list entries we want flagged, but "allowlist" is the
-   conventional term in security tooling so worth picking carefully).
-2. Source: `ALLOWLIST_PATH=/path/to/list.yaml` env var, loaded at
+1. Add a `DenylistDetector` — these are entries we want flagged for
+   redaction, which is the denylist semantics in security tooling
+   (allowlist = pass-through, denylist = flag/block).
+2. Source: `DENYLIST_PATH=/path/to/list.yaml` env var, loaded at
    startup (with the same `bundled:` prefix and reload-on-restart
    semantics as the regex patterns).
 3. Schema: list of `{type, value, case_sensitive?}` entries; build an
    internal trie or aho-corasick matcher (e.g. `pyahocorasick`) for
    sub-linear matching at scale.
 4. `DETECTOR_MODE` is already a comma-separated list — adding the
-   allowlist becomes `DETECTOR_MODE=allowlist,regex,llm` (or any other
+   denylist becomes `DETECTOR_MODE=denylist,regex,llm` (or any other
    ordering operators want). No enum/schema change needed at that point.
-5. Tests with overlapping allowlist + regex matches, case-sensitivity
+5. Tests with overlapping denylist + regex matches, case-sensitivity
    toggling, matching at word boundaries vs anywhere.
 
 **Concrete trigger:**
