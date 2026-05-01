@@ -248,25 +248,3 @@ flexibility.
   cheap to vary; pointing at a different inference service per
   request is a deployment-shape question that doesn't belong in the
   request body.
-
----
-
-## ~~Detector quality benchmark script~~ — done
-
-**Closed.** Shipped as `scripts/benchmark.sh` (thin bash
-wrapper) → `python -m tools.detector_bench` (Click CLI under
-`tools/detector_bench/`, dev-only, outside the production wheel).
-
-- Corpus YAML schema: `name` / `description` / `detector_mode` /
-  `overrides` / `cases[]` with `expect` (recall + type) and
-  `must_keep` (precision). `requires:` per case for skip-vs-fail.
-- Bundled starter at `tests/corpus/pentest.yaml`; resolve via
-  `--config bundled:pentest` or a filesystem path.
-- Forces `use_faker: false` per request so opaque `[TYPE_HEX]`
-  tokens make types recoverable from the response.
-- `--preset NAME` machinery mirrors `test-examples.sh`.
-- Unit tests for the corpus loader + scoring logic in
-  `tests/test_detector_bench.py`.
-
-See [docs/benchmark.md](docs/benchmark.md) for the canonical
-operator-facing walkthrough.
