@@ -123,6 +123,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
 | `FAIL_CLOSED`     | `true`                        | Block requests if LLM detector errors    |
+| `HF_HUB_OFFLINE`  | `1` *(baked image only)* / *(unset)* | Pf-baked sets this so transformers doesn't ping HuggingFace Hub on every start; pass `-e HF_HUB_OFFLINE=0` to force online mode for a refresh. The `pf` (runtime-download) flavour leaves it unset on first run; `scripts/cli.sh --hf-offline` / the menu offer it after the cache volume is populated. |
 
 ### Forwarding the caller's API key
 
@@ -350,6 +351,43 @@ matches are resolved at adoption time.
 
 ## Run it
 
+### Quick start (scripts)
+
+Two helper scripts live under `scripts/`. They wrap `podman build` /
+`podman run` with sensible defaults, the `--format=docker` quirk for
+HEALTHCHECK preservation, the volume + shared-network plumbing, and
+auto-start of the fake-llm test backend.
+
+```bash
+# Build all four image flavours (slim, pf, pf-baked, fake-llm).
+# Pass -t to build a single one (e.g. -t slim).
+scripts/build-image.sh -t all
+
+# Interactive launcher — single-screen menuconfig-style UI, every
+# setting visible at once, drill in to edit, hit Launch.
+scripts/menu.sh
+
+# Flag-driven launcher with bundled presets:
+scripts/cli.sh --preset uuid-debug      # slim + regex,llm + fake-llm + LOG_LEVEL=debug
+scripts/cli.sh --preset pentest         # pf + regex,privacy_filter,llm + pentest patterns/prompt + fake-llm
+scripts/cli.sh --preset regex-only      # slim + regex only — no LLM creds needed
+
+# Exercise the curl recipes against a running guardrail
+# (or pass --preset to spin one up + tear it down):
+scripts/test-examples.sh --preset uuid-debug
+```
+
+When the chosen `DETECTOR_MODE` includes `llm` and the LLM backend is
+set to `fake-llm`, the launcher boots the fake-llm container in the
+background on a shared `anonymizer-net`, waits for `/health`, and
+points the guardrail at `http://fake-llm:4000/v1`. fake-llm matches
+incoming chat-completion requests against a YAML rules file
+(`fake-llm/rules.example.yaml` by default; `--rules PATH` overrides),
+which is what makes the test recipes deterministic. See `fake-llm/README.md`
+for the rules schema.
+
+### Image flavours
+
 Three image flavours, controlled by two build-args, sharing one
 `Containerfile`:
 
@@ -365,23 +403,37 @@ you're deploying behind GPUs; expect ~4 GB extra on top — that's roughly
 how much `nvidia-cuda-runtime`, `nvidia-cudnn`, `nvidia-cublas`, etc.
 weigh on Linux x86.)
 
+### Building manually
+
+`scripts/build-image.sh` is the recommended path; the equivalent raw
+commands are:
+
 ```bash
 # 1) Slim — no ML deps.
-podman build -t anonymizer-guardrail:latest -f Containerfile .
+podman build --format=docker -t anonymizer-guardrail:latest -f Containerfile .
 
 # 2) Privacy-filter, runtime download — small image, downloads ~6 GB on
 #    first container start. Mount a NAMED VOLUME so subsequent starts
 #    skip the download (see below).
-podman build -t anonymizer-guardrail:privacy-filter \
+podman build --format=docker -t anonymizer-guardrail:privacy-filter \
     --build-arg WITH_PRIVACY_FILTER=true -f Containerfile .
 
 # 3) Privacy-filter, model baked into image — self-contained, no runtime
 #    network, at the cost of a much larger image (size in the table above).
-podman build -t anonymizer-guardrail:privacy-filter-baked \
+podman build --format=docker -t anonymizer-guardrail:privacy-filter-baked \
     --build-arg WITH_PRIVACY_FILTER=true \
     --build-arg BAKE_PRIVACY_FILTER_MODEL=true \
     -f Containerfile .
 ```
+
+`--format=docker` is needed because podman defaults to OCI image
+format, which doesn't include a HEALTHCHECK field — without the flag,
+the `HEALTHCHECK` directive in the Containerfile is silently dropped
+and `podman healthcheck run` won't work. `docker build` always emits
+Docker format, so the flag is podman-specific (and `build-image.sh`
+adds it conditionally).
+
+### Running manually
 
 Slim or baked images run without any volume:
 
@@ -425,18 +477,33 @@ Volume options compared:
   first pod pays the download; later pods reuse the PVC. Use
   `ReadWriteMany` for shared cache across replicas.
 
-Smoke test:
+### Smoke test
 
 ```bash
 curl -fsS http://localhost:8000/health
 ```
 
+For end-to-end curl recipes covering the round-trip, every detector
+category, multi-text batches, and a kitchen-sink payload, see
+[`examples.md`](examples.md). To run those recipes as automated
+assertions: `scripts/test-examples.sh` (with `--preset NAME` to
+self-host a test guardrail).
+
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest                                # regex-only tests, no LLM needed
+pytest                                # unit tests, no container needed
 uvicorn anonymizer_guardrail.main:app --reload
+```
+
+End-to-end testing of the curl recipes against an actual container
+(builds + runs + asserts via `cli.sh --preset`):
+
+```bash
+scripts/test-examples.sh --preset uuid-debug   # slim + regex,llm + fake-llm
+scripts/test-examples.sh --preset pentest      # pf + privacy_filter + pentest config
+scripts/test-examples.sh                       # connect to BASE_URL (already-running guardrail)
 ```
 
 ## Limitations
