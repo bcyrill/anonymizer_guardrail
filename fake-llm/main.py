@@ -47,15 +47,17 @@ class Rule:
     """One matching rule.
 
     Matchers (a rule fires when EVERY set matcher succeeds):
-      - `match`       substring of the user message
-      - `match_regex` Python regex on the user message (.search semantics)
-      - `match_model` substring of the request's `model` field — useful for
-                      verifying that callers' llm_model overrides reach us
+      - `match`               substring of the user message
+      - `match_regex`         Python regex on the user message (.search semantics)
+      - `match_model`         substring of the request's `model` field — useful for
+                              verifying that callers' llm_model overrides reach us
+      - `match_system_prompt` substring of the system message — useful for
+                              verifying that llm_prompt overrides reach us
 
     At least one matcher must be set (otherwise the rule is unfireable).
     Within the text-side matchers (`match` and `match_regex`) the rule
-    fires when *either* hits (OR); the model matcher AND-combines with
-    that result.
+    fires when *either* hits (OR); the model + system-prompt matchers
+    AND-combine with that result.
 
     Response controls (mutually-compatible, applied in this order):
       - `delay_s`     sleep before responding (float seconds)
@@ -72,20 +74,31 @@ class Rule:
         match_regex = raw.get("match_regex")
         self.match_regex = re.compile(match_regex) if match_regex else None
         self.match_model = raw.get("match_model")
-        if self.match is None and self.match_regex is None and self.match_model is None:
+        self.match_system_prompt = raw.get("match_system_prompt")
+        if (
+            self.match is None
+            and self.match_regex is None
+            and self.match_model is None
+            and self.match_system_prompt is None
+        ):
             raise ValueError(
                 f"rule {self.description!r} has none of `match`, `match_regex`, "
-                f"or `match_model`"
+                f"`match_model`, or `match_system_prompt`"
             )
         self.entities = raw.get("entities", [])
         self.raw_content: str | None = raw.get("raw_content")
         self.status_code = int(raw.get("status_code", 200))
         self.delay_s = float(raw.get("delay_s", 0))
 
-    def matches(self, text: str, model: str) -> bool:
+    def matches(self, text: str, model: str, system_prompt: str) -> bool:
         # Model matcher (when set) must succeed.
         if self.match_model is not None:
             if not isinstance(self.match_model, str) or self.match_model not in model:
+                return False
+        # System-prompt matcher (when set) must succeed.
+        if self.match_system_prompt is not None:
+            if (not isinstance(self.match_system_prompt, str)
+                    or self.match_system_prompt not in system_prompt):
                 return False
         # Text matchers (when any are set) must have at least one hit.
         has_text = self.match is not None or self.match_regex is not None
