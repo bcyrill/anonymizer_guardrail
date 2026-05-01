@@ -84,6 +84,11 @@ restored verbatim.
   sweeper. The TTL is a backstop for the case where LiteLLM crashes
   or aborts before issuing the matching `response` call (without it
   the vault would grow without bound).
+- **Size cap:** `VAULT_MAX_ENTRIES` (default 10000) bounds the store
+  with LRU eviction as a second backstop. A burst of unique
+  `call_id`s without matching `response` calls (client crashes,
+  malicious flood) would otherwise sit in memory until TTL fires.
+  Eviction emits a warning so a sustained overrun is visible in logs.
 - **Scope:** in-memory in the guardrail process. Not shared across
   replicas, not persisted across restarts (see *Limitations*).
 - **Skipped when `call_id` is missing.** A request without
@@ -224,6 +229,7 @@ All knobs are environment variables; sensible defaults baked into
 | `LLM_MAX_CHARS`   | `200000`                      | Hard cap; inputs above this are refused  |
 | `LLM_MAX_CONCURRENCY` | `10`                      | Semaphore on in-flight LLM detector calls; surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health` |
 | `VAULT_TTL_S`     | `600`                         | Drops mappings whose post_call never came |
+| `VAULT_MAX_ENTRIES` | `10000`                     | Hard cap on vault entries; LRU-evicted on overflow as a backstop against a flood of unique `call_id`s before TTL clears them. Raise for sustained high in-flight traffic; floor of 1 protects against typos. |
 | `LLM_FAIL_CLOSED` | `true`                        | Block requests if the LLM detector errors. |
 | `PRIVACY_FILTER_URL` | *(empty)*                  | When set, the `privacy_filter` detector talks HTTP to a standalone privacy-filter-service instead of loading the model in-process; the slim image then covers `privacy_filter`. See *Privacy-filter detector → Remote* below. |
 | `PRIVACY_FILTER_TIMEOUT_S` | `30`                | Per-call timeout (seconds) on the remote privacy-filter HTTP requests. |

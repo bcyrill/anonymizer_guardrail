@@ -218,6 +218,15 @@ class Config:
 
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     vault_ttl_s: int = _env_int("VAULT_TTL_S", 600)
+    # Hard cap on vault entries. TTL-only eviction fires lazily on put(), so a
+    # burst of unique call_ids without matching post_calls (client crashes,
+    # timeouts, malicious flood) can grow the vault to millions of entries
+    # before TTL clears them. The cap forces LRU eviction on overflow as a
+    # backstop. Each entry is a small dict of surrogate→original strings
+    # (~hundreds of bytes typical), so 10k entries ≈ a few MB worst case.
+    # Raise if your traffic legitimately holds many in-flight call_ids
+    # simultaneously (very chatty conversations, long-running streams).
+    vault_max_entries: int = _env_int("VAULT_MAX_ENTRIES", 10_000)
 
     # ── Failure mode ───────────────────────────────────────────────────────────
     # If the LLM detector errors out, do we proceed with regex-only results
