@@ -47,11 +47,8 @@ def _build_detectors() -> list[Detector]:
     via TaskGroup, but `_dedup` keeps first-seen entity_type, so a
     duplicate match will adopt the type from the detector listed earlier).
     Whitespace around names is tolerated; duplicates are collapsed with
-    a warning.
-
-    The historical `both` value is no longer accepted — use `regex,llm`.
-    Unknown names log a warning and are skipped; if nothing valid remains,
-    we fall back to regex-only so the service still boots.
+    a warning. Unknown names log a warning and are skipped; if nothing
+    valid remains, we fall back to regex-only so the service still boots.
 
     Factory lookup goes via the registry — the per-detector `SPEC.factory`
     is the single source of truth for how to construct a given token.
@@ -62,12 +59,6 @@ def _build_detectors() -> list[Detector]:
     detectors: list[Detector] = []
     seen: set[str] = set()
     for name in names:
-        if name == "both":
-            log.error(
-                "DETECTOR_MODE=both has been removed. Use 'regex,llm' for the "
-                "same behaviour, or pick a single detector ('regex' or 'llm')."
-            )
-            continue
         if name in seen:
             log.warning("DETECTOR_MODE: duplicate detector %r — collapsed", name)
             continue

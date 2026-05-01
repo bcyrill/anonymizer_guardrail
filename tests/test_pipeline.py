@@ -588,26 +588,6 @@ def test_detector_mode_dedupes_and_warns(
     assert any("duplicate" in r.message.lower() for r in caplog.records)
 
 
-def test_detector_mode_both_emits_migration_error(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Legacy `both` is no longer accepted; the warning must point operators
-    at the new syntax so a migration is obvious from the logs."""
-    import logging
-
-    from anonymizer_guardrail import pipeline as pipeline_mod
-
-    _patch_detector_mode(monkeypatch, "both")
-    with caplog.at_level(logging.ERROR, logger="anonymizer.pipeline"):
-        detectors = pipeline_mod._build_detectors()
-    # No detectors built from `both` → falls back to regex.
-    assert len(detectors) == 1
-    assert type(detectors[0]).__name__ == "RegexDetector"
-    assert any(
-        "regex,llm" in r.message and "both" in r.message for r in caplog.records
-    )
-
-
 def test_detector_mode_unknown_falls_back_to_regex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
