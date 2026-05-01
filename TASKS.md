@@ -251,123 +251,172 @@ flexibility.
 
 ---
 
-## Document the GLiNER-PII detector + service in README
+## Detector quality benchmark script (`scripts/test-detector-quality.sh`)
 
-**What:** the GLiNER-PII detector (`RemoteGlinerPIIDetector`) and the
-companion `gliner-pii-service` container exist with full code, tests,
-build-image.sh flavours, cli.sh / menu.sh wiring, and detailed
-service-level docs at `services/gliner_pii/README.md` — but the
-top-level README only documents the GLINER_PII_* env vars in the
-config table. The rest of the user-facing surface isn't there yet:
+**What:** a new test driver, sibling to `scripts/test-examples.sh`,
+that scores how well a chosen detector configuration redacts a
+labelled corpus. The corpus and the expected entities live in a
+**config file** (one per scenario — pentest, legal, healthcare,
+HR, etc.), so the same script can answer "is the gliner_pii detector
+worth turning on for our pentest workflow?" or "do we need both
+privacy_filter AND llm for legal?"
 
-  * no overview mention alongside the other detectors in the intro
-  * no `### GLiNER-PII detector` section parallel to the existing
-    `### Privacy-filter detector` (in-process / remote split, when
-    to pick it, label / threshold semantics, license note about
-    NVIDIA Open Model License)
-  * no entry in the *Container images* section for `gliner-pii-service`
-    (CPU + CUDA matrix, baked variants, "local-only — not yet
-    CI-published" note)
-  * no mention in the *Capping detector concurrency* section that
-    `GLINER_PII_MAX_CONCURRENCY` exists alongside the LLM and PF caps
-  * `DETECTOR_MODE` examples don't include `gliner_pii`
+The CLI shape mirrors `test-examples.sh`:
 
-**Why deferred:** the README is already 1000+ lines and a full docs
-split (multi-file `docs/` folder) is on the table as a separate
-follow-up. DEVELOPMENT.md was factored out as a first step — the
-contributor-facing material now lives there — but the operator-facing
-README is still the canonical home for detector overviews, env-var
-tables, and deployment guidance, and it's getting unwieldy. Either
-fold the GLiNER content into the existing README or wait until the
-broader split decides where detector docs should live.
+```bash
+scripts/test-detector-quality.sh --config corpus/pentest.yaml         # against $BASE_URL
+scripts/test-detector-quality.sh --config corpus/pentest.yaml --preset uuid-debug
+scripts/test-detector-quality.sh --config corpus/legal.yaml --detector-mode regex,llm
+```
 
-**Why it matters:** the detector is fully functional — operators
-discovering it via `cli.sh --help` or the menu can run it, but they
-won't find the design docs (when to pick it vs privacy_filter, the
-license caveat, the experimental status) without reading the source.
+**Why deferred:** the existing `scripts/test-examples.sh` only
+checks "did this exact substring get redacted yes/no" against a few
+hand-picked recipes — it's a smoke test, not a benchmark. We can
+ship detector improvements without it, but operators currently can't
+answer "which detector mix is best for my workload" without rolling
+their own measurement.
 
-**Sketch:**
+**Why it matters:**
 
-1. Add a `### GLiNER-PII detector` section under the existing
-   *Privacy-filter detector* section in `README.md`, mirroring its
-   shape: what the model is, where it differs, label / threshold
-   semantics, how to run the service, when to pick it, the NVIDIA
-   Open Model License caveat.
-2. Add a `gliner-pii-service` row to the *Container images* section
-   noting it's local-build-only (CPU + CUDA matrix).
-3. Extend the *Capping detector concurrency* section with
-   `GLINER_PII_MAX_CONCURRENCY`.
-4. Update DETECTOR_MODE examples that currently list
-   `regex,denylist,privacy_filter,llm` to mention the `gliner_pii`
-   token as an option.
-5. (Optional) revisit as part of the broader README → `docs/` split
-   if that lands first — the detector content moves to
-   `docs/detectors.md` (or similar) instead of growing the README.
-
-**Concrete trigger:** next time someone touches the detector docs
-in the README, OR when the broader docs split is decided.
-
-**Non-goals:**
-
-- Don't move the existing `services/gliner_pii/README.md` into the
-  top-level docs — keep the service-specific README colocated with
-  its code. The top-level README links there for the deep-dive.
-
----
-
-## Split README into a `docs/` folder
-
-**What:** the operator-facing README is over 1000 lines and mixes
-several audiences — quickstart (operators), env-var reference
-(operators tuning a deployment), deployment guides (ops), detector
-deep-dives (operators picking a detection setup), and architecture
-notes. A multi-file `docs/` folder would let each audience reach
-their content without scrolling past the others.
-
-**Why deferred:** restructuring 1000+ lines of prose is a focused
-effort that should not be entangled with code changes. DEVELOPMENT.md
-was factored out as a first step (contributor docs); operator docs
-remain in the single README file pending a decision on the broader
-split.
-
-**Why it matters:** every new detector / env var / deployment
-recipe is one more reason for a new reader to scroll past 800 lines
-to find the section they need. The current "Find on page" UX is
-acceptable for now but degrades with each addition.
+- Detector selection is currently guesswork. The
+  [detectors index](docs/detectors/index.md) gives qualitative
+  guidance ("privacy_filter is a strict subset of LLM coverage") but
+  no quantitative way to verify on the operator's own data.
+- Adding a new detector (gliner_pii is the live example) needs a
+  way to argue "this is worth wiring in" beyond "it exists." A
+  benchmark script makes that argument concrete.
+- Pentest / legal / healthcare configs are different enough that
+  one corpus can't speak for all of them — the config-driven shape
+  scales without code changes.
 
 **Sketch:**
 
-A reasonable cut, given the README's current section headers:
+### Corpus config format
 
-- `README.md` — keep as a landing page: what-it-is, quickstart,
-  table-of-contents pointing at the docs/ files, the detector
-  matrix at a glance.
-- `docs/configuration.md` — env-var tables (currently the bulk of
-  the README), forwarded keys, concurrency caps.
-- `docs/detectors.md` — detector deep-dives (regex, denylist,
-  privacy_filter, gliner_pii, llm) with when-to-pick-each guidance.
-- `docs/operations.md` — vault, surrogate cache, observability,
-  per-request overrides.
-- `docs/deployment.md` — container images, build commands, run
-  commands, smoke test.
-- `docs/architecture.md` — pipeline overview, regex overlap
-  resolution, anything that's "how it works internally" for
-  operators (deeper internals stay in DEVELOPMENT.md).
+Each config is a YAML file under (suggested) `tests/corpus/<name>.yaml`,
+versioned with the repo so different scenarios are reproducible:
 
-Each file would internally cross-reference the others. A small
-table-of-contents at the top of README would point at the right
-file for each common question.
+```yaml
+# tests/corpus/pentest.yaml
+name: "Pentest engagement transcript"
+description: |
+  Synthetic snippets typical of a security engagement: cracked password
+  artifacts, AWS keys, internal hostnames, employee names embedded in
+  prose, NTLM hashes, etc.
 
-**Concrete trigger:** the next time someone wants to add a new
-detector deep-dive section to the README and recoils at how much
-prose is already there. Or when the gliner-pii doc task (above) is
-ready to land — we could either fold it into the existing README
-or use it as the forcing function for the split.
+# Optional: pin the detector mix to test. If unset, --detector-mode on
+# the CLI wins; if neither is set, use the running guardrail's default.
+detector_mode: regex,denylist,privacy_filter,llm
+
+# Optional: pin per-request overrides (regex_patterns, llm_prompt, ...)
+overrides:
+  regex_patterns: pentest
+  llm_prompt: pentest
+
+cases:
+  - id: cracked-creds-table
+    text: |
+      Internal hostname dc01.acmecorp.local is reachable from
+      10.0.7.42. Cracked password from NTDS dump:
+      bob.smith:1107:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::
+    expect:
+      # Each entry: literal substring that MUST be redacted, with the
+      # entity type the operator considers correct.
+      - text: "dc01.acmecorp.local"
+        type: HOSTNAME
+      - text: "10.0.7.42"
+        type: IPV4_ADDRESS
+      - text: "8846f7eaee8fb117ad06bdd830b7586c"
+        type: HASH
+      - text: "bob.smith"
+        type: PERSON
+        # Optional: mark items the operator EXPECTS the chosen detector
+        # mix to miss, so a missed match is reported as "expected miss"
+        # not a regression.
+        # tolerated_miss: true
+
+  - id: aws-creds-in-prose
+    text: "Use AKIAIOSFODNN7EXAMPLE / wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY for the demo."
+    expect:
+      - text: "AKIAIOSFODNN7EXAMPLE"
+        type: AWS_ACCESS_KEY
+      - text: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        type: AWS_SECRET_KEY
+
+# Optional: anti-cases the detectors MUST leave alone (false-positive
+# sentinel). Anything redacted from these texts counts against the
+# precision score.
+do_not_redact:
+  - id: documentation-uuid
+    text: "Request id 11111111-2222-3333-4444-555555555555 is a documentation example, not real."
+    must_keep: ["11111111-2222-3333-4444-555555555555"]
+```
+
+### Score shape
+
+The script reports per-case and overall:
+
+| Metric | What it counts |
+|---|---|
+| `recall` | expected substrings that got redacted / total expected |
+| `recall_excluding_tolerated` | as above but ignores `tolerated_miss` items |
+| `type_accuracy` | of the substrings redacted, fraction whose entity_type matches the corpus's expected type (operator can disable strict typing per-case) |
+| `precision` | 1 − (false-positive redactions / total `must_keep` items in `do_not_redact`) |
+| `latency_ms` | per-case wall-clock (informational, not a pass/fail) |
+
+A summary table at the end lets the operator compare runs:
+
+```
+== Pentest corpus, DETECTOR_MODE=regex,denylist,privacy_filter,llm ==
+case                          recall    type_acc  precision  latency
+cracked-creds-table           4/4       4/4       —          312ms
+aws-creds-in-prose            2/2       2/2       —          105ms
+                              ---------------------------------------
+                              12/12     11/12     1.0        avg 208ms
+```
+
+### Pluggable backends
+
+Same `--preset` machinery as `test-examples.sh`: with no preset,
+talk to `$BASE_URL`; with `--preset NAME`, spawn a guardrail via
+`scripts/cli.sh --preset NAME` on a non-default port, run the
+benchmark, tear it down. This lets the operator run the same corpus
+against several configurations in a loop.
+
+### Config search path
+
+Bundle a few starter configs under `tests/corpus/` (pentest, legal,
+healthcare are the obvious starters); operators can also pass their
+own paths via `--config`. The script accepts either a bundled name
+(`--config bundled:pentest`) or a filesystem path. Same shape as the
+`bundled:NAME` / path convention in `REGEX_PATTERNS_PATH` /
+`LLM_SYSTEM_PROMPT_PATH`.
+
+### Implementation language
+
+Python rather than bash — the score arithmetic, JSON parsing of the
+guardrail's response, and YAML config loading are all painful in
+shell. Lives under `tools/` (sibling to `tools/launcher/`) so it
+stays out of the production wheel; `scripts/test-detector-quality.sh`
+is a thin bash wrapper that execs into `python -m
+tools.detector_bench` (mirroring the cli.sh / menu.sh shape).
+
+**Concrete trigger:** the next decision about which detector mix to
+ship by default, or the first time an operator asks "is gliner_pii
+better than privacy_filter for my data?"
 
 **Non-goals:**
 
-- Don't move `services/*/README.md` content into the top-level
-  docs. Service-specific READMEs stay colocated with their code.
-- Don't move DEVELOPMENT.md into the docs/ folder. Contributor docs
-  are a different audience from operator docs; keeping them at the
-  repo root flags them as such.
+- **Not a regression test for detector code itself** —
+  `tests/test_*_detector.py` already covers that with mocked
+  backends. This script measures *configurations*, not code.
+- **Not a fuzzing harness.** The corpus is hand-curated to mirror the
+  operator's real workload; surprise-finding is what production logs
+  are for.
+- **Not a load tester.** Latency is reported as informational only;
+  for throughput / saturation testing, point a load generator at a
+  running guardrail.
+- Don't bundle a giant default corpus into the repo; the starter
+  corpora should be small (~10-30 cases each) and easy for operators
+  to fork. Large datasets belong in operator-side fixtures, not in
+  the wheel.

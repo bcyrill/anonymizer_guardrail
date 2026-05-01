@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the curl examples from examples.md against a running guardrail
+# Run the curl examples from docs/examples.md against a running guardrail
 # container and assert the basic invariants per test:
 #
 #   - "should anonymize" examples → action=GUARDRAIL_INTERVENED, the
@@ -37,7 +37,7 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [--preset NAME [--port N] [--keep]] [-h]
 
-Run the curl examples from examples.md.
+Run the curl examples from docs/examples.md.
 
 Without --preset:
   Connects to \$BASE_URL (default http://localhost:8000) — assumes the

@@ -1,7 +1,7 @@
 # Development
 
-Guide for contributors. For end-user / operator docs, see
-[README.md](README.md).
+Guide for contributors. For end-user / operator docs, see the
+[README](../README.md) and the rest of the [docs/](./) folder.
 
 ## Setup
 
@@ -77,6 +77,22 @@ services/                        # auxiliary inference containers
   gliner_pii/
 
 tests/                           # pytest suite
+
+docs/                            # operator-facing documentation
+  configuration.md               # main env-var table
+  litellm-integration.md         # LiteLLM wiring
+  surrogates.md                  # surrogates / salt / Faker / locales
+  per-request-overrides.md       # additional_provider_specific_params
+  operations.md                  # vault, surrogate cache, /health
+  deployment.md                  # container images, build, run
+  development.md                 # this file
+  detectors/                     # one file per detector
+    index.md                     # overview + comparison
+    regex.md
+    denylist.md
+    privacy-filter.md
+    gliner-pii.md
+    llm.md
 ```
 
 ## Architecture: the detector registry
@@ -373,9 +389,12 @@ if my_detector_url is not None:
 
 ### 8. (If you want documentation)
 
-**`README.md`** — env-var table rows for every new `MY_DETECTOR_*`
-knob; optionally a detector section explaining when to use it (mirror
-the existing privacy-filter section).
+**`docs/detectors/my-detector.md`** — when to use it, env-var
+reference, failure-mode notes. Mirror the shape of the existing
+files in `docs/detectors/`.
+
+**`docs/configuration.md`** — env-var table rows for every new
+`MY_DETECTOR_*` knob.
 
 **`services/my_service/README.md`** — service-specific docs (API,
 build, run).
@@ -389,7 +408,7 @@ build, run).
 | **+ service container** | +5 — `services/my_service/{main.py,Containerfile,README.md}`, `scripts/build-image.sh`, `tools/launcher/spec_extras.py` |
 | **+ launcher CLI** | +1 — `tools/launcher/main.py` |
 | **+ launcher menu** | +1 — `tools/launcher/menu.py` |
-| **+ docs** | +1 — `README.md` |
+| **+ docs** | +1 to +2 — `docs/detectors/<name>.md`, optional row in `docs/configuration.md` |
 
 **Maximum** for a fully-integrated detector with a service container,
 flag support, menu support, and docs: **~10 files**. **Minimum** for
@@ -422,11 +441,11 @@ detectors" enumeration. They all consume `REGISTERED_SPECS` /
 
 ## See also
 
-- [TASKS.md](TASKS.md) — backlog of deliberately deferred work, with
+- [TASKS.md](../TASKS.md) — backlog of deliberately deferred work, with
   rationale for each deferral. Useful before starting on something
   that might already have a documented design sketch.
-- [README.md](README.md) — operator-facing docs (env vars, deployment,
-  detector overview, container images).
-- [services/privacy_filter/README.md](services/privacy_filter/README.md)
-  and [services/gliner_pii/README.md](services/gliner_pii/README.md) —
+- [README.md](../README.md) — project landing page; links into the
+  rest of `docs/`.
+- [services/privacy_filter/README.md](../services/privacy_filter/README.md)
+  and [services/gliner_pii/README.md](../services/gliner_pii/README.md) —
   reference shape for new auxiliary inference services.

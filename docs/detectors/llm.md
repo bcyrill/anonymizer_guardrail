@@ -1,0 +1,121 @@
+# LLM detector
+
+Calls an OpenAI-compatible Chat Completions endpoint with a JSON-mode
+prompt that asks the model to enumerate sensitive entities. Catches
+contextual stuff regex cannot: org names, personal names, internal
+product/project codenames embedded in prose.
+
+When pointed at LiteLLM, the model alias used here MUST NOT have the
+guardrail attached — otherwise every detection call would re-enter the
+guardrail and recurse forever. See
+[LiteLLM integration](../litellm-integration.md) for the recommended
+config pattern.
+
+## Configuration
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_API_BASE` | `http://litellm:4000/v1` | OpenAI-compatible endpoint. |
+| `LLM_API_KEY` | *(empty)* | Bearer token if the endpoint needs one. |
+| `LLM_USE_FORWARDED_KEY` | `false` | Use the caller's Authorization header instead of `LLM_API_KEY` (so detection cost attributes back to the user's virtual key). See [Forwarding the caller's API key](#forwarding-the-callers-api-key) below. |
+| `LLM_MODEL` | `anonymize` | Model alias used for detection. |
+| `LLM_TIMEOUT_S` | `30` | Per-call timeout (seconds) on LLM detector HTTP requests. |
+| `LLM_MAX_CHARS` | `200000` | Hard cap; inputs above this are refused (raises `LLMUnavailableError` → `LLM_FAIL_CLOSED` decides BLOCKED vs degrade). |
+| `LLM_MAX_CONCURRENCY` | `10` | Semaphore on in-flight LLM detector calls. Surfaced as `llm_in_flight`/`llm_max_concurrency` on `/health`. |
+| `LLM_FAIL_CLOSED` | `true` | Block requests if the LLM detector errors. Independent from the other detectors' fail-mode flags. |
+| `LLM_SYSTEM_PROMPT_PATH` | *(empty → bundled `llm_default.md`)* | Override the bundled detection prompt. Accepts `bundled:NAME` or a filesystem path. See [Customising the prompt](#customising-the-detection-prompt) below. |
+| `LLM_SYSTEM_PROMPT_REGISTRY` | *(empty)* | Comma-separated `name=path` list of NAMED alternative prompts callers can opt into per-request via `llm_prompt`. See [per-request overrides → Named alternatives](../per-request-overrides.md#named-alternatives). |
+
+## Per-request overrides
+
+Two LLM-specific keys can be passed in
+`additional_provider_specific_params` (see
+[per-request overrides](../per-request-overrides.md) for the general
+shape):
+
+| Override key | Type | Effect |
+|---|---|---|
+| `llm_model` | `string` | Override `LLM_MODEL` for this call. |
+| `llm_prompt` | `string` | Name of a registered alternative LLM detection prompt. Looked up in `LLM_SYSTEM_PROMPT_REGISTRY`; unknown names log a warning and fall back to the default prompt. |
+
+## Customising the detection prompt
+
+Two prompts ship with the package under
+`src/anonymizer_guardrail/prompts/`:
+
+- `llm_default.md` — small, conservative prompt loaded by default.
+- `llm_pentest.md` — verbatim port of the
+  [DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI/blob/main/src/llm_detector.py)
+  system prompt. Tuned for security-engagement output (cracked-password
+  artifacts, NetBIOS names, K8s namespace conventions, pentest tool noise
+  to ignore, etc.).
+
+To swap in one of those (or your own — extra entity types, domain-specific
+guidance, a different language), set `LLM_SYSTEM_PROMPT_PATH`. Two forms
+are accepted:
+
+- `bundled:<filename>` — a file shipped inside the package, e.g.
+  `bundled:llm_pentest.md`. Resolved via `importlib.resources`, so the env
+  var is independent of the Python version embedded in the site-packages
+  path.
+- A regular filesystem path — typically a mounted volume:
+
+```bash
+# Use the bundled pentest prompt — no path-juggling needed.
+podman run --rm -p 8000:8000 \
+  -e LLM_SYSTEM_PROMPT_PATH=bundled:llm_pentest.md \
+  anonymizer-guardrail:latest
+
+# Or mount your own:
+podman run --rm -p 8000:8000 \
+  -v $PWD/my_prompt.md:/etc/anonymizer/prompt.md:ro \
+  -e LLM_SYSTEM_PROMPT_PATH=/etc/anonymizer/prompt.md \
+  anonymizer-guardrail:latest
+```
+
+The prompt is loaded once at startup; restart the container to pick up
+edits. A missing/unreadable override path is a hard error rather than a
+silent fall-back to the bundled prompt — if you set the variable, we
+assume you mean it.
+
+## Forwarding the caller's API key
+
+Set `LLM_USE_FORWARDED_KEY=true` to authenticate to the detection LLM
+with the same key the user authenticated to LiteLLM with, instead of a
+shared `LLM_API_KEY`. Detection cost and rate limits then attribute
+back to the caller's virtual key.
+
+This requires opting into header forwarding on the LiteLLM side as well
+— LiteLLM redacts non-allowlisted headers to `"[present]"` by default,
+so without `extra_headers`, this guardrail will silently fall back to
+`LLM_API_KEY`:
+
+```yaml
+litellm_settings:
+  guardrails:
+    - guardrail_name: anonymizer
+      litellm_params:
+        guardrail: generic_guardrail_api
+        mode: [pre_call, post_call]
+        api_base: http://anonymizer:8000
+        unreachable_fallback: fail_closed
+        extra_headers: [authorization]   # ← forwards Bearer <user-key> to us
+```
+
+If the header is missing or arrives as `[present]`, we fall back to
+`LLM_API_KEY`. If both are empty, the LLM call goes out without an
+`Authorization` header (fine for local/dev backends; everything else
+will likely return 401, which routes through `LLM_FAIL_CLOSED`).
+
+## Failure handling
+
+`LLM_FAIL_CLOSED` (default `true`) governs what happens when the LLM
+detector errors out. When the detector raises `LLMUnavailableError`
+(connect / timeout / non-200 / oversized input / any unexpected
+exception under fail-closed), the guardrail returns `BLOCKED`. With
+fail-open, the error is logged and the request proceeds with
+coverage from the remaining detectors.
+
+The flag is independent from `PRIVACY_FILTER_FAIL_CLOSED` and
+`GLINER_PII_FAIL_CLOSED` — operators can fail closed on the LLM and
+open on the others, or vice versa.
