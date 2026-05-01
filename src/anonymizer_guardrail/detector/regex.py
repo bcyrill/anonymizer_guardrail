@@ -12,10 +12,11 @@ schema documentation in the YAML files themselves.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -308,6 +309,121 @@ def _load_patterns_registry() -> dict[str, list[tuple[str, re.Pattern[str]]]]:
 _COMPILED_PATTERNS = _load_patterns()
 _COMPILED_PATTERNS_REGISTRY = _load_patterns_registry()
 
+
+# ── Per-type structural validators ──────────────────────────────────────────
+# Run after a pattern has matched, before the candidate is added to the
+# results. Lets us reject structurally-implausible matches that the regex
+# layer can't catch on its own (Python `re` can't do arithmetic, so it can't
+# Luhn-check a credit card or MOD-97-check an IBAN). Each validator returns
+# True to keep the match, False to drop it.
+#
+# Default: no validator = accept all (keeps current behaviour for any type
+# without an entry).
+
+
+def _luhn(s: str) -> bool:
+    """Mod-10 (Luhn) checksum used by all major credit-card brands.
+
+    Strips spaces and hyphens — the regex pattern accepts both as group
+    separators, so the raw matched text may contain them. Empty / non-
+    numeric inputs return False (caller should never see those, but a
+    defensive False is cheaper than a TypeError).
+    """
+    digits = [int(c) for c in s if c.isdigit()]
+    if len(digits) < 2:
+        return False
+    checksum = 0
+    parity = len(digits) % 2
+    for i, d in enumerate(digits):
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        checksum += d
+    return checksum % 10 == 0
+
+
+def _iban_mod97(s: str) -> bool:
+    """ISO 13616 IBAN integrity check.
+
+    Algorithm: strip spaces, move the first four chars (country code +
+    check digits) to the end, replace letters with two-digit numbers
+    (A=10..Z=35), and confirm the result mod 97 == 1.
+    """
+    iban = s.replace(" ", "").upper()
+    if len(iban) < 5:
+        return False
+    rearranged = iban[4:] + iban[:4]
+    numeric_chars: list[str] = []
+    for c in rearranged:
+        if c.isdigit():
+            numeric_chars.append(c)
+        elif "A" <= c <= "Z":
+            numeric_chars.append(str(ord(c) - ord("A") + 10))
+        else:
+            return False
+    try:
+        return int("".join(numeric_chars)) % 97 == 1
+    except ValueError:
+        return False
+
+
+def _ipv4_address(s: str) -> bool:
+    """Reject 999.999.999.999 and other octet-range nonsense the regex
+    can't see. Hand-rolled (rather than `ipaddress.IPv4Address`) because
+    Python 3.9+ rejects leading zeros — fine for IETF parsers, but a
+    common shape in prose / logs that we still want to anonymize."""
+    parts = s.split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p or not p.isdigit() or len(p) > 3 or int(p) > 255:
+            return False
+    return True
+
+
+def _ipv4_network(s: str) -> bool:
+    """IPv4 CIDR: octet validation plus a 0..32 prefix check."""
+    if "/" not in s:
+        return False
+    ip, _, prefix = s.rpartition("/")
+    if not _ipv4_address(ip) or not prefix.isdigit():
+        return False
+    return 0 <= int(prefix) <= 32
+
+
+def _ipv6_address(s: str) -> bool:
+    """Validate IPv6 — covers the at-most-one-`::` rule, group count,
+    hex-digit ranges, and zone-ID syntax. Strips a `%zone` suffix before
+    handing to ipaddress so older Python versions still validate the
+    address half (newer 3.9+ stdlibs accept zones natively but we don't
+    rely on it)."""
+    candidate = s.split("%", 1)[0]
+    try:
+        ipaddress.IPv6Address(candidate)
+        return True
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
+def _ipv6_network(s: str) -> bool:
+    try:
+        ipaddress.IPv6Network(s, strict=False)
+        return True
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+        return False
+
+
+_VALIDATORS: dict[str, Callable[[str], bool]] = {
+    "CREDIT_CARD":  _luhn,
+    "IBAN":         _iban_mod97,
+    "IPV4_ADDRESS": _ipv4_address,
+    "IPV4_CIDR":    _ipv4_network,
+    "IPV6_ADDRESS": _ipv6_address,
+    "IPV6_CIDR":    _ipv6_network,
+}
+
+
 _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
 if config.regex_overlap_strategy not in _VALID_OVERLAP_STRATEGIES:
     raise RuntimeError(
@@ -405,6 +521,14 @@ class RegexDetector:
                         value = m.group(idx)
                 stripped = value.strip() if value else ""
                 if not stripped:
+                    continue
+                # Per-type structural validation — drop matches that the
+                # regex shape allowed but the canonical algorithm rejects
+                # (Luhn for cards, MOD-97 for IBANs, octet/group integrity
+                # for IPs). Skipping the candidate frees its span so a
+                # later pattern can claim it.
+                validator = _VALIDATORS.get(entity_type)
+                if validator is not None and not validator(stripped):
                     continue
                 candidates.append((start, end, stripped, entity_type))
 

@@ -436,3 +436,162 @@ async def test_overlap_strategy_longest_does_not_drop_unrelated_matches(
     matches = await detector.detect("Account 123456789012 was suspended.")
     by_text = {m.text: m.entity_type for m in matches}
     assert by_text.get("123456789012") == "IDENTIFIER"
+
+
+# ── Per-type structural validators ──────────────────────────────────────────
+# Cover the post-filter that rejects regex matches that fail a type-specific
+# structural check (Luhn for cards, MOD-97 for IBANs, octet/group rules for
+# IPs). The regex layer is intentionally permissive — these tests pin down
+# the validator behaviour so over-redaction on the new high-PII types
+# doesn't regress.
+
+
+def _detector_with_default_patterns() -> regex_mod.RegexDetector:
+    """Build a RegexDetector wired to the BUNDLED default pattern set,
+    independent of whatever some earlier test leaked into the module-level
+    `_COMPILED_PATTERNS`. Several earlier tests directly assign that
+    attribute without restoring it, so any test that wants the canonical
+    bundled patterns has to load them itself."""
+    detector = regex_mod.RegexDetector()
+    # _load_patterns(None) → reads config.regex_patterns_path. To avoid
+    # whatever the current `config` attribute is, pass an explicit
+    # bundled: name so we always get the shipped default file.
+    detector._compiled = regex_mod._load_patterns("bundled:regex_default.yaml")  # type: ignore[attr-defined]
+    return detector
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("4111-1111-1111-1111", True),   # Visa test number
+        ("5500 0000 0000 0004", True),   # Mastercard test number
+        ("3782 822463 10005",   True),   # Amex test number
+        # Same shape, single-digit perturbation — Luhn must reject.
+        ("4111-1111-1111-1112", False),
+        ("5500 0000 0000 0005", False),
+    ],
+)
+def test_luhn_validator(value: str, expected: bool) -> None:
+    assert regex_mod._luhn(value) is expected
+
+
+async def test_credit_card_pattern_drops_luhn_invalid() -> None:
+    """A 16-digit string with a Visa prefix but a bad checksum used to
+    sail through the regex layer; the validator now drops it. The valid
+    test number (4111-…) must still match."""
+    detector = _detector_with_default_patterns()
+    valid = await detector.detect("Paid with 4111-1111-1111-1111 today.")
+    assert any(m.entity_type == "CREDIT_CARD" for m in valid)
+
+    invalid = await detector.detect("Paid with 4111-1111-1111-1112 today.")
+    assert not any(m.entity_type == "CREDIT_CARD" for m in invalid)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("DE89370400440532013000", True),    # German test IBAN
+        ("GB82WEST12345698765432", True),    # UK test IBAN
+        # Wrong check digits — same shape, MOD-97 rejects.
+        ("DE00370400440532013000", False),
+        ("GB00WEST12345698765432", False),
+        # Non-alphanumeric in BBAN — must reject without crashing.
+        ("DE89370400440532013!!!", False),
+    ],
+)
+def test_iban_mod97_validator(value: str, expected: bool) -> None:
+    assert regex_mod._iban_mod97(value) is expected
+
+
+async def test_iban_pattern_drops_mod97_invalid() -> None:
+    detector = _detector_with_default_patterns()
+    valid = await detector.detect("Wire to DE89370400440532013000 by Friday.")
+    assert any(m.entity_type == "IBAN" for m in valid)
+
+    invalid = await detector.detect("Wire to DE00370400440532013000 by Friday.")
+    assert not any(m.entity_type == "IBAN" for m in invalid)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("192.168.1.1",     True),
+        ("0.0.0.0",         True),
+        ("255.255.255.255", True),
+        ("192.168.001.001", True),    # leading zeros in prose — accept
+        ("999.999.999.999", False),   # textbook over-the-top case
+        ("256.0.0.1",       False),   # one octet over by one
+        ("192.168.1",       False),   # too few groups
+        ("1.2.3.4.5",       False),   # too many groups
+    ],
+)
+def test_ipv4_address_validator(value: str, expected: bool) -> None:
+    assert regex_mod._ipv4_address(value) is expected
+
+
+async def test_ipv4_pattern_drops_out_of_range_octets() -> None:
+    detector = _detector_with_default_patterns()
+    matches = await detector.detect("server 999.999.999.999 is unreachable")
+    assert not any(m.entity_type == "IPV4_ADDRESS" for m in matches)
+
+    matches = await detector.detect("server 10.0.0.5 is unreachable")
+    assert any(m.entity_type == "IPV4_ADDRESS" for m in matches)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("10.0.0.0/24",     True),
+        ("192.168.1.5/24",  True),    # host bits set — accepted (strict=False)
+        ("0.0.0.0/0",       True),
+        ("10.0.0.0/33",     False),   # prefix > 32
+        ("999.0.0.0/24",    False),   # bad octet
+        ("10.0.0.0",        False),   # no slash at all
+    ],
+)
+def test_ipv4_network_validator(value: str, expected: bool) -> None:
+    assert regex_mod._ipv4_network(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("2001:db8::1",                            True),
+        ("::1",                                    True),
+        ("fe80::1ff:fe23:4567:890a",               True),
+        ("2001:0db8:0000:0000:0000:0000:0000:0001", True),
+        ("fe80::1ff:fe23:4567:890a%eth0",          True),     # zone ID accepted
+        ("::1::2",                                 False),    # two `::` is illegal
+        ("gggg::1",                                False),    # non-hex group
+        ("12345::",                                False),    # group > 4 hex digits
+    ],
+)
+def test_ipv6_address_validator(value: str, expected: bool) -> None:
+    assert regex_mod._ipv6_address(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("2001:db8::/32", True),
+        ("fe80::/10",     True),
+        ("::1/129",       False),   # prefix > 128
+        ("::1::2/64",     False),   # two `::`
+    ],
+)
+def test_ipv6_network_validator(value: str, expected: bool) -> None:
+    assert regex_mod._ipv6_network(value) is expected
+
+
+async def test_ipv6_pattern_passes_valid_address() -> None:
+    """The pentest YAML's IPV6_ADDRESS regex won't typically generate
+    `::1::2`-shaped matches on its own — the unit-level validator test
+    (above) covers the rejection path. This higher-level test just
+    confirms a structurally valid v6 still flows through the validator
+    once it's wired up."""
+    detector = regex_mod.RegexDetector()
+    detector._compiled = regex_mod._load_patterns(  # type: ignore[attr-defined]
+        "bundled:regex_pentest.yaml"
+    )
+    valid = await detector.detect("connect to 2001:db8::1 please")
+    assert any(m.entity_type == "IPV6_ADDRESS" for m in valid)
