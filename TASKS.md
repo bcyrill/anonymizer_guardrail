@@ -195,3 +195,306 @@ limit.
 
 - Not a per-tenant rate limit. That's a separate concern (and probably
   belongs in LiteLLM, not the guardrail).
+
+---
+
+## Strict response parsing for remote detectors
+
+**What:** make `LLMDetector`, `RemotePrivacyFilterDetector`, and
+`RemoteGlinerPIIDetector` raise their typed `*UnavailableError` when a
+200 OK response is unparseable or schema-violating, instead of logging
+and returning `[]`.
+
+**Why:** today the three detectors split errors into "availability"
+(transport, timeout, non-200 → raise → fail-closed policy applies) and
+"content" (non-JSON body, `matches` not a list, response-shape mismatch
+→ log+return `[]`). The split is explicit in the comments
+(`remote_privacy_filter.py:123-126`, `remote_gliner_pii.py:266-269`,
+`llm.py:296-298`). The justification — *"the service is reachable and
+replied 200, so this is a malformed response, not an outage"* — is the
+wrong frame. From the **guardrail's** perspective the detector cannot
+do its job, and an operator who set `*_FAIL_CLOSED=true` has
+explicitly opted into "block rather than risk leakage." Soft-failing
+content errors silently violates that policy. If a backend service
+gets misconfigured and starts returning garbage on 200 OK, the
+guardrail will currently behave as if no PII was found — a fail-open
+that defeats the entire `fail_closed` setting.
+
+**Why deferred:** behavior change. Operators currently relying on the
+soft-fail (perhaps as a debugging convenience) would see new BLOCKED
+responses after the change. Worth a release note and probably a knob
+to keep the old behavior available.
+
+**Sketch:**
+
+1. In `LLMDetector.detect()` (`detector/llm.py`):
+   - The JSON-decode `except` in `_parse_entities` (lines 154-159)
+     should bubble up to the caller as `LLMUnavailableError`. Move the
+     `try/except` out of the helper, or have it re-raise.
+   - The `KeyError/IndexError/ValueError` block at lines 296-298
+     should raise `LLMUnavailableError("Unexpected LLM response shape:
+     …")` instead of returning `[]`.
+2. In `RemotePrivacyFilterDetector.detect()`
+   (`detector/remote_privacy_filter.py:127-134`): the `ValueError`
+   from `resp.json()` should raise `PrivacyFilterUnavailableError`.
+   In `_parse_matches` (lines 150-161): `body` not a dict, or
+   `matches` not a list, should raise too — these are schema
+   violations the service should never produce.
+3. Same shape in `RemoteGlinerPIIDetector.detect()`
+   (`detector/remote_gliner_pii.py:270-277`) and its `_parse_matches`
+   (lines 287-304).
+4. Per-entry malformed entries (an `entry` that isn't a dict, or has
+   no `text` field) should still be dropped silently — those are
+   per-entity issues; the rest of the response is still good. Same
+   for the hallucination guard (text not in source). The change
+   targets the *whole-response* failures, not the per-entry ones.
+5. Update the docstrings at the top of each file — the "Content
+   errors are non-fatal" framing is no longer accurate.
+6. Tests: add a `200 OK + non-JSON body` case and a `200 OK + wrong
+   schema` case for each remote detector, asserting the typed error
+   and (with `fail_closed=True`) that the pipeline returns `BLOCKED`.
+
+**Non-goals:**
+
+- Don't add a separate `STRICT_PARSING` env knob. Either the response
+  is parseable and we use it, or it isn't and we treat it as an
+  outage — there's no intermediate posture worth preserving.
+
+---
+
+## Migrate `Config` to pydantic-settings
+
+**What:** replace the hand-rolled `Config` dataclass + `_env_int` /
+`_env_bool` helpers in `src/anonymizer_guardrail/config.py` with a
+`pydantic_settings.BaseSettings` model. Same env-var names, same
+fields — the change is in the parsing layer.
+
+**Why:** the current `_env_int` (`config.py:32-39`) silently swallows
+`ValueError` and falls back to the default. `PORT=abc` becomes `8000`
+with zero signal — exactly the class of misconfiguration that should
+crash at boot, not 30 minutes later when the operator notices the
+service is on the wrong port. pydantic-settings raises a clear
+validation error at import time. Other wins: built-in `.env` support
+(useful for local dev), automatic type coercion, free
+`PORT: int = Field(ge=1, le=65535)`-style range validation, JSON
+schema export for ops dashboards.
+
+**Why deferred:** pure modernization, not a bug fix. The existing
+parsers work; the silent-fallback issue has not been a real-world
+problem. Timed for the next dependency-bump window.
+
+**Sketch:**
+
+1. Add `pydantic-settings` to `pyproject.toml`.
+2. Convert `Config` to inherit from `BaseSettings`. The existing field
+   names map 1:1; replace `os.getenv` defaults with normal defaults
+   plus `model_config = SettingsConfigDict(env_file=".env",
+   case_sensitive=False)`.
+3. Per-detector configs (`detector/llm.py:LLMConfig`,
+   `privacy_filter.py:CONFIG`, `remote_gliner_pii.py:GlinerPIIConfig`,
+   `regex.py`, `denylist.py`) follow the same pattern. Keep them
+   per-module — the grouping is what makes the env table operator-
+   readable.
+4. Drop `_env_int` / `_env_bool` once nothing imports them. They're
+   re-exported from `config.py`; check call sites in detector modules
+   and remove imports.
+5. Confirm test monkey-patches still work — many tests rebuild
+   `CONFIG` after env changes, and pydantic-settings may need
+   `Config.model_construct()` or a refresh helper.
+
+**Non-goals:**
+
+- Don't go further and pull every operator-tunable string into Pydantic
+  validators (e.g. validating `DETECTOR_MODE` token names there). The
+  detector loader's warn-and-skip behavior is intentional for forward-
+  compat.
+
+---
+
+## Convert `Overrides` to a Pydantic model
+
+**What:** rewrite `api.Overrides` as a `pydantic.BaseModel` with
+`field_validator`s, replacing the ~150 lines of manual `_parse_*`
+helpers in `api.py` (`_parse_locale`, `_parse_threshold`,
+`_parse_label_list`, `_parse_detector_mode`) plus the per-key
+`if/elif` chain in `parse_overrides`.
+
+**Why:** the current parser is mostly boilerplate — type checks,
+strip-and-split, length caps, list-vs-string handling. Pydantic does
+all of this declaratively with validators and `Field(max_length=…)`.
+The api.py file is ~280 lines today; a Pydantic conversion plausibly
+halves it, with stronger validation as a side effect.
+
+**Why deferred:** the existing parser has a non-default behavior
+contract — *"each unknown / malformed field logs a warning and is
+dropped; the request itself is never blocked"* (see docstring,
+`api.py:185-191`). Pydantic's default is to raise on the first
+validation failure. The migration needs either:
+
+- per-field `try/except ValidationError` wrapping in `parse_overrides`
+  (gets back the lenient behavior at the cost of some of the
+  declarative-ness Pydantic gives us), or
+- `model_validator(mode="before")` that drops bad fields up-front
+  (cleaner but harder to log per-field which key failed and why).
+
+Neither is hard; neither is free. Worth doing alongside the
+`pydantic-settings` migration so both land together.
+
+**Sketch:**
+
+1. `class Overrides(BaseModel)` with frozen config (it's hashed in the
+   detector cache key).
+2. `Annotated[tuple[str, ...] | None, BeforeValidator(_split_csv)]` for
+   `faker_locale`, `detector_mode`, `gliner_labels` — accepts string
+   or list, normalizes to tuple. Length caps via `Field(max_length=…)`.
+3. `Annotated[float | None, …]` for `gliner_threshold` with
+   `Field(ge=0, le=1)`. Reject `bool` explicitly in a validator
+   (Python's `True == 1` would otherwise slip through).
+4. Per-field error handling: keep `parse_overrides` as a thin wrapper
+   that iterates `raw.items()`, validates one field at a time via
+   `Overrides.model_validate({key: value})` (or per-field constructor
+   calls), catches `ValidationError`, logs, and merges into a final
+   `Overrides`.
+5. Tests stay the same — the contract is unchanged from the caller's
+   perspective. The internal parsing is just shorter.
+
+**Non-goals:**
+
+- Don't expose `Overrides` directly on `GuardrailRequest` as a typed
+  field. The wire contract is `additional_provider_specific_params:
+  dict[str, Any]` per LiteLLM's spec; we own the parsing on top of
+  that.
+
+---
+
+## Optional structured (JSON) logging
+
+**What:** add a `LOG_FORMAT=text|json` env var (default `text`). When
+`json`, install a `python-json-logger` `JsonFormatter` on the root
+logger so every log line is one JSON object — `level`, `name`,
+`message`, `timestamp`, plus structured `extra={…}` fields like
+`call_id`, `entity_count`, `detector`.
+
+**Why:** today the format string in `main.py:23-26` is human-readable
+(`%(asctime)s %(levelname)s %(name)s — %(message)s`). Fine for `docker
+logs` and local dev, but in any production-grade log pipeline (ELK,
+Splunk, Datadog, Loki + Grafana) JSON lines are dramatically easier
+to query — *"show me all `anonymize` calls in the last hour where
+`entity_count > 50`"* is one filter expression on JSON, vs. a regex
+on text. Pairs well with the planned Prometheus `/metrics` endpoint:
+metrics for trends, structured logs for per-call drill-down.
+
+**Why deferred:** no production deployment yet that's plumbed into a
+log aggregator. Premature otherwise.
+
+**Sketch:**
+
+1. Add `python-json-logger` to `pyproject.toml`.
+2. Extend `Config` with `log_format: str = "text"`.
+3. In `main.py`, branch on `config.log_format`: keep the existing
+   `basicConfig` for `text`; for `json`, replace the root handler's
+   formatter with `pythonjsonlogger.jsonlogger.JsonFormatter`.
+4. Replace existing `log.info("anonymize call_id=%s entities=%d
+   texts=%d", …)` calls with `log.info("anonymize", extra={"call_id":
+   …, "entities": …, "texts": …})` so the structured fields land as
+   top-level JSON keys. Keep the message unchanged for text mode
+   (the JSON formatter respects `extra`; the text formatter ignores
+   it).
+5. Document `LOG_FORMAT` in the README env table next to `LOG_LEVEL`.
+
+**Non-goals:**
+
+- Don't add OpenTelemetry tracing here. Logging and tracing are
+  different shapes (point events vs. spans), and OTel pulls in a
+  much bigger dependency surface — separate task if/when needed.
+- Don't try to redact PII from logs structurally. The pipeline
+  already gates body-content logs behind DEBUG (`main.py:93-94`);
+  the structured fields we'd log (`call_id`, counts) are
+  PII-free.
+
+---
+
+## LLM batching for small fragments
+
+**What:** pack multiple short input texts from a single request into
+one LLM detection call instead of N parallel calls. The model is
+asked to return a list-of-lists (one entity list per input), and the
+pipeline maps the result back to per-text matches.
+
+**Why:** today each text in `req.texts` produces its own
+`_detect_one` task (`pipeline.py:391-398`), each of which fans out to
+its own LLM call (`detector/llm.py:detect`). For a request with 10
+short texts, that's 10 LLM round-trips, each carrying the full system
+prompt. The system prompt currently ~600 tokens (see
+`prompts/llm_default.md`); 10 short inputs of ~50 tokens each means
+we send ~6500 system-prompt tokens for ~500 user tokens — a 13×
+overhead. Batching one round-trip with the system prompt sent once
+plus a `[input1, input2, …]` user message would cut both token cost
+and total wall-clock latency (one TTFT + a longer generation, vs.
+ten TTFTs serialized through a concurrency cap of 10).
+
+**Why deferred:** non-trivial. Tradeoffs:
+
+- **Failure mode worsens.** Today one LLM call failing only loses
+  detection for one text; under `fail_closed=False` the others still
+  get coverage. Batched, a single bad response loses coverage for
+  the whole batch — and a *partially* malformed response (model
+  returns 9 of 10 expected lists) is messy to handle.
+- **Hallucination accounting gets harder.** The hallucination guard
+  in `_parse_entities` (`detector/llm.py:170-172`) checks each
+  matched substring against the source text. With multiple sources
+  in flight, the model could return a real entity from text 3 but
+  attribute it to text 1's list. The guard would still drop it (it
+  isn't in text 1), so we lose a real entity — net worse than
+  before.
+- **Heterogeneous batch sizes.** A request with one 50k-char text
+  and nine 50-char texts shouldn't batch — the long one alone is
+  near `LLM_MAX_CHARS`. Need a sizing heuristic.
+- The other detectors (regex, denylist, privacy_filter, gliner_pii)
+  don't benefit from this — only the LLM path. So the optimization
+  is detector-specific and adds only-the-LLM-batches branching to
+  the pipeline.
+
+**Why deferred (continued):** the wins are real but proportional to
+"many small texts per request," and our current traffic shape (mostly
+single-message LiteLLM hooks with a few texts each) doesn't yet
+spend much on system-prompt overhead. Worth measuring before
+implementing.
+
+**Concrete trigger:** a deployment shows a meaningful share of LLM
+detection cost / latency tied to small-fragment fan-out, OR a request
+shape with lots of small texts shows up (e.g. tool-call arguments,
+chat history with many short turns).
+
+**Sketch:**
+
+1. Move LLM detection out of the per-text fan-out at the *LLM
+   detector layer*. The pipeline still calls one detector per text;
+   the detector itself buffers and packs.
+2. Or simpler: introduce a `Pipeline._detect_batch` path that runs
+   the non-LLM detectors per-text (as today) and the LLM detector
+   once for the whole batch.
+3. Update the system prompt to describe the input format change
+   (`{"texts": ["...", "..."]}`) and the response format
+   (`{"entities_per_text": [[…], […]]}` or similar).
+4. Sizing heuristic: only batch texts whose combined length is below
+   some fraction of `LLM_MAX_CHARS` (e.g. 50%). Texts above the cut
+   go alone.
+5. Hallucination guard: per-text-list, check each entity against its
+   own source-text — preserves the existing protection.
+6. Failure handling under `fail_closed=False`: a malformed batched
+   response degrades the *whole batch* to `[]` for the LLM detector
+   (other detectors still cover). Document this as a tradeoff.
+7. Add a benchmark in `docs/benchmark.md` showing the
+   tokens-per-request and p95 latency improvement on a realistic
+   small-fragment workload.
+
+**Non-goals:**
+
+- Don't batch across requests. Cross-request batching needs a
+  request-coalescing window (extra latency for the first request in
+  the window) and undermines per-request `Overrides` (different
+  requests may pick different prompts / models). Out of scope.
+- Don't batch the regex / denylist / privacy_filter detectors. They
+  don't benefit from amortizing a system prompt because they don't
+  have one.
