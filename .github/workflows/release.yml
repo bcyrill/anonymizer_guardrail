@@ -1,7 +1,7 @@
 name: Release
 
 # Triggered by any vX.Y.Z* tag, but the job itself is skipped for
-# flavour-variant tags (vX.Y.Z+pf, vX.Y.Z+pf-baked) so they reuse the
+# flavour-variant tags (vX.Y.Z+pf, vX.Y.Z+pf-service) so they reuse the
 # existing release rather than create a new one per flavour.
 #
 # The exclusion is enforced at the job level (`if:`) rather than via a
@@ -31,22 +31,44 @@ jobs:
           generate_release_notes: true
           draft: false
           # Pre-release when the tag has a `-` suffix (`-rc1`, `-alpha`).
-          # Flavour variants (`+pf`, `+pf-baked`) are already filtered at
-          # the job level above, so `-` here is unambiguous.
+          # Flavour variants (`+pf`, `+pf-service`) are already filtered
+          # at the job level above, so `-` here is unambiguous.
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
-            Container images for this release:
+            ## Container images
+
+            ### Guardrail (always CPU)
+
             ```
-            # Slim (always published)
+            # Slim — always published
             podman pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
 
-            # Privacy-filter — published only if the matching tag
-            # ${{ github.ref_name }}+pf was pushed alongside this one
+            # Privacy-filter built into the guardrail (in-process).
+            # Published only if the matching tag ${{ github.ref_name }}+pf
+            # was pushed alongside this one.
             podman pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-pf
-
-            # Privacy-filter, model baked in — published only if the
-            # matching tag ${{ github.ref_name }}+pf-baked was pushed
-            podman pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-pf-baked
             ```
 
-            See the [Packages page](${{ github.server_url }}/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}) for all available tags and digests.
+            ### Standalone privacy-filter-service
+
+            Separate ghcr package; pair with the slim guardrail and
+            `PRIVACY_FILTER_URL` to keep the heavy ML deps in their
+            own container. Published only if the matching tag
+            `${{ github.ref_name }}+pf-service` was pushed alongside.
+            Both CPU and CUDA-13.0 variants are published; pull the one
+            that matches your hardware.
+
+            ```
+            # CPU
+            podman pull ghcr.io/${{ github.repository_owner }}/privacy-filter-service:${{ github.ref_name }}-cpu
+
+            # CUDA 13.0
+            podman pull ghcr.io/${{ github.repository_owner }}/privacy-filter-service:${{ github.ref_name }}-cu130
+            ```
+
+            Baked-model variants (`pf-baked`, `pf-service-baked`) are
+            not published from CI — they're multi-GB. Build locally with
+            `scripts/build-image.sh -t pf-baked` (or `-t pf-service-baked`)
+            if you need them.
+
+            See the [Packages page](${{ github.server_url }}/${{ github.repository_owner }}?tab=packages&repo_name=${{ github.event.repository.name }}) for all available tags and digests.

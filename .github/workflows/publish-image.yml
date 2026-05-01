@@ -3,21 +3,31 @@ name: Publish container image
 # Triggers:
 #   - push of vX.Y.Z        → slim image, tagged :vX.Y.Z (+ semver siblings)
 #   - push of vX.Y.Z+pf     → pf image, tagged :vX.Y.Z-pf
-#   - push of vX.Y.Z+pf-baked → pf-baked image, tagged :vX.Y.Z-pf-baked
 #   - workflow_dispatch     → operator picks the flavour from a dropdown
+#
+# pf-baked is deliberately NOT published from CI — the image is multi-GB
+# and stores indefinitely on GHCR, but most operators never need it.
+# Anyone who does can build it locally with
+# `scripts/build-image.sh -t pf-baked`. Same rationale for the
+# privacy-filter-service baked variant in publish-pf-service-image.yml.
+#
+# vX.Y.Z+pf-service tags are handled by publish-pf-service-image.yml,
+# which publishes a SEPARATE GHCR package (privacy-filter-service).
+# This workflow short-circuits on those tags so a single tag push only
+# fires the matching workflow.
 #
 # Branch pushes do NOT trigger image builds — most testing happens
 # locally via scripts/build-image.sh and scripts/run_container.sh, and
 # building a fresh image on every commit was producing too much registry
 # churn. Use workflow_dispatch if you need an ad-hoc build off a branch.
 #
-# Each tag publishes ONE flavour. To publish all three for a given
-# version, push three tags pointing at the same commit
+# Each tag publishes ONE flavour. To publish slim + pf for a given
+# version, push two tags pointing at the same commit
 # (`scripts/release.sh` walks operators through this).
 
 on:
   push:
-    tags: ['v*.*.*']  # also matches v*.*.*+pf and v*.*.*+pf-baked
+    tags: ['v*.*.*']  # also matches v*.*.*+pf and v*.*.*+pf-service
   workflow_dispatch:
     inputs:
       flavor:
@@ -28,7 +38,6 @@ on:
         options:
           - slim
           - pf
-          - pf-baked
 
 env:
   REGISTRY: ghcr.io
@@ -36,6 +45,13 @@ env:
 
 jobs:
   build-and-push:
+    # Skip on +pf-service / +pf-service-baked tags — those are handled
+    # by publish-pf-service-image.yml (different image, different
+    # Containerfile). The skip lives at the job level rather than as a
+    # negative tag pattern because GitHub Actions' minimatch parser
+    # treats `+*` as the extglob "one or more" quantifier and rejects
+    # the workflow with "invalid tags patterns".
+    if: ${{ !contains(github.ref_name, '+pf-service') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,7 +63,6 @@ jobs:
 
       # Decide which flavour to build based on the trigger:
       #   - workflow_dispatch  → operator's `flavor` input
-      #   - tag with +pf-baked → pf-baked
       #   - tag with +pf       → pf
       #   - any other tag / branch push → slim
       # Also emits the matching --build-args and the image-tag suffix
@@ -60,10 +75,15 @@ jobs:
             FLAVOR='${{ inputs.flavor }}'
           elif [ "${{ github.ref_type }}" = "tag" ]; then
             case '${{ github.ref_name }}' in
-              *+pf-baked) FLAVOR=pf-baked ;;
               *+pf)       FLAVOR=pf ;;
+              *+pf-baked|*+pf-service-baked)
+                echo "::error::Tag suffix '${{ github.ref_name }}' refers to a baked flavour."
+                echo "::error::Baked images are not published from CI — they're multi-GB."
+                echo "::error::Build locally with: scripts/build-image.sh -t pf-baked (or pf-service-baked)."
+                exit 1
+                ;;
               *+*)
-                echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf or +pf-baked."
+                echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf or +pf-service."
                 exit 1
                 ;;
               *)          FLAVOR=slim ;;
@@ -86,15 +106,6 @@ jobs:
               {
                 echo "build_args<<EOF"
                 echo "WITH_PRIVACY_FILTER=true"
-                echo "EOF"
-              } >> "$GITHUB_OUTPUT"
-              ;;
-            pf-baked)
-              echo "suffix=-pf-baked" >> "$GITHUB_OUTPUT"
-              {
-                echo "build_args<<EOF"
-                echo "WITH_PRIVACY_FILTER=true"
-                echo "BAKE_PRIVACY_FILTER_MODEL=true"
                 echo "EOF"
               } >> "$GITHUB_OUTPUT"
               ;;

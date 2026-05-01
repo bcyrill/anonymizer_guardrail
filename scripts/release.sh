@@ -7,15 +7,20 @@
 # via scripts/build-image.sh covers the iteration loop.
 #
 # Pushing a tag triggers the workflows in .github/workflows/:
-#   - publish-image.yml  (builds & pushes the container to ghcr.io)
-#   - release.yml        (creates a GitHub Release; canonical tag only)
+#   - publish-image.yml             (guardrail image → ghcr.io)
+#   - publish-pf-service-image.yml  (privacy-filter-service → ghcr.io)
+#   - release.yml                   (GitHub Release; canonical tag only)
 #
 # After the canonical vX.Y.Z tag, the script optionally also pushes
 # flavour-variant tags pointing at the same commit:
-#   vX.Y.Z+pf        → publishes the privacy-filter image
-#   vX.Y.Z+pf-baked  → publishes the privacy-filter image with model
-# Each one triggers publish-image.yml separately. release.yml only
+#   vX.Y.Z+pf         → publishes the guardrail pf image
+#   vX.Y.Z+pf-service → publishes the standalone privacy-filter-service
+# Each one triggers its matching workflow separately. release.yml only
 # creates a GitHub Release for the canonical tag (variants reuse it).
+#
+# Baked variants (`+pf-baked`, `+pf-service-baked`) are NOT published
+# from CI — the images are multi-GB. Build them locally with
+# `scripts/build-image.sh -t pf-baked` (or `-t pf-service-baked`).
 
 set -euo pipefail
 
@@ -81,7 +86,7 @@ if ! confirm "Create a new release tag?" n; then
   exit 0
 fi
 
-# Exclude flavour-variant tags (vX.Y.Z+pf, vX.Y.Z+pf-baked) — they
+# Exclude flavour-variant tags (anything with a `+` suffix) — they
 # share the version of their canonical sibling and break the bump
 # arithmetic below (split on `.` would leave the `+pf` suffix in
 # `pat`, then `$((pat + 1))` blows up under `set -u`).
@@ -144,30 +149,46 @@ git push "$remote" "$new_tag"
 ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create the release."
 
 # ── Flavour variants ─────────────────────────────────────────────────────────
-# The publish-image.yml workflow inspects the tag suffix:
-#   vX.Y.Z+pf       → privacy-filter image (no model baked in)
-#   vX.Y.Z+pf-baked → privacy-filter image with model baked in
-# Pushing additional tags pointing at the same commit publishes those
-# flavours alongside the slim one. Each is opt-in because pf-baked in
-# particular is a multi-GB image that takes a while to build and store.
+# Two independent axes, each prompted separately so an operator can
+# decide per-axis instead of navigating a 2x2 combined menu.
+#
+# Axis 1 — guardrail privacy-filter flavour (publish-image.yml):
+#   vX.Y.Z+pf → guardrail image with privacy-filter built-in
+#
+# Axis 2 — standalone privacy-filter-service (publish-pf-service-image.yml):
+#   vX.Y.Z+pf-service → separate ghcr package: privacy-filter-service
+#
+# Baked variants of either axis are intentionally absent — they're
+# local-build only (`scripts/build-image.sh -t pf-baked` /
+# `-t pf-service-baked`).
+variants=()
+
 say ""
-say "Also publish privacy-filter variants?"
+say "Also publish the guardrail privacy-filter image?"
 say ""
 say "  ${c_grn}1)${c_rst} no, slim only"
-say "  ${c_grn}2)${c_rst} +pf       — privacy-filter, model downloaded at runtime"
-say "  ${c_grn}3)${c_rst} +pf-baked — privacy-filter with model in image (~6.9 GB)"
-say "  ${c_grn}4)${c_rst} both +pf and +pf-baked"
-read -r -p "Choose [1-4, default 1]: " variant_choice || true
-case "${variant_choice:-1}" in
-  1) variants=() ;;
-  2) variants=("pf") ;;
-  3) variants=("pf-baked") ;;
-  4) variants=("pf" "pf-baked") ;;
+say "  ${c_grn}2)${c_rst} +pf — guardrail with privacy-filter built-in"
+read -r -p "Choose [1-2, default 1]: " gv_choice || true
+case "${gv_choice:-1}" in
+  1) ;;
+  2) variants+=("pf") ;;
   *) err "Invalid choice."; exit 1 ;;
 esac
 
-for v in "${variants[@]:-}"; do
-  [[ -z "$v" ]] && continue
+say ""
+say "Also publish the standalone privacy-filter-service image?"
+say "(separate ghcr package; pair with the slim guardrail and PRIVACY_FILTER_URL)"
+say ""
+say "  ${c_grn}1)${c_rst} no"
+say "  ${c_grn}2)${c_rst} +pf-service"
+read -r -p "Choose [1-2, default 1]: " sv_choice || true
+case "${sv_choice:-1}" in
+  1) ;;
+  2) variants+=("pf-service") ;;
+  *) err "Invalid choice."; exit 1 ;;
+esac
+
+for v in "${variants[@]}"; do
   variant_tag="${new_tag}+${v}"
   if git rev-parse "$variant_tag" >/dev/null 2>&1; then
     warn "Tag ${variant_tag} already exists — skipping."

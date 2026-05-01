@@ -1,0 +1,177 @@
+name: Publish privacy-filter-service image
+
+# Builds the standalone privacy-filter inference service from
+# services/privacy_filter/Containerfile and pushes to a SEPARATE GHCR
+# package — `privacy-filter-service` — under the same owner. Two
+# packages from one repo: the linkage is automatic via the
+# `org.opencontainers.image.source` label below; the GITHUB_TOKEN with
+# `packages: write` covers both packages without extra credentials.
+#
+# A single `+pf-service` tag fans out into a build matrix that publishes
+# both the CPU-only image and a CUDA-enabled variant:
+#
+#   ghcr.io/<owner>/privacy-filter-service:vX.Y.Z-cpu     CPU
+#   ghcr.io/<owner>/privacy-filter-service:vX.Y.Z-cu130   CUDA 13.0
+#
+# Both variants are explicitly suffixed (no implicit "default" tag) so
+# `podman pull privacy-filter-service:vX.Y.Z` fails fast with "tag not
+# found" instead of silently giving an operator a CPU image they meant
+# to be CUDA-accelerated. To add another CUDA version, extend the
+# matrix below; the rest of the pipeline (metadata, cache scope, push)
+# is parameterised on `matrix.variant.name`.
+#
+# Triggers:
+#   - push of vX.Y.Z+pf-service → matrix builds (CPU + CUDA variants)
+#   - workflow_dispatch         → ad-hoc build off any branch
+#
+# pf-service-baked is deliberately NOT published from CI — the image is
+# multi-GB and stores indefinitely on GHCR. Anyone who needs it can
+# build locally with `scripts/build-image.sh -t pf-service-baked`. Same
+# rationale that excludes the guardrail's pf-baked from CI.
+#
+# This workflow is a sibling of publish-image.yml — both fire on `v*.*.*`
+# tag patterns, but each one's `if:` clause keeps them in distinct lanes.
+
+on:
+  push:
+    tags: ['v*.*.*']  # also matches v*.*.*+pf-service
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    # Only fire for +pf-service tags (or workflow_dispatch). The other
+    # tag shapes are handled by publish-image.yml; this skip is the
+    # mirror of that workflow's `!contains(..., '+pf-service')`.
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.ref_name, '+pf-service') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      # One variant failing shouldn't cancel the others — operators
+      # should still get the CPU image even if a CUDA wheel mirror has
+      # a transient hiccup.
+      fail-fast: false
+      matrix:
+        variant:
+          # CPU variant. Explicitly suffixed `-cpu` so an operator who
+          # pulls `:vX.Y.Z` (no suffix) gets a clear "tag not found"
+          # rather than silently inheriting a CPU image they meant to
+          # be CUDA-accelerated.
+          - name: cpu
+            torch_index: https://download.pytorch.org/whl/cpu
+            suffix: '-cpu'
+          # CUDA 13.0. Suffix `-cu130` matches the convention pytorch
+          # uses for its wheel index (`cu130`), so the image tag and the
+          # underlying torch wheel index agree.
+          - name: cu130
+            torch_index: https://download.pytorch.org/whl/cu130
+            suffix: '-cu130'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Reject the baked variant explicitly so an operator who pushes
+      # +pf-service-baked sees a clear "build this locally" message
+      # rather than a surprise multi-GB CI run that we then refuse to
+      # tag. Mirrors publish-image.yml's pf-baked handling.
+      - name: Reject baked variant
+        if: ${{ github.event_name == 'push' && contains(github.ref_name, '+pf-service-baked') }}
+        run: |
+          echo "::error::Tag '${{ github.ref_name }}' refers to the baked pf-service flavour."
+          echo "::error::Baked images are not published from CI — they're multi-GB."
+          echo "::error::Build locally with: scripts/build-image.sh -t pf-service-baked"
+          exit 1
+
+      - name: Lowercase owner for image name
+        id: owner
+        run: |
+          echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Strip the `+pf-service` suffix from the tag before handing to
+      # docker/metadata-action — the resulting GHCR tag should be the
+      # plain semver (vX.Y.Z), not vX.Y.Z+pf-service. metadata-action's
+      # semver type derives version from the ref; for `workflow_dispatch`
+      # there's no ref-based version so we fall back to a sha tag.
+      - name: Compute clean ref for metadata
+        id: cleanref
+        run: |
+          ref="${{ github.ref_name }}"
+          # Drop everything from the first '+' onward so vX.Y.Z+pf-service
+          # becomes vX.Y.Z. Bash parameter expansion: ${var%%pat} removes
+          # the longest match of pat from the end.
+          clean="${ref%%+*}"
+          echo "ref=$clean" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/privacy-filter-service
+          # `flavor.suffix` adds the variant suffix to every generated
+          # tag (including `latest`), giving us :vX.Y.Z-cu130 and
+          # :latest-cu130 for the CUDA variant while CPU (suffix='')
+          # keeps the canonical :vX.Y.Z / :latest.
+          flavor: |
+            suffix=${{ matrix.variant.suffix }},onlatest=true
+          # `value=` overrides the metadata-action's auto-detection of
+          # the version from the tag — needed because the literal tag
+          # has a `+pf-service` suffix that semver parsers reject.
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.cleanref.outputs.ref }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.cleanref.outputs.ref }}
+            type=semver,pattern={{major}},value=${{ steps.cleanref.outputs.ref }}
+            type=sha,format=short
+          # The `image.source` label is what makes GHCR auto-link this
+          # package back to this repository on the Packages page. Without
+          # it the package would still publish but appear unowned.
+          # `image.variant` records which torch wheel index the image
+          # was built against — useful when an operator is staring at
+          # two pulled images and wondering which is which.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=privacy-filter-service
+            org.opencontainers.image.description=Standalone HTTP wrapper around openai/privacy-filter for the anonymizer-guardrail's RemotePrivacyFilterDetector
+            org.opencontainers.image.variant=${{ matrix.variant.name }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/privacy_filter
+          file: services/privacy_filter/Containerfile
+          # Only amd64 — torch wheels make a multi-arch build painfully
+          # slow on GitHub-hosted runners, same reason the guardrail's
+          # pf flavour is amd64-only.
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            TORCH_INDEX_URL=${{ matrix.variant.torch_index }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Per-variant cache scope so a CPU-only rebuild doesn't
+          # invalidate the CUDA cache or vice versa (different torch
+          # wheel sets, no useful overlap).
+          cache-from: type=gha,scope=pf-service-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=pf-service-${{ matrix.variant.name }}
+          provenance: true
+          sbom: true

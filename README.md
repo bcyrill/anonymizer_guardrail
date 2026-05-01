@@ -749,9 +749,10 @@ auto-start of both the fake-llm test backend and the privacy-filter
 inference service when the operator opts into them.
 
 ```bash
-# Build every flavour: three guardrail images (slim, pf, pf-baked)
+# Build every CPU flavour: three guardrail images (slim, pf, pf-baked)
 # plus the auxiliary services (privacy-filter-service in two
-# variants, fake-llm). Pass -t to build a single one (e.g. -t slim).
+# variants, fake-llm). Pass -t to build a single one (e.g. -t slim,
+# or -t pf-service-cu130 for the CUDA build of the pf service).
 scripts/build-image.sh -t all
 
 # Interactive launcher — single-screen menuconfig-style UI, every
@@ -792,8 +793,9 @@ See `services/privacy_filter/README.md` for the API contract.
 
 ### Image flavours
 
-Three image flavours, controlled by two build-args, sharing one
-`Containerfile`:
+Three guardrail flavours, controlled by two build-args, sharing one
+`Containerfile`. The standalone `privacy-filter-service` is a separate
+package with its own Containerfile and its own CPU/CUDA matrix.
 
 | flavour | size | model | when to pick it |
 |---|---|---|---|
@@ -801,11 +803,26 @@ Three image flavours, controlled by two build-args, sharing one
 | privacy-filter (runtime download) | ~1.3 GB | downloads on first container start | most deployments — pair with a named volume |
 | privacy-filter (model baked in) | ~6.9 GB | shipped inside image | air-gapped or strict cold-start latency |
 
-(Sizes assume the default CPU-only PyTorch build. Override with
-`--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121` if
-you're deploying behind GPUs; expect ~4 GB extra on top — that's roughly
-how much `nvidia-cuda-runtime`, `nvidia-cudnn`, `nvidia-cublas`, etc.
-weigh on Linux x86.)
+The guardrail's privacy-filter flavours are CPU-only by design — when
+you need GPU acceleration, deploy the standalone `privacy-filter-service`
+on a GPU node and point the slim guardrail at it via
+`PRIVACY_FILTER_URL` (see *Privacy-filter detector* above). The
+service ships in two variants:
+
+| pf-service variant | torch wheels | runtime needs |
+|---|---|---|
+| CPU (`-cpu`) | CPU-only | none beyond the container |
+| CUDA 13.0 (`-cu130`) | CUDA 13.0 wheels | nvidia GPU + nvidia-container-toolkit at run time |
+
+Both are published from CI (`+pf-service` tag); the baked variants of
+either are local-build only via `scripts/build-image.sh -t
+pf-service-baked` / `-t pf-service-baked-cu130` because the multi-GB
+image cost isn't worth carrying in the registry for what's typically a
+build-once artifact.
+
+(CPU sizes assume the default CPU-only PyTorch build. CUDA wheels add
+~2 GB on top — that's roughly how much `nvidia-cuda-runtime`,
+`nvidia-cudnn`, `nvidia-cublas`, etc. weigh on Linux x86.)
 
 ### Building manually
 

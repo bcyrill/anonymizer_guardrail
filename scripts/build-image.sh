@@ -40,8 +40,10 @@ TAG_SLIM="${TAG_SLIM:-anonymizer-guardrail:latest}"
 TAG_PF="${TAG_PF:-anonymizer-guardrail:privacy-filter}"
 TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
 TAG_FAKE_LLM="${TAG_FAKE_LLM:-fake-llm:latest}"
-TAG_PF_SERVICE="${TAG_PF_SERVICE:-privacy-filter-service:latest}"
-TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked}"
+TAG_PF_SERVICE="${TAG_PF_SERVICE:-privacy-filter-service:cpu}"
+TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked-cpu}"
+TAG_PF_SERVICE_CU130="${TAG_PF_SERVICE_CU130:-privacy-filter-service:cu130}"
+TAG_PF_SERVICE_BAKED_CU130="${TAG_PF_SERVICE_BAKED_CU130:-privacy-filter-service:baked-cu130}"
 
 usage() {
   cat <<EOF
@@ -61,9 +63,13 @@ Without -t, prompts interactively.
                                           standalone HTTP wrapper around the
                                           model, paired with the guardrail's
                                           RemotePrivacyFilterDetector. Runtime
-                                          download (small image, mount a volume
-                                          at /app/.cache/huggingface).
-                        pf-service-baked  pf-service + model baked in
+                                          download, CPU-only torch.
+                        pf-service-baked  pf-service + model baked in (CPU)
+                        pf-service-cu130  pf-service with CUDA 13.0 torch
+                                          wheels (~+2 GB image; needs an
+                                          nvidia GPU at run time)
+                        pf-service-baked-cu130  pf-service + model baked in,
+                                          CUDA 13.0 torch wheels
                         fake-llm          companion test backend — an OpenAI-
                                           compatible Chat Completions server
                                           with a YAML rules file, for driving
@@ -83,9 +89,11 @@ Environment overrides:
   TAG_SLIM              Default tag for slim (current: ${TAG_SLIM})
   TAG_PF                Default tag for pf (current: ${TAG_PF})
   TAG_PF_BAKED          Default tag for pf-baked (current: ${TAG_PF_BAKED})
-  TAG_PF_SERVICE        Default tag for pf-service (current: ${TAG_PF_SERVICE})
-  TAG_PF_SERVICE_BAKED  Default tag for pf-service-baked (current: ${TAG_PF_SERVICE_BAKED})
-  TAG_FAKE_LLM          Default tag for fake-llm (current: ${TAG_FAKE_LLM})
+  TAG_PF_SERVICE              Default tag for pf-service (current: ${TAG_PF_SERVICE})
+  TAG_PF_SERVICE_BAKED        Default tag for pf-service-baked (current: ${TAG_PF_SERVICE_BAKED})
+  TAG_PF_SERVICE_CU130        Default tag for pf-service-cu130 (current: ${TAG_PF_SERVICE_CU130})
+  TAG_PF_SERVICE_BAKED_CU130  Default tag for pf-service-baked-cu130 (current: ${TAG_PF_SERVICE_BAKED_CU130})
+  TAG_FAKE_LLM                Default tag for fake-llm (current: ${TAG_FAKE_LLM})
 EOF
 }
 
@@ -108,22 +116,26 @@ if [[ -z "$TYPE" ]]; then
   say ""
   say "Which image flavour do you want to build?"
   say ""
-  say "  ${c_grn}1)${c_rst} slim              without privacy-filter"
-  say "  ${c_grn}2)${c_rst} pf                privacy-filter, runtime download"
-  say "  ${c_grn}3)${c_rst} pf-baked          privacy-filter + model baked in"
-  say "  ${c_grn}4)${c_rst} pf-service        privacy-filter inference service ${c_dim}(standalone HTTP wrapper)${c_rst}"
-  say "  ${c_grn}5)${c_rst} pf-service-baked  pf-service + model baked in"
-  say "  ${c_grn}6)${c_rst} fake-llm          companion test backend ${c_dim}(deterministic LLM)${c_rst}"
-  say "  ${c_grn}a)${c_rst} all               build every flavour in sequence"
+  say "  ${c_grn}1)${c_rst} slim                    without privacy-filter"
+  say "  ${c_grn}2)${c_rst} pf                      privacy-filter, runtime download"
+  say "  ${c_grn}3)${c_rst} pf-baked                privacy-filter + model baked in"
+  say "  ${c_grn}4)${c_rst} pf-service              privacy-filter inference service ${c_dim}(CPU)${c_rst}"
+  say "  ${c_grn}5)${c_rst} pf-service-baked        pf-service + model baked in ${c_dim}(CPU)${c_rst}"
+  say "  ${c_grn}6)${c_rst} pf-service-cu130        pf-service with CUDA 13.0 torch ${c_dim}(needs GPU at runtime)${c_rst}"
+  say "  ${c_grn}7)${c_rst} pf-service-baked-cu130  pf-service + model baked in, CUDA 13.0"
+  say "  ${c_grn}8)${c_rst} fake-llm                companion test backend ${c_dim}(deterministic LLM)${c_rst}"
+  say "  ${c_grn}a)${c_rst} all                     build every CPU flavour in sequence ${c_dim}(skips CUDA)${c_rst}"
   say ""
-  read -r -p "Choose [1-6/a, default 1]: " choice || true
+  read -r -p "Choose [1-8/a, default 1]: " choice || true
   case "${choice:-1}" in
     1)   TYPE="slim" ;;
     2)   TYPE="pf" ;;
     3)   TYPE="pf-baked" ;;
     4)   TYPE="pf-service" ;;
     5)   TYPE="pf-service-baked" ;;
-    6)   TYPE="fake-llm" ;;
+    6)   TYPE="pf-service-cu130" ;;
+    7)   TYPE="pf-service-baked-cu130" ;;
+    8)   TYPE="fake-llm" ;;
     a|A) TYPE="all" ;;
     *) err "Invalid choice."; exit 1 ;;
   esac
@@ -189,8 +201,34 @@ resolve_flavour() {
       BUILD_CONTEXT="services/privacy_filter"
       RESOLVED_TYPE="pf-service-baked"
       ;;
+    # CUDA variants — only the standalone pf-service has them; the
+    # guardrail's built-in pf flavour stays CPU-only because anything
+    # that needs GPU acceleration is better off with the standalone
+    # service so the model can scale independently of the API tier.
+    # cu130 matches the convention pytorch uses for its CUDA wheel
+    # index (cu130 = CUDA 13.0); change the index URL or add another
+    # case to support a different CUDA version.
+    pf-service-cu130|privacy-filter-service-cu130)
+      BUILD_ARGS=(--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130)
+      DEFAULT_TAG="$TAG_PF_SERVICE_CU130"
+      CONTAINERFILE="services/privacy_filter/Containerfile"
+      BUILD_CONTEXT="services/privacy_filter"
+      RESOLVED_TYPE="pf-service-cu130"
+      ;;
+    pf-service-baked-cu130|privacy-filter-service-baked-cu130)
+      BUILD_ARGS=(
+        --build-arg BAKE_MODEL=true
+        --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+      )
+      DEFAULT_TAG="$TAG_PF_SERVICE_BAKED_CU130"
+      CONTAINERFILE="services/privacy_filter/Containerfile"
+      BUILD_CONTEXT="services/privacy_filter"
+      RESOLVED_TYPE="pf-service-baked-cu130"
+      ;;
     *)
-      err "Unknown type '$1'. Valid: slim, pf, pf-baked, pf-service, pf-service-baked, fake-llm, all."
+      err "Unknown type '$1'. Valid: slim, pf, pf-baked,"
+      err "  pf-service, pf-service-baked, pf-service-cu130, pf-service-baked-cu130,"
+      err "  fake-llm, all."
       exit 1
       ;;
   esac
@@ -241,7 +279,7 @@ say ""
 # call it out whether selected directly or pulled in via "all".
 for f in "${BUILD_LIST[@]}"; do
   case "$f" in
-    pf-baked|privacy-filter-baked|pf-service-baked|privacy-filter-service-baked)
+    pf-baked|privacy-filter-baked|pf-service-baked|privacy-filter-service-baked|pf-service-baked-cu130|privacy-filter-service-baked-cu130)
       warn "This build downloads the openai/privacy-filter model at build"
       warn "time. Network access is required and the build will take"
       warn "several minutes the first time (subsequent builds use the layer cache)."
@@ -317,6 +355,25 @@ case "$TYPE" in
     say ""
     say "  ${c_dim}# Self-contained — no runtime download. Point the guardrail at${c_rst}"
     say "  ${c_dim}# it via PRIVACY_FILTER_URL once RemotePrivacyFilterDetector lands.${c_rst}"
+    ;;
+  pf-service-cu130)
+    say "  # Create a named volume so the model download survives recreates."
+    say "  ${ENGINE} volume create privacy-filter-hf-cache"
+    say "  ${ENGINE} run --rm -p 8001:8001 \\"
+    say "      --device nvidia.com/gpu=all \\"
+    say "      -v privacy-filter-hf-cache:/app/.cache/huggingface \\"
+    say "      ${TAG}"
+    say ""
+    say "  ${c_dim}# CUDA wheels in image; needs an nvidia GPU + nvidia-container-toolkit${c_rst}"
+    say "  ${c_dim}# at run time. With docker, use --gpus all instead of --device.${c_rst}"
+    ;;
+  pf-service-baked-cu130)
+    say "  ${ENGINE} run --rm -p 8001:8001 \\"
+    say "      --device nvidia.com/gpu=all \\"
+    say "      ${TAG}"
+    say ""
+    say "  ${c_dim}# Self-contained CUDA build. Needs an nvidia GPU at run time.${c_rst}"
+    say "  ${c_dim}# With docker, use --gpus all instead of --device.${c_rst}"
     ;;
   fake-llm)
     say "  ${c_dim}# fake-llm is auto-started by scripts/cli.sh when you${c_rst}"
