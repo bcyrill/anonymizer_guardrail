@@ -14,7 +14,7 @@ scripts/cli.sh -t pf -d regex,privacy_filter
 
 # Full stack, requires LLM_API_BASE / LLM_API_KEY for the LLM examples.
 scripts/cli.sh -t pf -d regex,privacy_filter,llm \
-  --llm-backend custom \
+  --llm-backend external \
   --llm-api-base http://litellm:4000/v1 \
   --llm-api-key sk-litellm-master \
   --llm-model anonymize

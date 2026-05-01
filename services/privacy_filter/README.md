@@ -3,8 +3,12 @@
 HTTP wrapper around the
 [openai/privacy-filter](https://huggingface.co/openai/privacy-filter)
 token-classification model. Pair with the guardrail's
-`RemotePrivacyFilterDetector` (planned) so the heavy ML deps live in
-their own container instead of inflating the guardrail image.
+`RemotePrivacyFilterDetector` (set `PRIVACY_FILTER_URL` on the
+guardrail container, or `--privacy-filter-backend service` /
+`external` from the launcher) so the heavy ML deps live in their own
+container instead of inflating the guardrail image. See
+[docs/detectors/privacy-filter.md](../../docs/detectors/privacy-filter.md)
+for when to pick the in-process vs the remote variant.
 
 ## API
 
@@ -50,18 +54,20 @@ container `HEALTHCHECK` treats anything other than `ok` as unhealthy.
 Two flavours, both built from this directory:
 
 ```bash
-# Runtime download — small image (~1 GB), model downloads on first start.
+# Runtime download — model downloads on first container start.
 podman build -t privacy-filter-service:latest \
     -f Containerfile .
 
-# Baked — model in the image (~6.9 GB), works air-gapped.
+# Baked — model shipped in the image, works air-gapped.
 podman build -t privacy-filter-service:baked \
     --build-arg BAKE_MODEL=true \
     -f Containerfile .
 ```
 
 Or use `scripts/build-image.sh` from the repo root: types `pf-service`
-and `pf-service-baked`.
+and `pf-service-baked`. See
+[docs/deployment.md → Container images](../../docs/deployment.md#container-images)
+for the size/runtime trade-off across all flavours.
 
 ## Run
 
@@ -84,5 +90,5 @@ Configuration:
 
 GPU build: pass `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121`
 to the `podman build` (default is the CPU wheel index, since most
-deployments don't have a GPU and the CUDA `torch` wheel pulls in ~2 GB
-of CUDA runtime libraries).
+deployments don't have a GPU and the CUDA `torch` wheel adds the
+nvidia runtime libraries on top).

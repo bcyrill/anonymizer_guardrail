@@ -34,7 +34,7 @@ anonymization proceeds with config defaults for whatever was rejected.
 | Limit | Default | What it bounds |
 |---|---|---|
 | `faker_locale` chain length | 3 | Maximum locales in a single `faker_locale` value. A request asking for 50 locales is malformed and inflates Faker construction time. Hardcoded — primary + 1–2 fallbacks is the realistic shape. |
-| `detector_mode` list length | 4 | Four detector implementations exist (`regex`, `denylist`, `privacy_filter`, `llm`); anything longer cannot be valid. Hardcoded. |
+| `detector_mode` list length | `len(REGISTERED_SPECS)` (currently 5) | Caps the override at the number of registered detectors — anything longer cannot be valid since a `detector_mode` override is a *subset filter* over what's already configured. Auto-bumps when a new detector is registered. |
 | `SURROGATE_FAKER_LRU_MAX` | `32` | LRU cap on the per-locale Faker instance cache. Each Faker is a few MB resident (provider dictionaries); without a bound, a caller cycling distinct locale tuples could grow memory unboundedly. On overflow, the least-recently-used Faker is dropped and reconstructed on next use (~1–2 ms). Override at startup if your deployment legitimately serves many distinct locale combos. |
 
 When a length cap is exceeded, the override is dropped (warn-and-drop)

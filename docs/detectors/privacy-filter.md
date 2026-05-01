@@ -27,10 +27,12 @@ by changing the detector list.
 ## In-process (default)
 
 Loads the `openai/privacy-filter` model into the guardrail's own
-process. Pulls in `torch`, `transformers`, and ~6 GB of weights, so
-this option only works on the `pf` / `pf-baked` image flavours — slim
-doesn't ship the dependencies. Microsecond glue overhead per call;
-shares the guardrail's CPU/memory budget.
+process. Pulls in `torch`, `transformers`, and the full set of model
+weights, so this option only works on the `pf` / `pf-baked` image
+flavours — slim doesn't ship the dependencies. See
+[deployment → Container images](../deployment.md#container-images) for
+the size impact. Microsecond glue overhead per call; shares the
+guardrail's CPU/memory budget.
 
 Pick this when:
 
@@ -54,8 +56,8 @@ same input.
 
 Pick this when:
 
-- You want the slim guardrail image (no torch, ~200 MB) but still
-  need privacy-filter coverage.
+- You want the slim guardrail image (no torch in the API container)
+  but still need privacy-filter coverage.
 - Multiple guardrail replicas should share one inference service
   (single model copy in memory; one place to attach a GPU).
 - Model updates need to ship without rebuilding the guardrail image.

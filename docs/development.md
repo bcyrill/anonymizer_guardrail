@@ -7,7 +7,7 @@ Guide for contributors. For end-user / operator docs, see the
 
 ```bash
 pip install -e ".[dev]"
-pytest                                 # 341+ tests, no container needed
+pytest                                 # full unit-test suite, no container needed
 uvicorn anonymizer_guardrail.main:app --reload   # hot-reload dev server
 ```
 
@@ -56,9 +56,9 @@ src/anonymizer_guardrail/        # the importable package — what ships
                                  # config lives in the detector module.
 
 tools/launcher/                  # dev-only, NOT in the wheel
+  __main__.py                    # `python -m tools.launcher` entry
   spec_extras.py                 # LAUNCHER_METADATA (per-detector
                                  # service / env-passthrough metadata)
-  spec.py
   engine.py                      # podman/docker dispatch
   services.py                    # auto-start lifecycle
   runner.py                      # build run argv + exec engine
@@ -283,6 +283,9 @@ line includes its fail-mode and cap, `_run` dispatches via
 `SPECS_BY_NAME[det.name]`, and `main.py`'s BLOCKED handler maps the
 typed error via `TYPED_UNAVAILABLE_ERRORS`. `/health` gains
 `<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency` keys.
+The per-request `detector_mode` length cap in `api.py` is also
+derived from `len(REGISTERED_SPECS)`, so callers can pass the new
+detector in their override list without bumping a constant.
 
 ### 5. Tests
 
@@ -409,11 +412,6 @@ build, run).
 | **+ launcher CLI** | +1 — `tools/launcher/main.py` |
 | **+ launcher menu** | +1 — `tools/launcher/menu.py` |
 | **+ docs** | +1 to +2 — `docs/detectors/<name>.md`, optional row in `docs/configuration.md` |
-
-**Maximum** for a fully-integrated detector with a service container,
-flag support, menu support, and docs: **~10 files**. **Minimum** for
-an in-process Python-only detector that just shows up in
-`DETECTOR_MODE`: **2 files**.
 
 What you don't have to touch: `pipeline.py`, `main.py`, `config.py`,
 the bash wrapper scripts (`cli.sh` / `menu.sh`), or any "list of

@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .detector import REGISTERED_SPECS
+
 log = logging.getLogger("anonymizer.api")
 
 
@@ -72,13 +74,15 @@ class Overrides:
 
 _VALID_OVERLAP_STRATEGIES = frozenset({"longest", "priority"})
 
-# Defensive caps on parsed override values. Four detectors exist
-# (regex, denylist, privacy_filter, llm) so a list longer than that
-# is malformed. Three locales covers primary + a couple of fallbacks,
-# which is what realistic Faker chains use; anything beyond is almost
-# certainly abuse and inflates per-request Faker construction time.
+# Defensive caps on parsed override values. The detector_mode cap is
+# derived from REGISTERED_SPECS so adding a new detector automatically
+# bumps it — pre-refactor this was hardcoded and went silently stale
+# every time a detector landed. Three locales covers primary + a couple
+# of fallbacks, which is what realistic Faker chains use; anything
+# beyond is almost certainly abuse and inflates per-request Faker
+# construction time.
 _MAX_LOCALE_CHAIN = 3
-_MAX_DETECTOR_LIST = 4
+_MAX_DETECTOR_LIST = len(REGISTERED_SPECS)
 
 
 def _parse_locale(value: Any) -> tuple[str, ...] | None:

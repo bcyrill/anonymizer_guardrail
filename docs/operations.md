@@ -14,11 +14,11 @@ For deeper background:
 - **[Limitations](limitations.md)** — single-replica constraint,
   streaming, restart behaviour.
 
-## `/health`
+## Observability
 
-Returns live counters for both stores plus per-detector concurrency
-gauges so operators can monitor pressure or leak without inspecting
-the process:
+`/health` returns live counters for both stores plus per-detector
+concurrency gauges so operators can monitor pressure or leak without
+inspecting the process:
 
 ```json
 {

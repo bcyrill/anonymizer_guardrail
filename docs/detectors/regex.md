@@ -36,10 +36,9 @@ shape):
 
 Two pattern files ship with the package under
 `src/anonymizer_guardrail/patterns/`:
-`src/anonymizer_guardrail/patterns/`:
 
 - `regex_default.yaml` — small, conservative, low-FP set (loaded by default).
-- `regex_pentest.yaml` — `extends: regex_default.yaml` plus all 173 patterns
+- `regex_pentest.yaml` — `extends: regex_default.yaml` plus the patterns
   ported verbatim from
   [DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI/blob/main/src/regex_detector.py)
   (cloud creds, NTDS dumps, hashcat output, Pacu, Volatility, BloodHound,

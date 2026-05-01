@@ -2,11 +2,13 @@
 
 HTTP wrapper around NVIDIA's
 [nvidia/gliner-pii](https://huggingface.co/nvidia/gliner-PII) model — a
-fine-tune of GLiNER large-v2.1 for PII / PHI detection. **Experimental**:
-not yet wired into the guardrail's detector pipeline (no
-`RemoteGlinerDetector` exists). This container exists so the model can
-be evaluated locally before deciding whether to add it as a first-class
-detector alongside `privacy_filter`, `regex`, `denylist`, and `llm`.
+fine-tune of GLiNER large-v2.1 for PII / PHI detection. Paired with
+the guardrail's `RemoteGlinerPIIDetector` (set `GLINER_PII_URL` on
+the guardrail container, or `--gliner-pii-backend service` /
+`external` from the launcher) — there is no in-process variant. See
+[docs/detectors/gliner-pii.md](../../docs/detectors/gliner-pii.md)
+for when to pick this detector vs `privacy_filter`, label / threshold
+guidance, and the NVIDIA Open Model License caveat.
 
 The interesting differentiator vs the existing
 `privacy-filter-service` is **zero-shot labels**: the entity-type list
@@ -77,7 +79,7 @@ variants (CUDA tag matches the pytorch wheel-index convention — e.g.
 podman build -t gliner-pii-service:cpu \
     -f Containerfile .
 
-# CPU, baked — model in the image (~3 GB), works air-gapped.
+# CPU, baked — model shipped in the image, works air-gapped.
 podman build -t gliner-pii-service:baked-cpu \
     --build-arg BAKE_MODEL=true \
     -f Containerfile .
@@ -147,9 +149,9 @@ posture before relying on this service in production.
 
 Same rationale as the privacy-filter-service:
 
-- Heavy ML deps (`gliner` library + torch + ~570M weights) stay out of
-  the guardrail image — slim guardrail can still benefit by pointing
-  at this URL.
+- Heavy ML deps (`gliner` library + torch + the model weights) stay
+  out of the guardrail image — slim guardrail can still benefit by
+  pointing at this URL.
 - Independent scaling — typically deploy on a GPU node and share with
   multiple guardrail replicas.
 - License containment — the NVIDIA Open Model License terms apply only
