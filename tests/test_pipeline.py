@@ -183,9 +183,18 @@ async def test_batch_cancels_sibling_texts_on_fail_closed(
     sibling texts' in-flight detector calls must be cancelled — not
     left to burn compute and pin concurrency slots until they
     complete naturally. Locks down the TaskGroup-vs-gather choice in
-    Pipeline.anonymize: switching back to asyncio.gather would silently
-    pass the typed-exception assertion below but blow past the
-    wait_for timeout because the slow tasks would run to completion.
+    Pipeline.anonymize.
+
+    The check that catches a regression is `completed == 0` after the
+    sibling tasks would have had time to finish:
+
+      * TaskGroup → siblings cancelled at their `await`, never reach
+        the `completed += 1` line; counter stays 0 forever.
+      * asyncio.gather → exception propagates immediately, but
+        siblings keep running detached; after their sleep elapses
+        they reach the increment and the counter goes nonzero.
+
+    The 0.5 s sleep + 1.0 s settle window is the discriminator.
     """
     from anonymizer_guardrail.detector.llm import LLMDetector, LLMUnavailableError
 
@@ -201,10 +210,12 @@ async def test_batch_cancels_sibling_texts_on_fail_closed(
         nonlocal started, completed
         started += 1
         if text == "explode":
+            # Yield once so the sibling tasks get a chance to start
+            # their sleep — otherwise the cancellation case has nothing
+            # to cancel and the test doesn't exercise the property.
+            await asyncio.sleep(0)
             raise LLMUnavailableError("forced")
-        # Long enough that without cancellation the wait_for below
-        # would time out (proving the test catches a regression).
-        await asyncio.sleep(5)
+        await asyncio.sleep(0.5)
         completed += 1
         return []
 
@@ -212,25 +223,19 @@ async def test_batch_cancels_sibling_texts_on_fail_closed(
     p = Pipeline()
     p._detectors = [bad]
 
-    # Tight timeout — well under the 5s sleep. If cancellation works,
-    # this completes in milliseconds with the typed exception. If it
-    # doesn't, asyncio.wait_for raises TimeoutError instead and the
-    # `pytest.raises(LLMUnavailableError)` assertion fails loudly.
     with pytest.raises(LLMUnavailableError, match="forced"):
-        await asyncio.wait_for(
-            p.anonymize(
-                ["slow1", "explode", "slow2"], call_id="cancel-test",
-            ),
-            timeout=2,
+        await p.anonymize(
+            ["slow1", "explode", "slow2"], call_id="cancel-test",
         )
 
-    # The failing detector started; the slow ones may or may not have
-    # entered detect() depending on scheduler order. What MUST hold is
-    # that NO slow task ran to completion — they were cancelled.
+    # Settle: long enough that detached gather-style siblings would
+    # have finished their 0.5 s sleep and bumped `completed`.
+    await asyncio.sleep(1.0)
     assert completed == 0, (
         f"slow detector tasks completed despite sibling failure "
         f"(started={started}, completed={completed}); "
-        f"sibling cancellation is broken."
+        f"sibling cancellation is broken — Pipeline.anonymize is "
+        f"probably back on asyncio.gather instead of TaskGroup."
     )
 
 
