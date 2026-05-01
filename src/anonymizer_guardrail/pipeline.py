@@ -17,6 +17,7 @@ import logging
 import re
 from typing import Callable, Iterable
 
+from .api import Overrides
 from .config import config
 from .detector.base import Detector, Match
 from .detector.llm import LLMDetector, LLMUnavailableError
@@ -152,8 +153,50 @@ class Pipeline:
     def vault(self) -> Vault:
         return self._vault
 
+    def _resolve_active_detectors(
+        self, overrides: Overrides
+    ) -> list[Detector]:
+        """Apply the per-request `detector_mode` filter as a SUBSET over
+        the detectors configured at startup.
+
+        Operators can narrow the active set per call (e.g. "skip the LLM
+        for this request") but cannot expand it: privacy_filter requires
+        torch + the model to be loaded, and the LLM detector requires the
+        configured api_base / model — neither are constructable at
+        request time. Names that aren't currently configured are dropped
+        with a warning.
+        """
+        if not overrides.detector_mode:
+            return self._detectors
+        configured = {d.name: d for d in self._detectors}
+        active: list[Detector] = []
+        unknown: list[str] = []
+        for name in overrides.detector_mode:
+            d = configured.get(name)
+            if d is None:
+                unknown.append(name)
+            elif d not in active:
+                active.append(d)
+        if unknown:
+            log.warning(
+                "detector_mode override mentions detector(s) %s that aren't "
+                "configured (configured: %s) — ignored.",
+                unknown, list(configured),
+            )
+        if not active:
+            log.warning(
+                "detector_mode override resolved to an empty set; falling "
+                "back to all configured detectors for this request."
+            )
+            return self._detectors
+        return active
+
     async def _detect_one(
-        self, text: str, *, api_key: str | None = None
+        self,
+        text: str,
+        *,
+        api_key: str | None = None,
+        overrides: Overrides = Overrides.empty(),
     ) -> list[Match]:
         """Run all configured detectors against one text in parallel and dedup.
 
@@ -172,7 +215,12 @@ class Pipeline:
         still propagates under FAIL_CLOSED, in which case asyncio cancels
         the other in-flight detectors — the right behaviour because we're
         about to BLOCK the request anyway.
+
+        `overrides` is plumbed through to the detectors that care:
+        regex picks up the overlap-strategy override, LLM picks up the
+        model override.
         """
+        active = self._resolve_active_detectors(overrides)
 
         async def _run(det: Detector) -> list[Match]:
             try:
@@ -182,9 +230,17 @@ class Pipeline:
                     async with self._llm_semaphore:
                         self._llm_in_flight += 1
                         try:
-                            return await det.detect(text, api_key=api_key)
+                            return await det.detect(
+                                text,
+                                api_key=api_key,
+                                model=overrides.llm_model,
+                            )
                         finally:
                             self._llm_in_flight -= 1
+                if isinstance(det, RegexDetector):
+                    return await det.detect(
+                        text, overlap_strategy=overrides.regex_overlap_strategy,
+                    )
                 return await det.detect(text)
             except LLMUnavailableError as exc:
                 if config.fail_closed:
@@ -208,9 +264,9 @@ class Pipeline:
                     ) from exc
                 return []
 
-        results = await asyncio.gather(*[_run(d) for d in self._detectors])
+        results = await asyncio.gather(*[_run(d) for d in active])
         if log.isEnabledFor(logging.DEBUG):
-            for det, matches in zip(self._detectors, results):
+            for det, matches in zip(active, results):
                 log.debug(
                     "Detector %s returned %d matches: %s",
                     det.name, len(matches),
@@ -243,6 +299,7 @@ class Pipeline:
         call_id: str | None,
         *,
         api_key: str | None = None,
+        overrides: Overrides = Overrides.empty(),
     ) -> tuple[list[str], dict[str, str]]:
         """Anonymize a batch of texts, persist the reverse mapping, return modified texts.
 
@@ -251,21 +308,37 @@ class Pipeline:
 
         `api_key`, if given, overrides config.llm_api_key for the LLM detector
         on this call only — used to forward the caller's own key per-request.
+
+        `overrides` carries the `additional_provider_specific_params`
+        knobs (use_faker, faker_locale, detector_mode,
+        regex_overlap_strategy, llm_model). Each is None by default;
+        the detectors and the surrogate generator pick up only the
+        ones relevant to them.
         """
         if not texts:
             return [], {}
 
         per_text_matches = await asyncio.gather(
-            *[self._detect_one(t, api_key=api_key) for t in texts]
+            *[
+                self._detect_one(t, api_key=api_key, overrides=overrides)
+                for t in texts
+            ]
         )
 
         # Build one process-wide mapping (original → surrogate) so the same
         # entity gets the same surrogate across all texts in this request.
+        # Surrogate-side overrides (use_faker, faker_locale) are passed
+        # to for_match — the cache key includes them so different combos
+        # coexist with their own consistency.
         original_to_surrogate: dict[str, str] = {}
         for matches in per_text_matches:
             for m in matches:
                 if m.text not in original_to_surrogate:
-                    original_to_surrogate[m.text] = self._surrogates.for_match(m)
+                    original_to_surrogate[m.text] = self._surrogates.for_match(
+                        m,
+                        use_faker=overrides.use_faker,
+                        locale=overrides.faker_locale,
+                    )
 
         # The vault stores the *reverse* direction (surrogate → original) since
         # that's what deanonymize needs.

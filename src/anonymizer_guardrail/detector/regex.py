@@ -289,9 +289,24 @@ class RegexDetector:
     def __init__(self) -> None:
         self._compiled: list[tuple[str, re.Pattern[str]]] = _COMPILED_PATTERNS
 
-    async def detect(self, text: str) -> list[Match]:
+    async def detect(
+        self, text: str, *, overlap_strategy: str | None = None
+    ) -> list[Match]:
+        """Run every compiled pattern and return the resolved match list.
+
+        `overlap_strategy` is a per-call override; None means "use
+        config.regex_overlap_strategy". Validated up front so a typo
+        from a per-request override surfaces as a clear error rather
+        than silently behaving like the default.
+        """
         if not text:
             return []
+        strategy = overlap_strategy or config.regex_overlap_strategy
+        if strategy not in _VALID_OVERLAP_STRATEGIES:
+            raise ValueError(
+                f"Invalid overlap_strategy={strategy!r}. "
+                f"Allowed: {', '.join(sorted(_VALID_OVERLAP_STRATEGIES))}."
+            )
 
         # Pass 1: walk every pattern and collect every non-empty candidate.
         # Both strategies pay the same regex cost — Python's re engine
@@ -339,7 +354,7 @@ class RegexDetector:
         #   - "priority" keep insertion order (YAML order, then in-pattern
         #                position). The first pattern that matches a span
         #                wins — same as the pre-v0.2 behaviour.
-        if config.regex_overlap_strategy == "longest":
+        if strategy == "longest":
             candidates.sort(key=lambda c: (-(c[1] - c[0]), c[0]))
 
         claimed: list[tuple[int, int]] = []

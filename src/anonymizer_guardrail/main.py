@@ -14,7 +14,7 @@ from typing import AsyncIterator, Mapping
 
 from fastapi import FastAPI
 
-from .api import GuardrailRequest, GuardrailResponse
+from .api import GuardrailRequest, GuardrailResponse, parse_overrides
 from .config import config
 from .detector.llm import LLMUnavailableError
 from .pipeline import Pipeline
@@ -132,10 +132,19 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
                 hint,
             )
 
+    # Per-request overrides come in via additional_provider_specific_params
+    # (see api.parse_overrides for the accepted keys + validation policy).
+    # Only meaningful on the request side — deanonymize is a vault lookup
+    # that's already pinned by call_id.
+    overrides = parse_overrides(req.additional_provider_specific_params)
+
     try:
         if req.input_type == "request":
             modified, mapping = await _pipeline.anonymize(
-                req.texts, req.litellm_call_id, api_key=forwarded_key
+                req.texts,
+                req.litellm_call_id,
+                api_key=forwarded_key,
+                overrides=overrides,
             )
             if not mapping:
                 return GuardrailResponse(action="NONE")

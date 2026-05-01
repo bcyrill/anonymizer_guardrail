@@ -136,10 +136,12 @@ def test_surrogate_collision_resolved_with_unique_output(
     assert pre  # baseline
 
     # Forcibly insert that value as if another entity had already taken it,
-    # so the next NEW (text,type) combo has to salt-retry.
+    # so the next NEW (text,type) combo has to salt-retry. The cache key
+    # is (entity_type, text, use_faker, locale) — the trailing two are the
+    # per-request override slots; defaults bucket into (False, None).
     gen._used_surrogates.add(pre)
-    gen._cache[("PERSON", "carol")] = pre  # sanity: this combo not actually issued
-    del gen._cache[("PERSON", "carol")]    # remove again, keep used set polluted
+    gen._cache[("PERSON", "carol", False, None)] = pre  # sanity: not actually issued
+    del gen._cache[("PERSON", "carol", False, None)]    # keep used-set polluted
 
     out = gen.for_match(Match(text="bob", entity_type="PERSON"))
     assert out != pre, "salt-retry must produce a value not in _used_surrogates"
@@ -179,10 +181,12 @@ def test_lru_evicts_least_recently_used_entry(
 
     gen.for_match(Match(text="dan", entity_type="PERSON"))
     keys = set(gen._cache.keys())
-    assert ("PERSON", "alice") in keys
-    assert ("PERSON", "carol") in keys
-    assert ("PERSON", "dan") in keys
-    assert ("PERSON", "bob") not in keys, "least-recently-used should have been evicted"
+    # Cache key is (entity_type, text, use_faker, locale); the no-override
+    # path buckets into (False, None) here because use_faker=False.
+    assert ("PERSON", "alice", False, None) in keys
+    assert ("PERSON", "carol", False, None) in keys
+    assert ("PERSON", "dan", False, None) in keys
+    assert ("PERSON", "bob", False, None) not in keys, "LRU should have evicted"
 
 
 def test_evicted_surrogate_is_freed_for_collision_set(
@@ -203,7 +207,7 @@ def test_evicted_surrogate_is_freed_for_collision_set(
     # Force eviction of "alice" by adding a third entry.
     gen.for_match(Match(text="carol", entity_type="PERSON"))
 
-    assert ("PERSON", "alice") not in gen._cache
+    assert ("PERSON", "alice", False, None) not in gen._cache
     # The surrogate that "alice" used to hold is now free for re-issue.
     assert s_a not in gen._used_surrogates
 

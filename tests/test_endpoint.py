@@ -298,7 +298,12 @@ class _CapturingPipeline:
         call_id: str | None,
         *,
         api_key: str | None = None,
+        overrides: Any = None,
     ):
+        # `overrides` was added when the guardrail picked up
+        # additional_provider_specific_params support — accept it but
+        # don't assert anything here; the forwarded-key tests below
+        # only care about api_key plumbing.
         self.received_api_key = api_key
         return list(texts), {}
 

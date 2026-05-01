@@ -172,7 +172,13 @@ class LLMDetector:
         self.timeout_s = timeout_s or config.llm_timeout_s
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
 
-    async def detect(self, text: str, *, api_key: str | None = None) -> list[Match]:
+    async def detect(
+        self,
+        text: str,
+        *,
+        api_key: str | None = None,
+        model: str | None = None,
+    ) -> list[Match]:
         if not text or not text.strip():
             return []
 
@@ -181,6 +187,11 @@ class LLMDetector:
         # strip is treated as "no key" so we don't send an empty Bearer.
         effective_key = (api_key if api_key is not None else self.api_key) or ""
         effective_key = effective_key.strip()
+
+        # `model` lets callers (per-request override path) swap the
+        # detection model without rebuilding the LLMDetector. Falls
+        # back to whatever was configured at startup.
+        effective_model = (model or self.model).strip() or self.model
 
         # Refuse oversized inputs rather than truncating. Truncation would
         # silently let everything past the cap through unscanned — the
@@ -199,7 +210,7 @@ class LLMDetector:
             headers["Authorization"] = f"Bearer {effective_key}"
 
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": effective_model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": text},

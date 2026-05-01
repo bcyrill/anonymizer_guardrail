@@ -34,6 +34,8 @@ process memory unless the operator opts into a stable SURROGATE_SALT.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import secrets
 import threading
 from collections import OrderedDict
@@ -43,6 +45,8 @@ from typing import Callable
 from babel.core import UnknownLocaleError
 from babel.dates import format_date
 from faker import Faker
+
+log = logging.getLogger("anonymizer.surrogate")
 
 from .config import config
 from .detector.base import Match
@@ -202,6 +206,19 @@ _MAX_COLLISION_RETRIES = 4
 # Golden-ratio-derived constant. Used to perturb the seed across retries
 # so each attempt explores a different Faker output.
 _SALT_MULTIPLIER = 0x9E3779B97F4A7C15
+# Hard cap on the number of distinct override-locale Faker instances
+# kept warm. Sized for realistic deployments (a few primary locales
+# with a small number of fallback chains); on overflow the
+# least-recently-used is evicted, a cheap reconstruction on next use.
+# Adjustable via env if a deployment legitimately needs more.
+_FAKER_LRU_MAX = max(1, int(os.environ.get("SURROGATE_FAKER_LRU_MAX", "32")))
+
+
+_CacheKey = tuple[str, str, bool, tuple[str, ...] | None]
+"""Surrogate cache key: (entity_type, text, use_faker, locale_tuple).
+The trailing two slots encode the per-request overrides — None means
+"use the configured default", which keeps default-traffic entries in
+their own bucket and avoids cache-key churn on existing deployments."""
 
 
 class SurrogateGenerator:
@@ -212,7 +229,7 @@ class SurrogateGenerator:
         #   - on hit: move_to_end(key) marks it most-recently-used
         #   - on overflow: popitem(last=False) drops least-recently-used
         # Cap is configurable via SURROGATE_CACHE_MAX_SIZE.
-        self._cache: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._cache: OrderedDict[_CacheKey, str] = OrderedDict()
         # Sane minimum: a request can produce hundreds of unique entities,
         # so we don't want zero-or-tiny caps to silently cripple within-
         # request consistency. The pipeline still de-dups within a single
@@ -250,6 +267,18 @@ class SurrogateGenerator:
                     f"FAKER_LOCALE={config.faker_locale!r} is not a valid Faker "
                     f"locale: {exc}. See https://faker.readthedocs.io/ for the list."
                 ) from exc
+        # Cache of Faker instances keyed by locale tuple, populated on
+        # demand by per-request overrides. The default instance lives
+        # in self._fake (above); this OrderedDict only holds the
+        # alternates so we don't rebuild a Faker on every request.
+        #
+        # LRU-bounded: Faker instances are a few MB each (loaded
+        # provider dictionaries per locale) — without a bound a caller
+        # cycling through many distinct locale tuples would grow this
+        # without limit, an obvious OOM vector. The cap is small (a
+        # handful of distinct locale chains is realistic; on overflow
+        # the oldest is dropped and reconstructed on next use, ~1–2 ms).
+        self._faker_by_locale: OrderedDict[tuple[str, ...], Faker] = OrderedDict()
 
     def cache_stats(self) -> tuple[int, int]:
         """Return (current_size, max_size). Read without the lock —
@@ -257,9 +286,89 @@ class SurrogateGenerator:
         after __init__. Used by Pipeline.stats() for the /health probe."""
         return len(self._cache), self._max_cache_size
 
-    def for_match(self, match: Match) -> str:
-        """Return a stable surrogate for this match."""
-        key = (match.entity_type, match.text)
+    def _resolve_faker(
+        self, locale_tuple: tuple[str, ...] | None, use_faker: bool
+    ) -> Faker | None:
+        """Return the Faker instance to use for one for_match call.
+
+        - use_faker=False → no Faker (opaque-token gens); return None.
+        - locale_tuple is None → the configured default (self._fake), if any.
+        - Otherwise → look up / build a Faker for that exact locale tuple,
+          cached LRU so repeated overrides reuse the instance instead of
+          paying ~1–2 ms construction cost per call. Cap is _FAKER_LRU_MAX;
+          on overflow the least-recently-used Faker is dropped (it gets
+          rebuilt on demand if seen again).
+
+        An invalid locale logs a warning and falls back to the default —
+        same warn-and-ignore policy as the other per-request overrides.
+        """
+        if not use_faker:
+            return None
+        if locale_tuple is None:
+            return self._fake
+        cached = self._faker_by_locale.get(locale_tuple)
+        if cached is not None:
+            self._faker_by_locale.move_to_end(locale_tuple)
+            return cached
+        try:
+            f = Faker(list(locale_tuple))
+        except (AttributeError, ValueError, ModuleNotFoundError) as exc:
+            log.warning(
+                "Override faker_locale=%s is not a valid Faker locale (%s); "
+                "falling back to the configured default.",
+                locale_tuple, exc,
+            )
+            return self._fake
+        self._faker_by_locale[locale_tuple] = f
+        # LRU eviction. Faker instances aren't tiny — bounding the cache
+        # is the OOM-safety net against callers cycling distinct locale
+        # tuples. Eviction is essentially free here (Python just drops
+        # the reference; no I/O, no provider unloading).
+        while len(self._faker_by_locale) > _FAKER_LRU_MAX:
+            self._faker_by_locale.popitem(last=False)
+        return f
+
+    def for_match(
+        self,
+        match: Match,
+        *,
+        use_faker: bool | None = None,
+        locale: tuple[str, ...] | None = None,
+    ) -> str:
+        """Return a stable surrogate for this match.
+
+        `use_faker` and `locale` are per-call overrides; None means
+        "use the configured default" and bucket into the default cache
+        slot. Overridden values get their own slot in the cache, keyed
+        by (entity_type, text, use_faker, locale) — each unique combo
+        is consistent both within and across requests.
+        """
+        # Resolve to concrete values so the cache key is always
+        # canonical (avoids collisions where one caller passes None
+        # and another passes the matching default).
+        effective_use_faker = self._use_faker if use_faker is None else bool(use_faker)
+        # locale is meaningful only when use_faker is True; with opaque
+        # gens the locale doesn't change the output, so we collapse to
+        # None so all opaque-mode calls share a cache slot.
+        effective_locale: tuple[str, ...] | None
+        if effective_use_faker:
+            effective_locale = locale if locale is not None else None
+        else:
+            effective_locale = None
+
+        # Override resolution path: when we got a use_faker override,
+        # fall back from default _generators to a per-call generator
+        # set. Cheap to build (just dict comprehension over _GENERATOR_SPEC).
+        if use_faker is None:
+            generators = self._generators
+        else:
+            generators = _build_generators(effective_use_faker, self._salt)
+
+        fake = self._resolve_faker(effective_locale, effective_use_faker)
+
+        key: _CacheKey = (
+            match.entity_type, match.text, effective_use_faker, effective_locale,
+        )
         with self._lock:
             cached = self._cache.get(key)
             if cached is not None:
@@ -269,7 +378,7 @@ class SurrogateGenerator:
                 return cached
 
             seed = _seed_for(match.text, match.entity_type, self._salt)
-            gen = self._generators.get(match.entity_type, self._generators["OTHER"])
+            gen = generators.get(match.entity_type, generators["OTHER"])
 
             # Try the natural surrogate first. Salt-retry on collision —
             # either with the original itself, or with a surrogate already
@@ -285,9 +394,9 @@ class SurrogateGenerator:
             for attempt in range(_MAX_COLLISION_RETRIES):
                 attempt_seed = seed if attempt == 0 else seed ^ (attempt * _SALT_MULTIPLIER)
                 attempt_text = match.text if attempt == 0 else f"{match.text}#{attempt}"
-                if self._fake is not None:
-                    self._fake.seed_instance(attempt_seed)
-                    candidate = gen(self._fake, attempt_text)
+                if fake is not None:
+                    fake.seed_instance(attempt_seed)
+                    candidate = gen(fake, attempt_text)
                 else:
                     candidate = gen(None, attempt_text)  # type: ignore[arg-type]
                 if candidate != match.text and candidate not in self._used_surrogates:
