@@ -1,0 +1,126 @@
+# syntax=docker/dockerfile:1.7
+# Privacy-filter inference service.
+#
+# Standalone HTTP wrapper around the openai/privacy-filter token-
+# classification model. Pair with the guardrail's RemotePrivacyFilterDetector
+# (DETECTOR_MODE includes `privacy_filter`, PRIVACY_FILTER_URL points here)
+# so the heavy ML deps live in their own container instead of inflating the
+# guardrail image.
+#
+# Two flavours, controlled by one build-arg:
+#
+#   BAKE_MODEL=false (default)   image is small (~1 GB); the model
+#                                downloads on first container start.
+#                                Mount a NAMED VOLUME at
+#                                /app/.cache/huggingface so the
+#                                download survives container recreation.
+#   BAKE_MODEL=true              image carries the model weights
+#                                (~6.9 GB total); no runtime download,
+#                                works air-gapped.
+#
+# TORCH_INDEX_URL defaults to the CPU wheel index; override for a CUDA
+# build:
+#   --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+#
+# Build:
+#   podman build -t privacy-filter-service:latest \
+#       -f services/privacy_filter/Containerfile services/privacy_filter/
+#
+# Run (runtime download):
+#   podman volume create privacy-filter-hf-cache
+#   podman run --rm -p 8001:8001 \
+#       -v privacy-filter-hf-cache:/app/.cache/huggingface \
+#       privacy-filter-service:latest
+#
+# Run (baked):
+#   podman run --rm -p 8001:8001 privacy-filter-service:baked
+
+FROM docker.io/library/python:3.12-slim
+
+LABEL org.opencontainers.image.title="privacy-filter-service" \
+      org.opencontainers.image.description="HTTP wrapper around openai/privacy-filter for the anonymizer-guardrail's RemotePrivacyFilterDetector" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# curl for HEALTHCHECK only. Cache mounts let buildkit reuse the apt
+# package + lists across builds; the cache mounts are unmounted at RUN
+# exit so nothing lingers in the image layer.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends curl
+
+# Non-root user (Podman is rootless by default; this also helps on K8s).
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN groupadd --system --gid ${APP_GID} app \
+ && useradd  --system --uid ${APP_UID} --gid ${APP_GID} \
+             --home-dir /app --shell /usr/sbin/nologin app
+
+WORKDIR /app
+
+ARG BAKE_MODEL=false
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+# Two install steps so the torch wheel comes from the chosen index
+# (CPU vs CUDA). PyPI's default `torch` silently pulls in nvidia-cuda-*
+# packages we never use; the CPU wheel index skips them, dropping the
+# image substantially. The buildkit cache mount keeps wheels across
+# rebuilds; we drop --no-cache-dir for the same reason — the mount IS
+# the cache and lives outside the image layer.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url "$TORCH_INDEX_URL" torch \
+ && pip install \
+        'transformers>=4.40' \
+        'fastapi>=0.110' \
+        'uvicorn[standard]>=0.27' \
+        'pydantic>=2.6'
+
+COPY main.py /app/main.py
+
+# HF cache lives at a known path so operators can mount a named volume
+# at the same location to persist downloads across container recreation.
+ENV HF_HOME=/app/.cache/huggingface
+
+# Optional: pre-download the model into the image. When baked, also
+# default HF_HUB_OFFLINE=1 so transformers doesn't ping HuggingFace Hub
+# on every container start to revalidate the cache (visible as 5+ seconds
+# of HEAD requests and a misleading "set HF_TOKEN" warning). The setting
+# is written to /app/_runtime-env, which the CMD sources before exec'ing
+# uvicorn; the `${HF_HUB_OFFLINE:-1}` form lets operators force online
+# mode at run time with `-e HF_HUB_OFFLINE=0` if they need to refresh
+# weights from inside a baked image. Non-baked flavour gets an empty
+# file so the source statement in CMD is a no-op.
+RUN if [ "$BAKE_MODEL" = "true" ]; then \
+        python -c "from transformers import pipeline; pipeline('token-classification', model='openai/privacy-filter', aggregation_strategy='first')" \
+     && echo 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' > /app/_runtime-env; \
+    else \
+        : > /app/_runtime-env; \
+    fi
+
+RUN chown -R app:app /app
+
+ENV HOST=0.0.0.0 \
+    PORT=8001 \
+    LOG_LEVEL=info \
+    MODEL_NAME=openai/privacy-filter
+
+EXPOSE 8001
+
+USER app
+
+# Generous start-period to accommodate the runtime-download case, where
+# the first container start fetches the model before /health flips to
+# "ok". Operators on slow networks can override at run time via
+# `--health-start-period=…`.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=300s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health" | grep -q '"status":"ok"' || exit 1
+
+# Sourcing /app/_runtime-env applies any flavour-specific defaults
+# (e.g. HF_HUB_OFFLINE=1 for the baked image). The file is empty for
+# flavours that don't need it, so the source is a cheap no-op.
+CMD ["sh", "-c", ". /app/_runtime-env && exec uvicorn main:app --host ${HOST} --port ${PORT} --log-level $(echo ${LOG_LEVEL} | tr A-Z a-z)"]

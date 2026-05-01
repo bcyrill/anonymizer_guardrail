@@ -40,6 +40,8 @@ TAG_SLIM="${TAG_SLIM:-anonymizer-guardrail:latest}"
 TAG_PF="${TAG_PF:-anonymizer-guardrail:privacy-filter}"
 TAG_PF_BAKED="${TAG_PF_BAKED:-anonymizer-guardrail:privacy-filter-baked}"
 TAG_FAKE_LLM="${TAG_FAKE_LLM:-fake-llm:latest}"
+TAG_PF_SERVICE="${TAG_PF_SERVICE:-privacy-filter-service:latest}"
+TAG_PF_SERVICE_BAKED="${TAG_PF_SERVICE_BAKED:-privacy-filter-service:baked}"
 
 usage() {
   cat <<EOF
@@ -49,20 +51,27 @@ Build the anonymizer-guardrail (or companion fake-llm) container image.
 Without -t, prompts interactively.
 
   -t, --type TYPE     One of:
-                        slim       without privacy-filter
-                        pf         privacy-filter, runtime download
-                                   — needs a persistent volume to avoid
-                                   re-downloading the model every run
-                        pf-baked   privacy-filter + model baked in
-                                   — self-contained; works air-gapped
-                        fake-llm   companion test backend — an OpenAI-
-                                   compatible Chat Completions server
-                                   with a YAML rules file, for driving
-                                   the guardrail's LLM detector
-                                   deterministically (see fake-llm/)
-                        all        build all four flavours in sequence
-                                   (uses the default tag for each — pass
-                                   -T separately if you want overrides)
+                        slim              without privacy-filter
+                        pf                privacy-filter, runtime download
+                                          — needs a persistent volume to avoid
+                                          re-downloading the model every run
+                        pf-baked          privacy-filter + model baked in
+                                          — self-contained; works air-gapped
+                        pf-service        privacy-filter inference service —
+                                          standalone HTTP wrapper around the
+                                          model, paired with the guardrail's
+                                          RemotePrivacyFilterDetector. Runtime
+                                          download (small image, mount a volume
+                                          at /app/.cache/huggingface).
+                        pf-service-baked  pf-service + model baked in
+                        fake-llm          companion test backend — an OpenAI-
+                                          compatible Chat Completions server
+                                          with a YAML rules file, for driving
+                                          the guardrail's LLM detector
+                                          deterministically (see services/fake_llm/)
+                        all               build all flavours in sequence
+                                          (uses the default tag for each — pass
+                                          -T separately if you want overrides)
   -T, --tag TAG       Override the default image tag (single-flavour only).
   -h, --help          Show this help.
 
@@ -70,11 +79,13 @@ Anything after \`--\` is passed straight through to the build engine,
 e.g. \`-- --no-cache --pull\`.
 
 Environment overrides:
-  ENGINE         podman | docker (auto-detected; current: ${ENGINE})
-  TAG_SLIM       Default tag for slim (current: ${TAG_SLIM})
-  TAG_PF         Default tag for pf (current: ${TAG_PF})
-  TAG_PF_BAKED   Default tag for pf-baked (current: ${TAG_PF_BAKED})
-  TAG_FAKE_LLM   Default tag for fake-llm (current: ${TAG_FAKE_LLM})
+  ENGINE                podman | docker (auto-detected; current: ${ENGINE})
+  TAG_SLIM              Default tag for slim (current: ${TAG_SLIM})
+  TAG_PF                Default tag for pf (current: ${TAG_PF})
+  TAG_PF_BAKED          Default tag for pf-baked (current: ${TAG_PF_BAKED})
+  TAG_PF_SERVICE        Default tag for pf-service (current: ${TAG_PF_SERVICE})
+  TAG_PF_SERVICE_BAKED  Default tag for pf-service-baked (current: ${TAG_PF_SERVICE_BAKED})
+  TAG_FAKE_LLM          Default tag for fake-llm (current: ${TAG_FAKE_LLM})
 EOF
 }
 
@@ -97,18 +108,22 @@ if [[ -z "$TYPE" ]]; then
   say ""
   say "Which image flavour do you want to build?"
   say ""
-  say "  ${c_grn}1)${c_rst} slim       without privacy-filter"
-  say "  ${c_grn}2)${c_rst} pf         privacy-filter, runtime download"
-  say "  ${c_grn}3)${c_rst} pf-baked   privacy-filter + model baked in"
-  say "  ${c_grn}4)${c_rst} fake-llm   companion test backend ${c_dim}(deterministic LLM)${c_rst}"
-  say "  ${c_grn}a)${c_rst} all        build all four flavours in sequence"
+  say "  ${c_grn}1)${c_rst} slim              without privacy-filter"
+  say "  ${c_grn}2)${c_rst} pf                privacy-filter, runtime download"
+  say "  ${c_grn}3)${c_rst} pf-baked          privacy-filter + model baked in"
+  say "  ${c_grn}4)${c_rst} pf-service        privacy-filter inference service ${c_dim}(standalone HTTP wrapper)${c_rst}"
+  say "  ${c_grn}5)${c_rst} pf-service-baked  pf-service + model baked in"
+  say "  ${c_grn}6)${c_rst} fake-llm          companion test backend ${c_dim}(deterministic LLM)${c_rst}"
+  say "  ${c_grn}a)${c_rst} all               build every flavour in sequence"
   say ""
-  read -r -p "Choose [1-4/a, default 1]: " choice || true
+  read -r -p "Choose [1-6/a, default 1]: " choice || true
   case "${choice:-1}" in
     1)   TYPE="slim" ;;
     2)   TYPE="pf" ;;
     3)   TYPE="pf-baked" ;;
-    4)   TYPE="fake-llm" ;;
+    4)   TYPE="pf-service" ;;
+    5)   TYPE="pf-service-baked" ;;
+    6)   TYPE="fake-llm" ;;
     a|A) TYPE="all" ;;
     *) err "Invalid choice."; exit 1 ;;
   esac
@@ -120,7 +135,7 @@ if [[ "$TYPE" == "all" ]]; then
     err "-T/--tag isn't supported with --type all (each flavour uses its own default tag)."
     exit 1
   fi
-  BUILD_LIST=(slim pf pf-baked fake-llm)
+  BUILD_LIST=(slim pf pf-baked pf-service pf-service-baked fake-llm)
 else
   BUILD_LIST=("$TYPE")
 fi
@@ -128,8 +143,9 @@ fi
 # ── Per-flavour resolver: maps a flavour name to build-args, Containerfile,
 # build context, and default tag. Sets globals that build_one consumes.
 # Most flavours build the main guardrail image from the repo root
-# Containerfile; fake-llm is a separate companion image with its own
-# Containerfile and a self-contained build context under fake-llm/.
+# Containerfile; the auxiliary services (fake-llm, privacy-filter
+# inference) are separate companion images with their own Containerfile
+# and a self-contained build context under services/.
 resolve_flavour() {
   CONTAINERFILE="Containerfile"
   BUILD_CONTEXT="."
@@ -155,12 +171,26 @@ resolve_flavour() {
     fake-llm)
       BUILD_ARGS=()
       DEFAULT_TAG="$TAG_FAKE_LLM"
-      CONTAINERFILE="fake-llm/Containerfile"
-      BUILD_CONTEXT="fake-llm"
+      CONTAINERFILE="services/fake_llm/Containerfile"
+      BUILD_CONTEXT="services/fake_llm"
       RESOLVED_TYPE="fake-llm"
       ;;
+    pf-service|privacy-filter-service)
+      BUILD_ARGS=()
+      DEFAULT_TAG="$TAG_PF_SERVICE"
+      CONTAINERFILE="services/privacy_filter/Containerfile"
+      BUILD_CONTEXT="services/privacy_filter"
+      RESOLVED_TYPE="pf-service"
+      ;;
+    pf-service-baked|privacy-filter-service-baked)
+      BUILD_ARGS=(--build-arg BAKE_MODEL=true)
+      DEFAULT_TAG="$TAG_PF_SERVICE_BAKED"
+      CONTAINERFILE="services/privacy_filter/Containerfile"
+      BUILD_CONTEXT="services/privacy_filter"
+      RESOLVED_TYPE="pf-service-baked"
+      ;;
     *)
-      err "Unknown type '$1'. Valid: slim, pf, pf-baked, fake-llm, all."
+      err "Unknown type '$1'. Valid: slim, pf, pf-baked, pf-service, pf-service-baked, fake-llm, all."
       exit 1
       ;;
   esac
@@ -207,16 +237,18 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
 fi
 say ""
 
-# pf-baked downloads the model at build time — call it out whether
-# selected directly or pulled in via "all".
+# Any flavour that bakes the model downloads weights at build time —
+# call it out whether selected directly or pulled in via "all".
 for f in "${BUILD_LIST[@]}"; do
-  if [[ "$f" == "pf-baked" || "$f" == "privacy-filter-baked" ]]; then
-    warn "The pf-baked build downloads the openai/privacy-filter model at"
-    warn "build time. Network access is required and the build will take"
-    warn "several minutes the first time (subsequent builds use the layer cache)."
-    say ""
-    break
-  fi
+  case "$f" in
+    pf-baked|privacy-filter-baked|pf-service-baked|privacy-filter-service-baked)
+      warn "This build downloads the openai/privacy-filter model at build"
+      warn "time. Network access is required and the build will take"
+      warn "several minutes the first time (subsequent builds use the layer cache)."
+      say ""
+      break
+      ;;
+  esac
 done
 
 read -r -p "Proceed? [Y/n] " reply || true
@@ -269,6 +301,22 @@ case "$TYPE" in
     say "  ${ENGINE} run --rm -p 8000:8000 \\"
     say "      -e DETECTOR_MODE=regex,privacy_filter,llm \\"
     say "      ${TAG}"
+    ;;
+  pf-service)
+    say "  # Create a named volume so the model download survives recreates."
+    say "  ${ENGINE} volume create privacy-filter-hf-cache"
+    say "  ${ENGINE} run --rm -p 8001:8001 \\"
+    say "      -v privacy-filter-hf-cache:/app/.cache/huggingface \\"
+    say "      ${TAG}"
+    say ""
+    say "  ${c_dim}# Then point the guardrail at it (RemotePrivacyFilterDetector,${c_rst}"
+    say "  ${c_dim}# planned): -e PRIVACY_FILTER_URL=http://privacy-filter-service:8001${c_rst}"
+    ;;
+  pf-service-baked)
+    say "  ${ENGINE} run --rm -p 8001:8001 ${TAG}"
+    say ""
+    say "  ${c_dim}# Self-contained — no runtime download. Point the guardrail at${c_rst}"
+    say "  ${c_dim}# it via PRIVACY_FILTER_URL once RemotePrivacyFilterDetector lands.${c_rst}"
     ;;
   fake-llm)
     say "  ${c_dim}# fake-llm is auto-started by run_container.sh when you${c_rst}"

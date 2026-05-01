@@ -17,14 +17,18 @@ backend.
 ## Build and run
 
 ```bash
-podman build -t fake-llm:latest -f fake-llm/Containerfile fake-llm/
+podman build -t fake-llm:latest \
+    -f services/fake_llm/Containerfile services/fake_llm/
+
+# Or via the build script:
+scripts/build-image.sh -t fake-llm
 
 # With the bundled example rules:
 podman run --rm -p 4000:4000 --name fake-llm fake-llm:latest
 
 # With your own rules file:
 podman run --rm -p 4000:4000 \
-  -v $PWD/fake-llm/my-rules.yaml:/app/rules.yaml:ro \
+  -v $PWD/services/fake_llm/my-rules.yaml:/app/rules.yaml:ro \
   --name fake-llm fake-llm:latest
 ```
 

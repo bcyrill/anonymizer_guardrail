@@ -674,9 +674,9 @@ set to `fake-llm`, the launcher boots the fake-llm container in the
 background on a shared `anonymizer-net`, waits for `/health`, and
 points the guardrail at `http://fake-llm:4000/v1`. fake-llm matches
 incoming chat-completion requests against a YAML rules file
-(`fake-llm/rules.example.yaml` by default; `--rules PATH` overrides),
-which is what makes the test recipes deterministic. See `fake-llm/README.md`
-for the rules schema.
+(`services/fake_llm/rules.example.yaml` by default; `--rules PATH`
+overrides), which is what makes the test recipes deterministic. See
+`services/fake_llm/README.md` for the rules schema.
 
 ### Image flavours
 

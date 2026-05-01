@@ -2,7 +2,10 @@
 # Fake OpenAI-compatible Chat Completions server for guardrail testing.
 #
 # Build:
-#   podman build -t fake-llm:latest -f fake-llm/Containerfile fake-llm/
+#   podman build -t fake-llm:latest \
+#       -f services/fake_llm/Containerfile services/fake_llm/
+#
+# Or via the build script: scripts/build-image.sh -t fake-llm
 #
 # Run with the bundled rules.example.yaml:
 #   podman run --rm -p 4000:4000 fake-llm:latest
