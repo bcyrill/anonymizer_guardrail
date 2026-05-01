@@ -27,6 +27,16 @@ rules:
     match_model: "invalid-model"
     status_code: 503
 
+  # Same idea for the llm_prompt override. "NORDVENTO" is a substring
+  # unique to bundled:llm_pentest.md (an example NetBIOS name in the
+  # pentest prompt's instructions), so this rule fires only when the
+  # guardrail forwarded that prompt as the system message. The default
+  # prompt doesn't contain NORDVENTO, so a request without llm_prompt
+  # override → no match here, normal flow.
+  - description: "Override test: pentest prompt → 503"
+    match_system_prompt: "NORDVENTO"
+    status_code: 503
+
   # Reproduces the UUID-overlap case: regex catches the full UUID, the
   # LLM (us, here) reports only the trailing 12-digit suffix as
   # IDENTIFIER. Useful for verifying that longest-match-wins works at

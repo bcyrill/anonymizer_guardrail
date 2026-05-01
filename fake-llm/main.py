@@ -175,13 +175,24 @@ def _last_user_content(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _first_system_content(messages: list[dict[str, Any]]) -> str:
+    """Pull the first system-role message — what the guardrail uses to
+    carry its detection prompt. Empty when the caller didn't send one."""
+    for m in messages:
+        if m.get("role") == "system":
+            return str(m.get("content", ""))
+    return ""
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request) -> Response:
     body = await req.json()
     model = str(body.get("model", DEFAULT_MODEL))
-    user_msg = _last_user_content(body.get("messages", []))
+    msgs = body.get("messages", [])
+    user_msg = _last_user_content(msgs)
+    system_msg = _first_system_content(msgs)
 
-    rule = next((r for r in _RULES if r.matches(user_msg, model)), None)
+    rule = next((r for r in _RULES if r.matches(user_msg, model, system_msg)), None)
 
     if rule is None:
         log.info("no-rule-match user=%r", user_msg[:120])
