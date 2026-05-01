@@ -70,6 +70,7 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 | Observability — `/health`, in-flight gauges | [docs/operations.md](docs/operations.md) |
 | Container images, build, run | [docs/deployment.md](docs/deployment.md) |
 | Curl recipes | [docs/examples.md](docs/examples.md) |
+| Detector quality benchmark | [docs/benchmark.md](docs/benchmark.md) |
 | Limitations — single replica, no streaming | [docs/limitations.md](docs/limitations.md) |
 | Contributor guide | [docs/development.md](docs/development.md) |
 

@@ -251,172 +251,22 @@ flexibility.
 
 ---
 
-## Detector quality benchmark script (`scripts/test-detector-quality.sh`)
+## ~~Detector quality benchmark script~~ — done
 
-**What:** a new test driver, sibling to `scripts/test-examples.sh`,
-that scores how well a chosen detector configuration redacts a
-labelled corpus. The corpus and the expected entities live in a
-**config file** (one per scenario — pentest, legal, healthcare,
-HR, etc.), so the same script can answer "is the gliner_pii detector
-worth turning on for our pentest workflow?" or "do we need both
-privacy_filter AND llm for legal?"
+**Closed.** Shipped as `scripts/benchmark.sh` (thin bash
+wrapper) → `python -m tools.detector_bench` (Click CLI under
+`tools/detector_bench/`, dev-only, outside the production wheel).
 
-The CLI shape mirrors `test-examples.sh`:
+- Corpus YAML schema: `name` / `description` / `detector_mode` /
+  `overrides` / `cases[]` with `expect` (recall + type) and
+  `must_keep` (precision). `requires:` per case for skip-vs-fail.
+- Bundled starter at `tests/corpus/pentest.yaml`; resolve via
+  `--config bundled:pentest` or a filesystem path.
+- Forces `use_faker: false` per request so opaque `[TYPE_HEX]`
+  tokens make types recoverable from the response.
+- `--preset NAME` machinery mirrors `test-examples.sh`.
+- Unit tests for the corpus loader + scoring logic in
+  `tests/test_detector_bench.py`.
 
-```bash
-scripts/test-detector-quality.sh --config corpus/pentest.yaml         # against $BASE_URL
-scripts/test-detector-quality.sh --config corpus/pentest.yaml --preset uuid-debug
-scripts/test-detector-quality.sh --config corpus/legal.yaml --detector-mode regex,llm
-```
-
-**Why deferred:** the existing `scripts/test-examples.sh` only
-checks "did this exact substring get redacted yes/no" against a few
-hand-picked recipes — it's a smoke test, not a benchmark. We can
-ship detector improvements without it, but operators currently can't
-answer "which detector mix is best for my workload" without rolling
-their own measurement.
-
-**Why it matters:**
-
-- Detector selection is currently guesswork. The
-  [detectors index](docs/detectors/index.md) gives qualitative
-  guidance ("privacy_filter is a strict subset of LLM coverage") but
-  no quantitative way to verify on the operator's own data.
-- Adding a new detector (gliner_pii is the live example) needs a
-  way to argue "this is worth wiring in" beyond "it exists." A
-  benchmark script makes that argument concrete.
-- Pentest / legal / healthcare configs are different enough that
-  one corpus can't speak for all of them — the config-driven shape
-  scales without code changes.
-
-**Sketch:**
-
-### Corpus config format
-
-Each config is a YAML file under (suggested) `tests/corpus/<name>.yaml`,
-versioned with the repo so different scenarios are reproducible:
-
-```yaml
-# tests/corpus/pentest.yaml
-name: "Pentest engagement transcript"
-description: |
-  Synthetic snippets typical of a security engagement: cracked password
-  artifacts, AWS keys, internal hostnames, employee names embedded in
-  prose, NTLM hashes, etc.
-
-# Optional: pin the detector mix to test. If unset, --detector-mode on
-# the CLI wins; if neither is set, use the running guardrail's default.
-detector_mode: regex,denylist,privacy_filter,llm
-
-# Optional: pin per-request overrides (regex_patterns, llm_prompt, ...)
-overrides:
-  regex_patterns: pentest
-  llm_prompt: pentest
-
-cases:
-  - id: cracked-creds-table
-    text: |
-      Internal hostname dc01.acmecorp.local is reachable from
-      10.0.7.42. Cracked password from NTDS dump:
-      bob.smith:1107:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::
-    expect:
-      # Each entry: literal substring that MUST be redacted, with the
-      # entity type the operator considers correct.
-      - text: "dc01.acmecorp.local"
-        type: HOSTNAME
-      - text: "10.0.7.42"
-        type: IPV4_ADDRESS
-      - text: "8846f7eaee8fb117ad06bdd830b7586c"
-        type: HASH
-      - text: "bob.smith"
-        type: PERSON
-        # Optional: mark items the operator EXPECTS the chosen detector
-        # mix to miss, so a missed match is reported as "expected miss"
-        # not a regression.
-        # tolerated_miss: true
-
-  - id: aws-creds-in-prose
-    text: "Use AKIAIOSFODNN7EXAMPLE / wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY for the demo."
-    expect:
-      - text: "AKIAIOSFODNN7EXAMPLE"
-        type: AWS_ACCESS_KEY
-      - text: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-        type: AWS_SECRET_KEY
-
-# Optional: anti-cases the detectors MUST leave alone (false-positive
-# sentinel). Anything redacted from these texts counts against the
-# precision score.
-do_not_redact:
-  - id: documentation-uuid
-    text: "Request id 11111111-2222-3333-4444-555555555555 is a documentation example, not real."
-    must_keep: ["11111111-2222-3333-4444-555555555555"]
-```
-
-### Score shape
-
-The script reports per-case and overall:
-
-| Metric | What it counts |
-|---|---|
-| `recall` | expected substrings that got redacted / total expected |
-| `recall_excluding_tolerated` | as above but ignores `tolerated_miss` items |
-| `type_accuracy` | of the substrings redacted, fraction whose entity_type matches the corpus's expected type (operator can disable strict typing per-case) |
-| `precision` | 1 − (false-positive redactions / total `must_keep` items in `do_not_redact`) |
-| `latency_ms` | per-case wall-clock (informational, not a pass/fail) |
-
-A summary table at the end lets the operator compare runs:
-
-```
-== Pentest corpus, DETECTOR_MODE=regex,denylist,privacy_filter,llm ==
-case                          recall    type_acc  precision  latency
-cracked-creds-table           4/4       4/4       —          312ms
-aws-creds-in-prose            2/2       2/2       —          105ms
-                              ---------------------------------------
-                              12/12     11/12     1.0        avg 208ms
-```
-
-### Pluggable backends
-
-Same `--preset` machinery as `test-examples.sh`: with no preset,
-talk to `$BASE_URL`; with `--preset NAME`, spawn a guardrail via
-`scripts/cli.sh --preset NAME` on a non-default port, run the
-benchmark, tear it down. This lets the operator run the same corpus
-against several configurations in a loop.
-
-### Config search path
-
-Bundle a few starter configs under `tests/corpus/` (pentest, legal,
-healthcare are the obvious starters); operators can also pass their
-own paths via `--config`. The script accepts either a bundled name
-(`--config bundled:pentest`) or a filesystem path. Same shape as the
-`bundled:NAME` / path convention in `REGEX_PATTERNS_PATH` /
-`LLM_SYSTEM_PROMPT_PATH`.
-
-### Implementation language
-
-Python rather than bash — the score arithmetic, JSON parsing of the
-guardrail's response, and YAML config loading are all painful in
-shell. Lives under `tools/` (sibling to `tools/launcher/`) so it
-stays out of the production wheel; `scripts/test-detector-quality.sh`
-is a thin bash wrapper that execs into `python -m
-tools.detector_bench` (mirroring the cli.sh / menu.sh shape).
-
-**Concrete trigger:** the next decision about which detector mix to
-ship by default, or the first time an operator asks "is gliner_pii
-better than privacy_filter for my data?"
-
-**Non-goals:**
-
-- **Not a regression test for detector code itself** —
-  `tests/test_*_detector.py` already covers that with mocked
-  backends. This script measures *configurations*, not code.
-- **Not a fuzzing harness.** The corpus is hand-curated to mirror the
-  operator's real workload; surprise-finding is what production logs
-  are for.
-- **Not a load tester.** Latency is reported as informational only;
-  for throughput / saturation testing, point a load generator at a
-  running guardrail.
-- Don't bundle a giant default corpus into the repo; the starter
-  corpora should be small (~10-30 cases each) and easy for operators
-  to fork. Large datasets belong in operator-side fixtures, not in
-  the wheel.
+See [docs/benchmark.md](docs/benchmark.md) for the canonical
+operator-facing walkthrough.

@@ -56,7 +56,8 @@ Usage: $(basename "$0") [-t TYPE] [-T TAG] [-h] [-- EXTRA_BUILD_ARGS...]
 Build the anonymizer-guardrail (or companion fake-llm) container image.
 Without -t, prompts interactively.
 
-  -t, --type TYPE     One of:
+  -t, --type TYPE     One value, or a comma-separated list (e.g.
+                      \`-t slim,pf-service,gliner-service\`). One of:
                         slim              without privacy-filter
                         pf                privacy-filter, runtime download
                                           — needs a persistent volume to avoid
@@ -164,15 +165,48 @@ if [[ -z "$TYPE" ]]; then
   esac
 fi
 
-# Expand "all" into a build list; otherwise use the single requested flavour.
-if [[ "$TYPE" == "all" ]]; then
-  if [[ -n "$TAG_OVERRIDE" ]]; then
-    err "-T/--tag isn't supported with --type all (each flavour uses its own default tag)."
-    exit 1
+# Comma-separated TYPE → list of flavours. One value works exactly as
+# before; multiple values let an operator do `-t slim,pf-service` to
+# build a curated subset without invoking the script repeatedly.
+IFS=',' read -ra TYPE_PARTS <<< "$TYPE"
+
+# Pre-flight: trim whitespace, drop empties, expand "all".
+BUILD_LIST=()
+for raw in "${TYPE_PARTS[@]}"; do
+  t="${raw#"${raw%%[![:space:]]*}"}"   # ltrim
+  t="${t%"${t##*[![:space:]]}"}"        # rtrim
+  [[ -z "$t" ]] && continue
+  if [[ "$t" == "all" ]]; then
+    BUILD_LIST+=(slim pf pf-baked pf-service pf-service-baked fake-llm)
+  else
+    BUILD_LIST+=("$t")
   fi
-  BUILD_LIST=(slim pf pf-baked pf-service pf-service-baked fake-llm)
-else
-  BUILD_LIST=("$TYPE")
+done
+
+if [[ ${#BUILD_LIST[@]} -eq 0 ]]; then
+  err "No build types resolved from -t '$TYPE'."
+  exit 1
+fi
+
+# Dedupe so `-t slim,all` doesn't build slim twice. Order-preserving:
+# walks the list once and records the first occurrence.
+declare -A _seen=()
+DEDUPED_LIST=()
+for t in "${BUILD_LIST[@]}"; do
+  if [[ -z "${_seen[$t]:-}" ]]; then
+    DEDUPED_LIST+=("$t")
+    _seen[$t]=1
+  fi
+done
+BUILD_LIST=("${DEDUPED_LIST[@]}")
+unset _seen DEDUPED_LIST
+
+# -T / --tag only makes sense for a single flavour — otherwise N
+# different images would all get the same tag, with the last build
+# silently overwriting the earlier ones.
+if [[ ${#BUILD_LIST[@]} -gt 1 && -n "$TAG_OVERRIDE" ]]; then
+  err "-T/--tag isn't supported when building multiple flavours (each uses its own default tag)."
+  exit 1
 fi
 
 # ── Per-flavour resolver: maps a flavour name to build-args, Containerfile,
