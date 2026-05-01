@@ -73,6 +73,7 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 | Detector quality benchmark | [docs/benchmark.md](docs/benchmark.md) |
 | Limitations — single replica, no streaming | [docs/limitations.md](docs/limitations.md) |
 | Contributor guide | [docs/development.md](docs/development.md) |
+| Design decisions — paths considered and declined | [docs/design-decisions.md](docs/design-decisions.md) |
 
 ## Acknowledgements
 
