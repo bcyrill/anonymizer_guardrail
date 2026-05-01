@@ -21,13 +21,14 @@ these lists are org-specific).
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sys
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import yaml
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..bundled_resource import resolve_spec
 from ..registry import parse_named_path_registry
@@ -38,18 +39,23 @@ log = logging.getLogger("anonymizer.denylist")
 
 
 # ── Per-detector config ───────────────────────────────────────────────────
-@dataclass(frozen=True)
-class DenylistConfig:
+class DenylistConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="DENYLIST_",
+        extra="ignore",
+        frozen=True,
+    )
+
     # Path to the YAML file defining the denylist detector's literal-
     # string entries. If unset, the detector still loads under
     # DETECTOR_MODE=denylist but matches nothing — useful for boot-order
     # independence (operator can set DETECTOR_MODE first and DENYLIST_PATH
     # later). Accepts the same `bundled:NAME` / filesystem-path
     # conventions as REGEX_PATTERNS_PATH.
-    path: str = os.getenv("DENYLIST_PATH", "")
+    path: str = ""
     # Optional registry of NAMED alternative denylists that callers can
     # opt into per-request via additional_provider_specific_params.denylist.
-    registry: str = os.getenv("DENYLIST_REGISTRY", "")
+    registry: str = ""
     # Matching backend for the denylist detector:
     #   - "regex" (default) — Python `re` alternation. Pure stdlib, fast
     #                          for low-thousands of entries.
@@ -59,7 +65,12 @@ class DenylistConfig:
     #                          install size. Requires the
     #                          `denylist-aho` optional extra.
     # Validated at startup; an unknown value crashes loud.
-    backend: str = os.getenv("DENYLIST_BACKEND", "regex").strip().lower()
+    backend: str = "regex"
+
+    @field_validator("backend", mode="after")
+    @classmethod
+    def _normalize_backend(cls, v: str) -> str:
+        return v.strip().lower()
 
 
 CONFIG = DenylistConfig()

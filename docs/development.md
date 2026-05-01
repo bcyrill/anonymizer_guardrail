@@ -202,26 +202,29 @@ soft-failing to `[]` would silently violate `*_FAIL_CLOSED=true`
 malformed entries within an otherwise-parseable payload still drop
 silently — those only invalidate one match, not the whole response.
 
-### 2. Define a `CONFIG` dataclass
+### 2. Define a `CONFIG` BaseSettings model
 
-Same module. Frozen `@dataclass` with the env-var-derived fields the
-detector reads. Conventional field names for backend-style detectors:
-`url`, `timeout_s`, `max_concurrency`, `fail_closed`. Use the env
-helpers from `config.py`:
+Same module. `pydantic_settings.BaseSettings` subclass with
+`env_prefix` set to your detector's namespace; the upper-snake-case
+form of each field name maps to the env var (e.g. `url` → `MY_DETECTOR_URL`).
+Conventional field names for backend-style detectors: `url`,
+`timeout_s`, `max_concurrency`, `fail_closed`.
 
 ```python
-import os
-from dataclasses import dataclass
-
-from ..config import _env_bool, _env_int
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-@dataclass(frozen=True)
-class MyDetectorConfig:
-    url: str = os.getenv("MY_DETECTOR_URL", "")
-    timeout_s: int = _env_int("MY_DETECTOR_TIMEOUT_S", 30)
-    max_concurrency: int = _env_int("MY_DETECTOR_MAX_CONCURRENCY", 10)
-    fail_closed: bool = _env_bool("MY_DETECTOR_FAIL_CLOSED", True)
+class MyDetectorConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="MY_DETECTOR_",
+        extra="ignore",
+        frozen=True,
+    )
+
+    url: str = ""
+    timeout_s: int = 30
+    max_concurrency: int = 10
+    fail_closed: bool = True
 
 
 CONFIG = MyDetectorConfig()
@@ -230,8 +233,11 @@ CONFIG = MyDetectorConfig()
 The detector reads its own config via the module-level `CONFIG`
 attribute (e.g. `CONFIG.url`). The pipeline reads
 `spec.config.fail_closed` and `spec.config.max_concurrency` live, so
-test monkeypatches via `dataclasses.replace(MOD.CONFIG, …)` take
-effect immediately for all consumers.
+test monkeypatches via `MOD.CONFIG.model_copy(update={...})` take
+effect immediately for all consumers. Pydantic crashes loud at
+instantiation on a malformed env value (`MY_DETECTOR_TIMEOUT_S=abc`),
+which is exactly the misconfiguration that should fail boot rather
+than first request.
 
 ### 3. Define a `SPEC` constant
 
@@ -436,7 +442,7 @@ detectors" enumeration. They all consume `REGISTERED_SPECS` /
   deprecation cycle. Track deprecation work in `TASKS.md`.
 - **Per-detector config** lives in the detector module. The central
   `Config` only carries cross-cutting fields. Tests patch via
-  `dataclasses.replace(MOD.CONFIG, ...)`, never reach into central
+  `MOD.CONFIG.model_copy(update={...})`, never reach into central
   `Config`.
 - **Fail loud at boot** for misconfiguration. A typo in
   `REGEX_PATTERNS_PATH` should crash on import, not at first request.

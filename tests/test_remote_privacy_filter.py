@@ -19,8 +19,6 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 import httpx
 import pytest
 
-from dataclasses import replace
-
 from anonymizer_guardrail.detector import privacy_filter as pf_mod
 from anonymizer_guardrail.detector import remote_privacy_filter as rpf_mod
 from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterConfig
@@ -39,7 +37,7 @@ def _fake_config(**overrides: Any) -> PrivacyFilterConfig:
         url="http://privacy-filter-service:8001",
         timeout_s=5,
     )
-    return replace(base, **overrides) if overrides else base
+    return base.model_copy(update=overrides) if overrides else base
 
 
 def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:
@@ -298,7 +296,7 @@ def test_factory_picks_remote_when_url_set(
 
     monkeypatch.setattr(
         pf_mod, "CONFIG",
-        replace(pf_mod.CONFIG, url="http://privacy-filter-service:8001"),
+        pf_mod.CONFIG.model_copy(update={"url": "http://privacy-filter-service:8001"}),
     )
 
     det = _privacy_filter_factory()
@@ -308,7 +306,9 @@ def test_factory_picks_remote_when_url_set(
     # in-process class. PrivacyFilterDetector's __init__ does heavy
     # work (loads torch + the model), so we mock it out — the test is
     # about *which class the factory picks*, not about constructing it.
-    monkeypatch.setattr(pf_mod, "CONFIG", replace(pf_mod.CONFIG, url=""))
+    monkeypatch.setattr(
+        pf_mod, "CONFIG", pf_mod.CONFIG.model_copy(update={"url": ""}),
+    )
     constructed: list[str] = []
 
     def fake_init(self, *_args, **_kwargs):

@@ -39,14 +39,13 @@ default-fallback the LLM and remote PF detectors use.
 from __future__ import annotations
 
 import logging
-import os
 import sys
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ..config import _env_bool, _env_int
 from .base import Detector, Match
 from .spec import DetectorSpec
 
@@ -54,31 +53,41 @@ log = logging.getLogger("anonymizer.gliner_pii.remote")
 
 
 # ── Per-detector config ───────────────────────────────────────────────────
-@dataclass(frozen=True)
-class GlinerPIIConfig:
+class GlinerPIIConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="GLINER_PII_",
+        extra="ignore",
+        frozen=True,
+    )
+
     # Empty (default) → DETECTOR_MODE=gliner_pii is rejected at boot
     # with a clear error: there's no in-process fallback, so an empty
     # URL means "this detector isn't deployable in this process."
     # Set to an HTTP URL → the detector posts to {URL}/detect on every
     # request. The standalone gliner-pii-service container (see
     # services/gliner_pii/) is the canonical other end.
-    url: str = os.getenv("GLINER_PII_URL", "").strip()
+    url: str = ""
     # Per-call timeout on the remote detector's HTTP requests.
-    timeout_s: int = _env_int("GLINER_PII_TIMEOUT_S", 30)
+    timeout_s: int = 30
     # Failure mode. Independent of llm.CONFIG.fail_closed and
     # privacy_filter.CONFIG.fail_closed — operators can fail closed on
     # one detector and open on another without coupling.
-    fail_closed: bool = _env_bool("GLINER_PII_FAIL_CLOSED", True)
+    fail_closed: bool = True
     # Default zero-shot label list to send with every request. Empty
     # falls back to whatever the gliner-pii-service has configured as
     # *its* DEFAULT_LABELS.
-    labels: str = os.getenv("GLINER_PII_LABELS", "")
+    labels: str = ""
     # Confidence cutoff sent with every request. Empty → use whatever
     # the gliner-pii-service has configured as its DEFAULT_THRESHOLD.
-    threshold: str = os.getenv("GLINER_PII_THRESHOLD", "")
+    threshold: str = ""
     # Max number of concurrent gliner-pii calls. Same rationale as
     # privacy_filter.CONFIG.max_concurrency.
-    max_concurrency: int = _env_int("GLINER_PII_MAX_CONCURRENCY", 10)
+    max_concurrency: int = 10
+
+    @field_validator("url", mode="after")
+    @classmethod
+    def _strip_url(cls, v: str) -> str:
+        return v.strip()
 
 
 CONFIG = GlinerPIIConfig()

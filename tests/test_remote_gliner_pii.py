@@ -19,8 +19,6 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 import httpx
 import pytest
 
-from dataclasses import replace
-
 from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
 from anonymizer_guardrail.detector.remote_gliner_pii import (
     GlinerPIIConfig,
@@ -40,7 +38,7 @@ def _fake_config(**overrides: Any) -> GlinerPIIConfig:
         labels="",
         threshold="",
     )
-    return replace(base, **overrides) if overrides else base
+    return base.model_copy(update=overrides) if overrides else base
 
 
 def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:

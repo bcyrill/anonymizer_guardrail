@@ -330,18 +330,20 @@ async def test_pipeline_uses_denylist_alongside_regex(
     # Wire DENYLIST_PATH into the denylist detector's CONFIG so a
     # freshly-built Pipeline sees it. Detector_mode lives on the central
     # Config; denylist's own fields live on deny_mod.CONFIG.
-    from dataclasses import replace
     import anonymizer_guardrail.config as cfg_mod
     import anonymizer_guardrail.pipeline as pipeline_mod
 
-    new_central_cfg = SimpleNamespace(
-        **{**cfg_mod.config.__dict__, "detector_mode": "denylist,regex"},
+    new_central_cfg = cfg_mod.config.model_copy(
+        update={"detector_mode": "denylist,regex"},
     )
     monkeypatch.setattr(cfg_mod, "config", new_central_cfg)
     monkeypatch.setattr(pipeline_mod, "config", new_central_cfg)
     # Patch the per-detector CONFIG and reload its module-level cache so
     # the new path is picked up at the next Pipeline construction.
-    monkeypatch.setattr(deny_mod, "CONFIG", replace(deny_mod.CONFIG, path=str(p)))
+    monkeypatch.setattr(
+        deny_mod, "CONFIG",
+        deny_mod.CONFIG.model_copy(update={"path": str(p)}),
+    )
     monkeypatch.setattr(deny_mod, "_LOADED_ENTRIES", deny_mod._load_entries())
     monkeypatch.setattr(
         deny_mod, "_DEFAULT_INDEX",

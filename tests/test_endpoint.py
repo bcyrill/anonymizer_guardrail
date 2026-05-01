@@ -264,13 +264,14 @@ def _patch_llm_config(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None
     Tests that previously called `_patch_config(llm_use_forwarded_key=True)`
     against the central Config now patch `llm_mod.CONFIG.use_forwarded_key`
     — same effect via the new per-detector config layout."""
-    from dataclasses import replace
     from anonymizer_guardrail.detector import llm as llm_mod
 
     # Drop the legacy `llm_` prefix from override keys so test call
     # sites don't have to track which prefix the central Config used.
     cleaned = {k.removeprefix("llm_"): v for k, v in overrides.items()}
-    monkeypatch.setattr(llm_mod, "CONFIG", replace(llm_mod.CONFIG, **cleaned))
+    monkeypatch.setattr(
+        llm_mod, "CONFIG", llm_mod.CONFIG.model_copy(update=cleaned),
+    )
 
 
 class _CapturingPipeline:

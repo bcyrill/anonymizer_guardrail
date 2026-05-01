@@ -126,7 +126,7 @@ class DetectorSpec:
 
         Returning a property (rather than caching the instance at
         SPEC construction) lets tests monkeypatch `module.CONFIG`
-        — typically via `dataclasses.replace(...)` — and have the
+        — typically via `CONFIG.model_copy(update=...)` — and have the
         change take effect immediately for all consumers
         (Pipeline, main.py, the spec validators below).
         """

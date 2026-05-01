@@ -21,9 +21,6 @@ from anonymizer_guardrail.detector import llm as llm_mod
 from anonymizer_guardrail.detector.llm import LLMDetector, LLMUnavailableError
 
 
-from dataclasses import replace
-
-
 def _fake_config(**overrides: object) -> "llm_mod.LLMConfig":
     """Build an LLMConfig from a small test-friendly baseline plus any
     overrides. Tests apply via
@@ -39,7 +36,7 @@ def _fake_config(**overrides: object) -> "llm_mod.LLMConfig":
         max_chars=100,
         system_prompt_path="",
     )
-    return replace(base, **overrides) if overrides else base
+    return base.model_copy(update=overrides) if overrides else base
 
 
 def _ok_response(entities: list[dict[str, str]]) -> MagicMock:

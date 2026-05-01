@@ -11,8 +11,6 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 
 import pytest
 
-from dataclasses import replace
-
 from anonymizer_guardrail.detector import regex as regex_mod
 from anonymizer_guardrail.detector.regex import RegexConfig
 
@@ -26,7 +24,7 @@ def _fake_config(**overrides: Any) -> RegexConfig:
         patterns_path="",
         overlap_strategy="longest",
     )
-    return replace(base, **overrides) if overrides else base
+    return base.model_copy(update=overrides) if overrides else base
 
 
 def test_default_yaml_loads_at_import_time() -> None:

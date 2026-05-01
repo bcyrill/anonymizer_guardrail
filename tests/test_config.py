@@ -1,9 +1,9 @@
-"""Tests for the env-var parsing helpers in `config.py`.
+"""Tests for the central pydantic-settings Config.
 
-The truthy parser is shared by every detector's `*_FAIL_CLOSED` flag and
-by `USE_FAKER`. A regression here would silently flip safety defaults —
-e.g. Python's `bool("FALSE")` is True — so the contract is locked down
-explicitly.
+Replaces the hand-rolled `_env_bool` / `_env_int` parsers that lived
+here pre-migration. The win documented in this file is the one the
+migration was for: malformed env values crash at import time with a
+clear ValidationError, instead of silently falling back to defaults.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ import os
 os.environ.setdefault("DETECTOR_MODE", "regex")
 
 import pytest
+from pydantic import ValidationError
 
-from anonymizer_guardrail.config import _env_bool
+from anonymizer_guardrail.config import Config
 
 
 @pytest.mark.parametrize(
@@ -31,20 +32,53 @@ from anonymizer_guardrail.config import _env_bool
         ("0",     False),
         ("no",    False),
         ("off",   False),
-        ("",      False),  # empty string is falsy in our parser
-        ("garbage", False),  # anything not in the truthy set → False
     ],
 )
-def test_env_bool_parses_truthy_strings(
+def test_use_faker_parses_truthy_strings(
     raw: str, expected: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ANONYMIZER_TEST_FLAG", raw)
-    assert _env_bool("ANONYMIZER_TEST_FLAG", default=True) is expected
+    """Pydantic-settings handles the bool parsing now. Lock the truthy/
+    falsy set down so a future Pydantic version that narrows it (say,
+    drops "yes"/"no") is caught by tests rather than silently flipping
+    safety defaults in production."""
+    monkeypatch.setenv("USE_FAKER", raw)
+    cfg = Config()
+    assert cfg.use_faker is expected
 
 
-def test_env_bool_returns_default_when_unset(
+def test_use_faker_default_is_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ANONYMIZER_TEST_FLAG", raising=False)
-    assert _env_bool("ANONYMIZER_TEST_FLAG", default=True) is True
-    assert _env_bool("ANONYMIZER_TEST_FLAG", default=False) is False
+    monkeypatch.delenv("USE_FAKER", raising=False)
+    assert Config().use_faker is True
+
+
+def test_invalid_bool_crashes_loud(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The win the pydantic-settings migration is for: a bogus bool
+    used to silently fall back to the default. Now it crashes at
+    instantiation so the operator sees the typo immediately."""
+    monkeypatch.setenv("USE_FAKER", "garbage")
+    with pytest.raises(ValidationError):
+        Config()
+
+
+def test_invalid_port_crashes_loud(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same win for ints. Pre-migration `_env_int("PORT", 8000)` would
+    silently swallow `PORT=abc` and serve on 8000 — exactly the kind
+    of misconfiguration that should crash boot, not 30 minutes later
+    when the operator notices the wrong port."""
+    monkeypatch.setenv("PORT", "not-a-number")
+    with pytest.raises(ValidationError):
+        Config()
+
+
+def test_valid_port_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PORT", "9090")
+    assert Config().port == 9090
+
+
+def test_detector_mode_lowercased(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operator-typed env var like `DETECTOR_MODE=Regex,LLM` should be
+    folded for /health readability and downstream parsing."""
+    monkeypatch.setenv("DETECTOR_MODE", "Regex,LLM")
+    assert Config().detector_mode == "regex,llm"

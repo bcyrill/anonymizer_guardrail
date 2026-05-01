@@ -312,14 +312,12 @@ async def test_regex_overlap_strategy_override(
 ) -> None:
     """`overlap_strategy` kwarg overrides CONFIG.overlap_strategy
     for one call."""
-    from dataclasses import replace
     monkeypatch.setattr(
         regex_mod, "CONFIG",
-        replace(
-            regex_mod.CONFIG,
-            patterns_path="bundled:regex_pentest.yaml",
-            overlap_strategy="priority",
-        ),
+        regex_mod.CONFIG.model_copy(update={
+            "patterns_path": "bundled:regex_pentest.yaml",
+            "overlap_strategy": "priority",
+        }),
     )
     monkeypatch.setattr(regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns())
     detector = regex_mod.RegexDetector()
@@ -483,14 +481,12 @@ def test_denylist_registry_loader_compiles_each_entry(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    from dataclasses import replace
     import unittest.mock
-    fake_cfg = replace(
-        deny_mod.CONFIG,
-        path="",
-        registry=f"legal={p_legal},marketing={p_mkt}",
-        backend="regex",
-    )
+    fake_cfg = deny_mod.CONFIG.model_copy(update={
+        "path": "",
+        "registry": f"legal={p_legal},marketing={p_mkt}",
+        "backend": "regex",
+    })
     with unittest.mock.patch.object(deny_mod, "CONFIG", fake_cfg):
         registry = deny_mod._load_registry()
     assert set(registry) == {"legal", "marketing"}

@@ -13,17 +13,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import sys
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..bundled_resource import read_bundled_default, resolve_spec
 from ..registry import parse_named_path_registry
-from ..config import _env_bool, _env_int
 from .base import Match
 from .spec import DetectorSpec
 
@@ -31,34 +29,39 @@ log = logging.getLogger("anonymizer.llm")
 
 
 # ── Per-detector config ───────────────────────────────────────────────────
-@dataclass(frozen=True)
-class LLMConfig:
+class LLMConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="LLM_",
+        extra="ignore",
+        frozen=True,
+    )
+
     # OpenAI-compatible endpoint. When pointed at LiteLLM, ensure the
     # model used here does NOT have this guardrail attached (otherwise
     # → infinite recursion).
-    api_base: str = os.getenv("LLM_API_BASE", "http://litellm:4000/v1")
-    api_key: str = os.getenv("LLM_API_KEY", "")
-    model: str = os.getenv("LLM_MODEL", "anonymize")
-    timeout_s: int = _env_int("LLM_TIMEOUT_S", 30)
+    api_base: str = "http://litellm:4000/v1"
+    api_key: str = ""
+    model: str = "anonymize"
+    timeout_s: int = 30
     # When true, prefer the Authorization bearer token forwarded by
     # LiteLLM (via `extra_headers: [authorization]` on the guardrail)
     # over LLM_API_KEY. Falls back to LLM_API_KEY if the header is absent.
-    use_forwarded_key: bool = _env_bool("LLM_USE_FORWARDED_KEY", False)
+    use_forwarded_key: bool = False
     # Path to the system prompt for the LLM detector. Empty → bundled
     # default (prompts/llm_default.md).
-    system_prompt_path: str = os.getenv("LLM_SYSTEM_PROMPT_PATH", "")
+    system_prompt_path: str = ""
     # Optional registry of NAMED alternative LLM prompts that callers
     # can opt into per-request via additional_provider_specific_params.llm_prompt.
-    system_prompt_registry: str = os.getenv("LLM_SYSTEM_PROMPT_REGISTRY", "")
+    system_prompt_registry: str = ""
     # Hard cap on input size sent to the LLM in one call. Inputs above
     # this are REFUSED (LLMUnavailableError → fail-closed policy
     # applies), never silently truncated.
-    max_chars: int = _env_int("LLM_MAX_CHARS", 200_000)
+    max_chars: int = 200_000
     # Max number of concurrent LLM calls.
-    max_concurrency: int = _env_int("LLM_MAX_CONCURRENCY", 10)
+    max_concurrency: int = 10
     # Failure mode when the LLM detector errors out. true (default) →
     # block; false → fall back to coverage from the other detectors.
-    fail_closed: bool = _env_bool("LLM_FAIL_CLOSED", True)
+    fail_closed: bool = True
 
 
 CONFIG = LLMConfig()

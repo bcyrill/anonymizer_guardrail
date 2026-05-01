@@ -78,31 +78,31 @@ def _patch_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
     """Flip the LLM detector's fail_closed flag for one test by patching
     `llm_mod.CONFIG`. The pipeline reads `spec.config.fail_closed` live,
     so the patch takes effect immediately."""
-    from dataclasses import replace
     from anonymizer_guardrail.detector import llm as llm_mod
 
     monkeypatch.setattr(
-        llm_mod, "CONFIG", replace(llm_mod.CONFIG, fail_closed=value),
+        llm_mod, "CONFIG",
+        llm_mod.CONFIG.model_copy(update={"fail_closed": value}),
     )
 
 
 def _patch_pf_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
     """Same shim for the privacy_filter detector's fail_closed flag."""
-    from dataclasses import replace
     from anonymizer_guardrail.detector import privacy_filter as pf_mod
 
     monkeypatch.setattr(
-        pf_mod, "CONFIG", replace(pf_mod.CONFIG, fail_closed=value),
+        pf_mod, "CONFIG",
+        pf_mod.CONFIG.model_copy(update={"fail_closed": value}),
     )
 
 
 def _patch_gliner_pii_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
     """Same shim for the gliner_pii detector's fail_closed flag."""
-    from dataclasses import replace
     from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
 
     monkeypatch.setattr(
-        gp_mod, "CONFIG", replace(gp_mod.CONFIG, fail_closed=value),
+        gp_mod, "CONFIG",
+        gp_mod.CONFIG.model_copy(update={"fail_closed": value}),
     )
 
 
@@ -532,18 +532,26 @@ async def test_unexpected_gliner_pii_failure_routes_through_fail_closed(
         await p.anonymize(["alice"], call_id="gliner-unexpected-fail")
 
 
+def _patch_detector_mode(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    """Swap pipeline_mod.config for one with `detector_mode` overridden.
+    Uses Pydantic's `model_copy(update=...)` — the central Config moved
+    from a dataclass to BaseSettings during the pydantic-settings
+    migration, so this is now the canonical way to override one field
+    while keeping every other field at its environment-derived value."""
+    from anonymizer_guardrail import pipeline as pipeline_mod
+
+    monkeypatch.setattr(
+        pipeline_mod, "config",
+        pipeline_mod.config.model_copy(update={"detector_mode": value}),
+    )
+
+
 def test_detector_mode_parses_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:
     """`regex,llm` produces a regex detector followed by an llm detector
     — order preserved (it determines _dedup type priority)."""
     from anonymizer_guardrail import pipeline as pipeline_mod
-    from anonymizer_guardrail.detector.llm import LLMDetector
-    from anonymizer_guardrail.detector.regex import RegexDetector
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["detector_mode"] = "regex,llm"
-    from types import SimpleNamespace
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
-
+    _patch_detector_mode(monkeypatch, "regex,llm")
     detectors = pipeline_mod._build_detectors()
     assert [type(d).__name__ for d in detectors] == ["RegexDetector", "LLMDetector"]
 
@@ -551,24 +559,16 @@ def test_detector_mode_parses_comma_separated(monkeypatch: pytest.MonkeyPatch) -
 def test_detector_mode_order_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
     """Operators picking `llm,regex` get LLM type-priority on duplicates."""
     from anonymizer_guardrail import pipeline as pipeline_mod
-    from types import SimpleNamespace
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["detector_mode"] = "llm,regex"
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
-
+    _patch_detector_mode(monkeypatch, "llm,regex")
     detectors = pipeline_mod._build_detectors()
     assert [type(d).__name__ for d in detectors] == ["LLMDetector", "RegexDetector"]
 
 
 def test_detector_mode_tolerates_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
     from anonymizer_guardrail import pipeline as pipeline_mod
-    from types import SimpleNamespace
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["detector_mode"] = "  regex ,  llm  "
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
-
+    _patch_detector_mode(monkeypatch, "  regex ,  llm  ")
     detectors = pipeline_mod._build_detectors()
     assert len(detectors) == 2
 
@@ -580,12 +580,8 @@ def test_detector_mode_dedupes_and_warns(
     import logging
 
     from anonymizer_guardrail import pipeline as pipeline_mod
-    from types import SimpleNamespace
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["detector_mode"] = "regex,regex"
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
-
+    _patch_detector_mode(monkeypatch, "regex,regex")
     with caplog.at_level(logging.WARNING, logger="anonymizer.pipeline"):
         detectors = pipeline_mod._build_detectors()
     assert len(detectors) == 1
@@ -600,12 +596,8 @@ def test_detector_mode_both_emits_migration_error(
     import logging
 
     from anonymizer_guardrail import pipeline as pipeline_mod
-    from types import SimpleNamespace
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["detector_mode"] = "both"
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
-
+    _patch_detector_mode(monkeypatch, "both")
     with caplog.at_level(logging.ERROR, logger="anonymizer.pipeline"):
         detectors = pipeline_mod._build_detectors()
     # No detectors built from `both` → falls back to regex.
@@ -621,12 +613,8 @@ def test_detector_mode_unknown_falls_back_to_regex(
 ) -> None:
     """Garbage in DETECTOR_MODE: warn, fall back to regex so the service boots."""
     from anonymizer_guardrail import pipeline as pipeline_mod
-    from types import SimpleNamespace
 
-    fields = {f: getattr(pipeline_mod.config, f) for f in pipeline_mod.config.__dataclass_fields__}
-    fields["detector_mode"] = "magic-detector"
-    monkeypatch.setattr(pipeline_mod, "config", SimpleNamespace(**fields))
-
+    _patch_detector_mode(monkeypatch, "magic-detector")
     detectors = pipeline_mod._build_detectors()
     assert [type(d).__name__ for d in detectors] == ["RegexDetector"]
 

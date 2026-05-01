@@ -84,14 +84,12 @@ def test_regex_registry_loaded_at_module_init(
 ) -> None:
     """When REGEX_PATTERNS_REGISTRY is set, _load_patterns_registry()
     compiles each entry and the result is keyed by name."""
-    from dataclasses import replace
     monkeypatch.setattr(
         regex_mod, "CONFIG",
-        replace(
-            regex_mod.CONFIG,
-            patterns_path="",
-            patterns_registry="pentest=bundled:regex_pentest.yaml",
-        ),
+        regex_mod.CONFIG.model_copy(update={
+            "patterns_path": "",
+            "patterns_registry": "pentest=bundled:regex_pentest.yaml",
+        }),
     )
     out = regex_mod._load_patterns_registry()
     assert "pentest" in out
@@ -161,14 +159,12 @@ async def test_regex_detect_default_name_is_default(
 def test_llm_prompt_registry_loaded_at_module_init(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from dataclasses import replace
     monkeypatch.setattr(
         llm_mod, "CONFIG",
-        replace(
-            llm_mod.CONFIG,
-            system_prompt_path="",
-            system_prompt_registry="pentest=bundled:llm_pentest.md",
-        ),
+        llm_mod.CONFIG.model_copy(update={
+            "system_prompt_path": "",
+            "system_prompt_registry": "pentest=bundled:llm_pentest.md",
+        }),
     )
     out = llm_mod._load_system_prompt_registry()
     assert "pentest" in out

@@ -13,16 +13,17 @@ schema documentation in the YAML files themselves.
 from __future__ import annotations
 
 import ipaddress
-import os
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
 import logging
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..bundled_resource import (
     read_bundled,
@@ -38,28 +39,39 @@ log = logging.getLogger("anonymizer.regex")
 
 # ── Per-detector config ───────────────────────────────────────────────────
 # Lives here (not in central config.py) so the env-var fields are
-# colocated with the code that reads them. Tests can monkeypatch
-# `regex.CONFIG = dataclasses.replace(CONFIG, …)` to override per-test;
-# the SPEC's `config` property reads the module attribute live.
-@dataclass(frozen=True)
-class RegexConfig:
+# colocated with the code that reads them. Tests can swap the module
+# CONFIG via `monkeypatch.setattr(regex, "CONFIG", regex.CONFIG.model_copy(
+# update={...}))`; the SPEC's `config` property reads the module
+# attribute live.
+class RegexConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="REGEX_",
+        extra="ignore",
+        frozen=True,
+    )
+
     # Path to the YAML file defining the regex detector's patterns. If
     # unset, the bundled default (patterns/regex_default.yaml) is used.
     # Pre-built alternatives also ship with the package
     # (e.g. patterns/regex_pentest.yaml) — point this at any of them
     # or at your own file.
-    patterns_path: str = os.getenv("REGEX_PATTERNS_PATH", "")
+    patterns_path: str = ""
     # Optional registry of NAMED alternative regex pattern files that
     # callers can opt into per-request via
     # additional_provider_specific_params.regex_patterns. Comma-separated
     # `name=path` pairs.
-    patterns_registry: str = os.getenv("REGEX_PATTERNS_REGISTRY", "")
+    patterns_registry: str = ""
     # How the regex detector resolves overlapping matches between patterns:
     #   - "longest"  pick the longest match span (default).
     #   - "priority" first pattern in YAML order wins.
     # Validated at startup; a typo crashes loudly rather than silently
     # falling through to a default.
-    overlap_strategy: str = os.getenv("REGEX_OVERLAP_STRATEGY", "longest").lower()
+    overlap_strategy: str = "longest"
+
+    @field_validator("overlap_strategy", mode="after")
+    @classmethod
+    def _lower_overlap(cls, v: str) -> str:
+        return v.lower()
 
 
 CONFIG = RegexConfig()

@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import sys
-from dataclasses import dataclass
 from typing import Any
 
-from ..config import _env_bool, _env_int
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from .base import Detector, Match
 from .spec import DetectorSpec
 
@@ -39,25 +39,37 @@ log = logging.getLogger("anonymizer.privacy_filter")
 # Covers BOTH the in-process variant (PrivacyFilterDetector) and the
 # remote variant (RemotePrivacyFilterDetector) — they share a
 # DETECTOR_MODE token, fail-closed flag, and concurrency cap.
-@dataclass(frozen=True)
-class PrivacyFilterConfig:
+class PrivacyFilterConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="PRIVACY_FILTER_",
+        extra="ignore",
+        frozen=True,
+    )
+
     # Empty (default) → DETECTOR_MODE=privacy_filter loads the model
     # in-process. Set to an HTTP URL → the detector becomes
     # RemotePrivacyFilterDetector and posts to {URL}/detect on every
     # request. The standalone privacy-filter-service container (see
     # services/privacy_filter/) is the canonical other end.
-    url: str = os.getenv("PRIVACY_FILTER_URL", "").strip()
+    url: str = ""
     # Per-call timeout on the remote detector's HTTP requests.
-    timeout_s: int = _env_int("PRIVACY_FILTER_TIMEOUT_S", 30)
+    timeout_s: int = 30
     # Failure mode for the privacy_filter detector. true (default) →
     # block the request on PF outage; false → degrade to no PF matches
     # and proceed with the other detectors. Independent from
     # llm.CONFIG.fail_closed and gliner_pii.CONFIG.fail_closed.
-    fail_closed: bool = _env_bool("PRIVACY_FILTER_FAIL_CLOSED", True)
+    fail_closed: bool = True
     # Max concurrent PF detector calls (in-process AND remote).
     # Independent from LLM_MAX_CONCURRENCY: a saturated PF queue
     # shouldn't reduce LLM headroom or vice versa.
-    max_concurrency: int = _env_int("PRIVACY_FILTER_MAX_CONCURRENCY", 10)
+    max_concurrency: int = 10
+
+    @field_validator("url", mode="after")
+    @classmethod
+    def _strip_url(cls, v: str) -> str:
+        # Trailing whitespace on a copy-pasted URL is the kind of typo
+        # we'd rather absorb than turn into a confusing 404.
+        return v.strip()
 
 
 CONFIG = PrivacyFilterConfig()
@@ -240,7 +252,7 @@ def _privacy_filter_factory() -> Detector:
     is sufficient.
 
     Evaluated at instantiation, not at module import, so a test that
-    monkeypatches `privacy_filter.CONFIG` (e.g. via `dataclasses.replace`)
+    monkeypatches `privacy_filter.CONFIG` (e.g. via `model_copy(update=...)`)
     then rebuilds the pipeline picks up the new value. Lives here
     (rather than in pipeline.py) so the SPEC declaration below can
     reference it without pipeline.py needing to know about either

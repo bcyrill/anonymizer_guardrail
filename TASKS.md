@@ -198,55 +198,6 @@ limit.
 
 ---
 
-## Migrate `Config` to pydantic-settings
-
-**What:** replace the hand-rolled `Config` dataclass + `_env_int` /
-`_env_bool` helpers in `src/anonymizer_guardrail/config.py` with a
-`pydantic_settings.BaseSettings` model. Same env-var names, same
-fields — the change is in the parsing layer.
-
-**Why:** the current `_env_int` (`config.py:32-39`) silently swallows
-`ValueError` and falls back to the default. `PORT=abc` becomes `8000`
-with zero signal — exactly the class of misconfiguration that should
-crash at boot, not 30 minutes later when the operator notices the
-service is on the wrong port. pydantic-settings raises a clear
-validation error at import time. Other wins: built-in `.env` support
-(useful for local dev), automatic type coercion, free
-`PORT: int = Field(ge=1, le=65535)`-style range validation, JSON
-schema export for ops dashboards.
-
-**Why deferred:** pure modernization, not a bug fix. The existing
-parsers work; the silent-fallback issue has not been a real-world
-problem. Timed for the next dependency-bump window.
-
-**Sketch:**
-
-1. Add `pydantic-settings` to `pyproject.toml`.
-2. Convert `Config` to inherit from `BaseSettings`. The existing field
-   names map 1:1; replace `os.getenv` defaults with normal defaults
-   plus `model_config = SettingsConfigDict(env_file=".env",
-   case_sensitive=False)`.
-3. Per-detector configs (`detector/llm.py:LLMConfig`,
-   `privacy_filter.py:CONFIG`, `remote_gliner_pii.py:GlinerPIIConfig`,
-   `regex.py`, `denylist.py`) follow the same pattern. Keep them
-   per-module — the grouping is what makes the env table operator-
-   readable.
-4. Drop `_env_int` / `_env_bool` once nothing imports them. They're
-   re-exported from `config.py`; check call sites in detector modules
-   and remove imports.
-5. Confirm test monkey-patches still work — many tests rebuild
-   `CONFIG` after env changes, and pydantic-settings may need
-   `Config.model_construct()` or a refresh helper.
-
-**Non-goals:**
-
-- Don't go further and pull every operator-tunable string into Pydantic
-  validators (e.g. validating `DETECTOR_MODE` token names there). The
-  detector loader's warn-and-skip behavior is intentional for forward-
-  compat.
-
----
-
 ## Convert `Overrides` to a Pydantic model
 
 **What:** rewrite `api.Overrides` as a `pydantic.BaseModel` with
