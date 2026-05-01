@@ -46,9 +46,16 @@ DEFAULT_MODEL = os.environ.get("MODEL_NAME", "fake")
 class Rule:
     """One matching rule.
 
-    `match` (substring) and `match_regex` (Python regex) are tried in
-    that order; either or both may be set. `match_regex` is compiled
-    once at startup. A rule fires if any configured matcher succeeds.
+    Matchers (a rule fires when EVERY set matcher succeeds):
+      - `match`       substring of the user message
+      - `match_regex` Python regex on the user message (.search semantics)
+      - `match_model` substring of the request's `model` field — useful for
+                      verifying that callers' llm_model overrides reach us
+
+    At least one matcher must be set (otherwise the rule is unfireable).
+    Within the text-side matchers (`match` and `match_regex`) the rule
+    fires when *either* hits (OR); the model matcher AND-combines with
+    that result.
 
     Response controls (mutually-compatible, applied in this order):
       - `delay_s`     sleep before responding (float seconds)
@@ -64,21 +71,33 @@ class Rule:
         self.match = raw.get("match")
         match_regex = raw.get("match_regex")
         self.match_regex = re.compile(match_regex) if match_regex else None
-        if self.match is None and self.match_regex is None:
+        self.match_model = raw.get("match_model")
+        if self.match is None and self.match_regex is None and self.match_model is None:
             raise ValueError(
-                f"rule {self.description!r} has neither `match` nor `match_regex`"
+                f"rule {self.description!r} has none of `match`, `match_regex`, "
+                f"or `match_model`"
             )
         self.entities = raw.get("entities", [])
         self.raw_content: str | None = raw.get("raw_content")
         self.status_code = int(raw.get("status_code", 200))
         self.delay_s = float(raw.get("delay_s", 0))
 
-    def matches(self, text: str) -> bool:
-        if isinstance(self.match, str) and self.match and self.match in text:
-            return True
-        if self.match_regex is not None and self.match_regex.search(text):
-            return True
-        return False
+    def matches(self, text: str, model: str) -> bool:
+        # Model matcher (when set) must succeed.
+        if self.match_model is not None:
+            if not isinstance(self.match_model, str) or self.match_model not in model:
+                return False
+        # Text matchers (when any are set) must have at least one hit.
+        has_text = self.match is not None or self.match_regex is not None
+        if has_text:
+            text_hit = False
+            if isinstance(self.match, str) and self.match and self.match in text:
+                text_hit = True
+            elif self.match_regex is not None and self.match_regex.search(text):
+                text_hit = True
+            if not text_hit:
+                return False
+        return True
 
 
 def _load_rules(path: str) -> tuple[list[Rule], dict[str, Any]]:
@@ -149,7 +168,7 @@ async def chat_completions(req: Request) -> Response:
     model = str(body.get("model", DEFAULT_MODEL))
     user_msg = _last_user_content(body.get("messages", []))
 
-    rule = next((r for r in _RULES if r.matches(user_msg)), None)
+    rule = next((r for r in _RULES if r.matches(user_msg, model)), None)
 
     if rule is None:
         log.info("no-rule-match user=%r", user_msg[:120])

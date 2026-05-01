@@ -75,15 +75,19 @@ scripts/run_container.sh -t slim -- \
 
 ## Rules schema
 
-Each entry under `rules:` declares a matcher and a response. Matching
-is first-rule-wins; both `match` and `match_regex` may be set on the
-same rule (either matcher firing counts as a hit).
+Each entry under `rules:` declares matchers and a response. Matching
+is first-rule-wins. Within a rule, every set matcher must succeed
+(`match`/`match_regex` are OR'd together, then AND'd with
+`match_model`). At least one matcher is required.
 
 ```yaml
 rules:
   - description: "human-readable label, used in logs"
-    match: "literal substring"          # case-sensitive
-    match_regex: 'Python\s+regex'       # .search semantics
+    match: "literal substring"          # case-sensitive substring of user msg
+    match_regex: 'Python\s+regex'       # .search semantics on user msg
+    match_model: "invalid-model"        # substring of the request's `model`
+                                        # field — useful for verifying that
+                                        # llm_model overrides reach us
     entities:                           # default response shape
       - text: "string from the input"
         type: PERSON                    # any string; the guardrail will

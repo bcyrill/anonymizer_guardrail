@@ -17,6 +17,16 @@
 # When no rule matches, the `default:` block applies.
 
 rules:
+  # Override-verification rule. Listed FIRST because it's keyed on the
+  # request's model field (not the user message), and we want it to
+  # pre-empt text-only rules whenever the guardrail's `llm_model`
+  # override propagates "invalid-model" through the chat-completions
+  # call. The 503 response trips FAIL_CLOSED in the guardrail, so the
+  # outer request comes back BLOCKED — proves the override reached us.
+  - description: "Override test: model='invalid-model' → 503"
+    match_model: "invalid-model"
+    status_code: 503
+
   # Reproduces the UUID-overlap case: regex catches the full UUID, the
   # LLM (us, here) reports only the trailing 12-digit suffix as
   # IDENTIFIER. Useful for verifying that longest-match-wins works at
