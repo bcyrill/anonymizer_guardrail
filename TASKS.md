@@ -206,7 +206,8 @@ logger so every log line is one JSON object — `level`, `name`,
 `message`, `timestamp`, plus structured `extra={…}` fields like
 `call_id`, `entity_count`, `detector`.
 
-**Why:** today the format string in `main.py:23-26` is human-readable
+**Why:** today the `logging.basicConfig` call in `main.py` uses a
+human-readable format string
 (`%(asctime)s %(levelname)s %(name)s — %(message)s`). Fine for `docker
 logs` and local dev, but in any production-grade log pipeline (ELK,
 Splunk, Datadog, Loki + Grafana) JSON lines are dramatically easier
@@ -239,9 +240,9 @@ log aggregator. Premature otherwise.
   different shapes (point events vs. spans), and OTel pulls in a
   much bigger dependency surface — separate task if/when needed.
 - Don't try to redact PII from logs structurally. The pipeline
-  already gates body-content logs behind DEBUG (`main.py:93-94`);
-  the structured fields we'd log (`call_id`, counts) are
-  PII-free.
+  already gates body-content logs behind DEBUG in `main.py`'s
+  `guardrail` handler; the structured fields we'd log (`call_id`,
+  counts) are PII-free.
 
 ---
 
@@ -253,8 +254,9 @@ asked to return a list-of-lists (one entity list per input), and the
 pipeline maps the result back to per-text matches.
 
 **Why:** today each text in `req.texts` produces its own
-`_detect_one` task (`pipeline.py:391-398`), each of which fans out to
-its own LLM call (`detector/llm.py:detect`). For a request with 10
+`_detect_one` task (see `Pipeline.anonymize` in `pipeline.py`), each
+of which fans out to its own LLM call (`LLMDetector.detect` in
+`detector/llm.py`). For a request with 10
 short texts, that's 10 LLM round-trips, each carrying the full system
 prompt. The system prompt currently ~600 tokens (see
 `prompts/llm_default.md`); 10 short inputs of ~50 tokens each means
@@ -272,8 +274,8 @@ ten TTFTs serialized through a concurrency cap of 10).
   the whole batch — and a *partially* malformed response (model
   returns 9 of 10 expected lists) is messy to handle.
 - **Hallucination accounting gets harder.** The hallucination guard
-  in `_parse_entities` (`detector/llm.py:170-172`) checks each
-  matched substring against the source text. With multiple sources
+  in `_parse_entities` (`detector/llm.py`) checks each matched
+  substring against the source text. With multiple sources
   in flight, the model could return a real entity from text 3 but
   attribute it to text 1's list. The guard would still drop it (it
   isn't in text 1), so we lose a real entity — net worse than

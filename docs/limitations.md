@@ -21,8 +21,8 @@ aren't visible from another. Two consequences:
   accepting it as a small loss.
 
 For multi-replica deployments, swap the in-memory `Vault` for a
-Redis-backed implementation — the interface is two methods (`set` and
-`pop_with_ttl`).
+Redis-backed implementation — the interface is two methods (`put` and
+`pop`).
 
 ## No streaming responses
 

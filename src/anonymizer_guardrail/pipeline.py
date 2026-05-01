@@ -185,11 +185,12 @@ class Pipeline:
         the detectors configured at startup.
 
         Operators can narrow the active set per call (e.g. "skip the LLM
-        for this request") but cannot expand it: privacy_filter requires
-        torch + the model to be loaded, and the LLM detector requires the
-        configured api_base / model — neither are constructable at
-        request time. Names that aren't currently configured are dropped
-        with a warning.
+        for this request") but cannot expand it: every detector has
+        boot-time setup that isn't safe to run mid-request — the
+        in-process privacy_filter loads torch + the model, the remote
+        variants set up httpx clients against configured URLs, and the
+        LLM detector needs the configured api_base / model. Names that
+        aren't currently configured are dropped with a warning.
         """
         if not overrides.detector_mode:
             return self._detectors
@@ -235,12 +236,12 @@ class Pipeline:
         starve the others. CPU-cheap detectors (regex, denylist) skip
         gating entirely.
 
-        Per-detector exceptions are handled inside the inner runner so one
-        detector crashing doesn't poison the gather. Typed unavailable
-        errors still propagate under fail-closed — the TaskGroup then
-        cancels the in-flight siblings (saving wasted work since the
-        request is about to BLOCK) and re-raises the typed error so
-        main.py's BLOCKED handler matches.
+        Per-detector exceptions are handled inside the inner runner so
+        one detector crashing doesn't tear down the TaskGroup. Typed
+        unavailable errors still propagate under fail-closed — the
+        TaskGroup then cancels the in-flight siblings (saving wasted
+        work since the request is about to BLOCK) and re-raises the
+        typed error so main.py's BLOCKED handler matches.
         """
         active = self._resolve_active_detectors(overrides)
 

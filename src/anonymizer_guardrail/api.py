@@ -207,6 +207,12 @@ class Overrides(BaseModel):
 # that the model's own validator rejects, and the bad value would only
 # fail at the final `Overrides(**fields)` construction — outside the
 # per-field try/except, defeating the warn-and-drop contract.
+#
+# Shape recovered for the `gliner_threshold` field:
+#     field.annotation = float | None
+#     field.metadata   = [BeforeValidator(_strict_threshold)]
+#     reconstructed    = Annotated[float | None,
+#                                  BeforeValidator(_strict_threshold)]
 def _field_adapter(field: Any) -> TypeAdapter:
     if field.metadata:
         return TypeAdapter(Annotated[(field.annotation, *field.metadata)])

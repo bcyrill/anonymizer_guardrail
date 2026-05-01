@@ -8,7 +8,6 @@ arbitrary paths over the wire.
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 
 # Match the other tests: keep config harmless for transitive imports.
 os.environ.setdefault("DETECTOR_MODE", "regex")

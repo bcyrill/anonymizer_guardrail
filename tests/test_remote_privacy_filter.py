@@ -9,7 +9,6 @@ HTTP-layer failure mode it has to degrade gracefully on.
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 

@@ -70,22 +70,6 @@ class Vault:
                     self._max_entries, evicted,
                 )
 
-    def get(self, call_id: str) -> dict[str, str]:
-        """Retrieve the mapping for a call without removing it.
-        Returns {} if absent/expired.
-        """
-        if not call_id:
-            return {}
-        with self._lock:
-            entry = self._store.get(call_id)
-        if entry is None:
-            return {}
-        ts, mapping = entry
-        if time.monotonic() - ts > self._ttl_s:
-            log.warning("Vault entry for call_id=%s expired before post_call", call_id)
-            return {}
-        return mapping
-
     def pop(self, call_id: str) -> dict[str, str]:
         """Retrieve and remove the mapping for a call. Returns {} if absent/expired."""
         if not call_id:

@@ -8,7 +8,6 @@ LLM_FAIL_CLOSED in the pipeline decides), never by truncating.
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 # Match test_pipeline.py: keep config harmless for transitive imports.

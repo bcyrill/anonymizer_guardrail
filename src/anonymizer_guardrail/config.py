@@ -20,7 +20,7 @@ config instances via `model_copy(update={...})`.
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +68,13 @@ class Config(BaseSettings):
     # you have very chatty users; lower (or zero, effectively disabling)
     # if memory is tight and per-request consistency is enough.
     surrogate_cache_max_size: int = 100_000
+    # Cap on the per-locale Faker instance cache (separate from the
+    # surrogate cache above). Each Faker is a few MB resident (provider
+    # dictionaries); without a bound, callers cycling distinct
+    # `faker_locale` overrides could grow memory unboundedly. Floor of 1
+    # via Field(ge=1) so a typoed 0/negative value can't disable the
+    # cache entirely (would force a fresh Faker per call → ~1–2 ms each).
+    surrogate_faker_lru_max: int = Field(default=32, ge=1)
     # Secret keying material mixed into the blake2b hashes the surrogate
     # generator uses (both the Faker seed and the opaque-token digest).
     # Empty (the default) → a fresh 16-byte random salt is generated each

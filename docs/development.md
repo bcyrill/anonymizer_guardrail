@@ -110,13 +110,16 @@ one per `DETECTOR_MODE` token. Each spec carries:
   `sys.modules[__name__]`); the `config` property reads `module.CONFIG`
   live so test monkeypatches are visible.
 - `prepare_call_kwargs(overrides, api_key)` — builds per-call kwargs.
-- `has_semaphore`, `stats_prefix`, `max_concurrency_field` — concurrency cap.
-- `unavailable_error`, `fail_closed_field`, `blocked_reason` — failure mode.
+- `has_semaphore`, `stats_prefix` — concurrency cap. The cap value
+  itself comes from `spec.config.max_concurrency` (live lookup).
+- `unavailable_error`, `blocked_reason` — failure mode. The
+  fail-closed flag comes from `spec.config.fail_closed` (live lookup).
 
 **Per-detector `CONFIG`** — each detector module
-(`detector/<name>.py`) defines its own frozen `<Name>Config` dataclass
-and instantiates `CONFIG`. Cross-cutting fields (vault, surrogate,
-http server, faker locale) stay on the central `Config` in `config.py`.
+(`detector/<name>.py`) defines its own `<Name>Config` BaseSettings model
+(env-prefixed, `frozen=True`) and instantiates `CONFIG`. Cross-cutting
+fields (vault, surrogate, http server, faker locale) stay on the
+central `Config` in `config.py`.
 
 **`Pipeline.__init__`** iterates `REGISTERED_SPECS` to allocate
 `_semaphores` / `_inflight_counters` dicts, build the
@@ -456,6 +459,9 @@ detectors" enumeration. They all consume `REGISTERED_SPECS` /
 - [TASKS.md](../TASKS.md) — backlog of deliberately deferred work, with
   rationale for each deferral. Useful before starting on something
   that might already have a documented design sketch.
+- [design-decisions.md](design-decisions.md) — paths considered and
+  declined, with the load-bearing reasoning so future work can
+  re-evaluate when the assumptions change.
 - [README.md](../README.md) — project landing page; links into the
   rest of `docs/`.
 - [services/privacy_filter/README.md](../services/privacy_filter/README.md)

@@ -502,11 +502,16 @@ def test_denylist_registry_loader_compiles_each_entry(tmp_path) -> None:
 def test_surrogate_faker_lru_evicts_oldest_locale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cycling through more distinct locale tuples than _FAKER_LRU_MAX
+    """Cycling through more distinct locale tuples than the configured cap
     must NOT grow the cache without bound. Cap is enforced via LRU
     eviction; the dropped Faker is reconstructible on demand."""
+    from anonymizer_guardrail import config as cfg_mod
     from anonymizer_guardrail import surrogate as surrogate_mod
-    monkeypatch.setattr(surrogate_mod, "_FAKER_LRU_MAX", 3)
+    monkeypatch.setattr(
+        cfg_mod, "config",
+        cfg_mod.config.model_copy(update={"surrogate_faker_lru_max": 3}),
+    )
+    monkeypatch.setattr(surrogate_mod, "config", cfg_mod.config)
     gen = SurrogateGenerator()
     m = Match(text="Alice", entity_type="PERSON")
 

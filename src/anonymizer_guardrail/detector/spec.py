@@ -7,10 +7,10 @@ in-flight counter + `_run` branch + exception handler + TaskGroup
 handler), tests, plus the bash launchers.
 
 `DetectorSpec` collapses the Python-side fan-out into one constant per
-detector, AND each detector module owns its own `CONFIG` dataclass so
-the env-var fields live alongside the code that reads them. Adding a
-new detector is now: write the Detector class, define `CONFIG = …`,
-define `SPEC = DetectorSpec(...)`, append the SPEC to
+detector, AND each detector module owns its own `CONFIG` BaseSettings
+model so the env-var fields live alongside the code that reads them.
+Adding a new detector is now: write the Detector class, define
+`CONFIG = …`, define `SPEC = DetectorSpec(...)`, append the SPEC to
 `REGISTERED_SPECS` in `detector/__init__.py`. Pipeline iterates the
 registry to build all the wiring above; `main.py` iterates to build
 the typed-error → BLOCKED response map.

@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import secrets
 import threading
 from collections import OrderedDict
@@ -206,12 +205,6 @@ _MAX_COLLISION_RETRIES = 4
 # Golden-ratio-derived constant. Used to perturb the seed across retries
 # so each attempt explores a different Faker output.
 _SALT_MULTIPLIER = 0x9E3779B97F4A7C15
-# Hard cap on the number of distinct override-locale Faker instances
-# kept warm. Sized for realistic deployments (a few primary locales
-# with a small number of fallback chains); on overflow the
-# least-recently-used is evicted, a cheap reconstruction on next use.
-# Adjustable via env if a deployment legitimately needs more.
-_FAKER_LRU_MAX = max(1, int(os.environ.get("SURROGATE_FAKER_LRU_MAX", "32")))
 
 
 _CacheKey = tuple[str, str, bool, tuple[str, ...] | None]
@@ -306,9 +299,9 @@ class SurrogateGenerator:
         - locale_tuple is None → the configured default (self._fake), if any.
         - Otherwise → look up / build a Faker for that exact locale tuple,
           cached LRU so repeated overrides reuse the instance instead of
-          paying ~1–2 ms construction cost per call. Cap is _FAKER_LRU_MAX;
-          on overflow the least-recently-used Faker is dropped (it gets
-          rebuilt on demand if seen again).
+          paying ~1–2 ms construction cost per call. Cap is
+          `config.surrogate_faker_lru_max`; on overflow the least-recently-
+          used Faker is dropped (it gets rebuilt on demand if seen again).
 
         An invalid locale logs a warning and falls back to the default —
         same warn-and-ignore policy as the other per-request overrides.
@@ -335,7 +328,7 @@ class SurrogateGenerator:
         # is the OOM-safety net against callers cycling distinct locale
         # tuples. Eviction is essentially free here (Python just drops
         # the reference; no I/O, no provider unloading).
-        while len(self._faker_by_locale) > _FAKER_LRU_MAX:
+        while len(self._faker_by_locale) > config.surrogate_faker_lru_max:
             self._faker_by_locale.popitem(last=False)
         return f
 

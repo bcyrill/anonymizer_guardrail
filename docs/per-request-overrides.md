@@ -7,11 +7,13 @@ the deployment-wide default.
 
 This page documents the **cross-cutting** overrides that apply to
 the pipeline as a whole. Detector-specific overrides
-(`regex_overlap_strategy`, `regex_patterns`, `denylist`, `llm_model`,
-`llm_prompt`) live with each detector's docs:
+(`regex_overlap_strategy`, `regex_patterns`, `denylist`, `gliner_labels`,
+`gliner_threshold`, `llm_model`, `llm_prompt`) live with each detector's
+docs:
 
 - [Regex detector → Per-request overrides](detectors/regex.md#per-request-overrides)
 - [Denylist detector → Per-request overrides](detectors/denylist.md#per-request-overrides)
+- [GLiNER-PII detector → Per-request overrides](detectors/gliner-pii.md#per-request-overrides)
 - [LLM detector → Per-request overrides](detectors/llm.md#per-request-overrides)
 
 ## Cross-cutting overrides
