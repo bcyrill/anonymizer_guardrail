@@ -50,13 +50,24 @@ LABEL org.opencontainers.image.title="anonymizer-guardrail" \
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# curl for HEALTHCHECK only.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
- && rm -rf /var/lib/apt/lists/*
+# Note: PIP_NO_CACHE_DIR is intentionally unset. The pip RUN steps
+# below mount a buildkit cache at /root/.cache/pip — that cache lives
+# OUTSIDE the image (it's a buildkit volume detached after the RUN
+# completes), so the image stays small AND incremental rebuilds reuse
+# previously-downloaded wheels. Setting PIP_NO_CACHE_DIR=1 would defeat
+# the mount entirely.
+
+# curl for HEALTHCHECK only. Cache mounts let buildkit reuse the apt
+# package + lists across builds; rm -rf of /var/lib/apt/lists isn't
+# needed because the cache mounts are unmounted at RUN exit, leaving
+# nothing in the image layer.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends curl
 
 # Non-root user (Podman is rootless by default; this also helps on K8s).
 ARG APP_UID=10001
@@ -93,11 +104,19 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # `pip install ".[privacy-filter]"` then satisfies its torch dep without
 # pulling a different (possibly CUDA-fattened) build from the default
 # PyPI index.
-RUN if [ "$WITH_PRIVACY_FILTER" = "true" ]; then \
-        pip install --no-cache-dir --index-url "$TORCH_INDEX_URL" torch \
-     && pip install --no-cache-dir ".[privacy-filter]"; \
+#
+# `--mount=type=cache,target=/root/.cache/pip` keeps the wheel cache
+# across builds (rebuilds with the same pyproject.toml are nearly
+# instant; even after a dep bump, only the changed wheels download).
+# We deliberately drop --no-cache-dir on the pip calls — the mount
+# IS the cache, and the wheels live in the cache mount, not in the
+# image layer.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$WITH_PRIVACY_FILTER" = "true" ]; then \
+        pip install --index-url "$TORCH_INDEX_URL" torch \
+     && pip install ".[privacy-filter]"; \
     else \
-        pip install --no-cache-dir .; \
+        pip install .; \
     fi
 
 # HF cache lives at a known path so operators can mount a named volume

@@ -170,10 +170,17 @@ resolve_flavour() {
 # Run a single build. Honors EXTRA_ARGS (passthrough after `--`).
 build_one() {
   resolve_flavour "$1"
+  # `--format=docker` is needed under podman because podman defaults to
+  # the OCI image format, which doesn't include a HEALTHCHECK field —
+  # podman drops our HEALTHCHECK silently and warns. Docker format
+  # preserves it. The flag isn't valid on `docker build`, so we only
+  # add it when the engine is podman.
+  local fmt_args=()
+  [[ "$ENGINE" == "podman" ]] && fmt_args=(--format=docker)
   say ""
   say "${c_bld}── Building ${RESOLVED_TYPE} → ${TAG} ──${c_rst}"
-  say "${c_dim}${ENGINE} build -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f ${CONTAINERFILE} ${BUILD_CONTEXT}${c_rst}"
-  "$ENGINE" build -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f "$CONTAINERFILE" "$BUILD_CONTEXT"
+  say "${c_dim}${ENGINE} build ${fmt_args[*]} -t ${TAG} ${BUILD_ARGS[*]} ${EXTRA_ARGS[*]:-} -f ${CONTAINERFILE} ${BUILD_CONTEXT}${c_rst}"
+  "$ENGINE" build "${fmt_args[@]}" -t "$TAG" "${BUILD_ARGS[@]}" "${EXTRA_ARGS[@]}" -f "$CONTAINERFILE" "$BUILD_CONTEXT"
   ok "Built ${TAG}."
 }
 

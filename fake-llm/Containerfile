@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Fake OpenAI-compatible Chat Completions server for guardrail testing.
 #
 # Build:
@@ -15,10 +16,14 @@ FROM docker.io/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN pip install --no-cache-dir \
+# Buildkit cache mount: wheels persist across rebuilds in a cache
+# volume that's detached after the RUN, so the image stays small and
+# the next build skips re-downloading. PIP_NO_CACHE_DIR is unset for
+# the same reason (set, it would defeat the mount).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
         'fastapi>=0.110' \
         'uvicorn[standard]>=0.27' \
         'pyyaml>=6.0'
