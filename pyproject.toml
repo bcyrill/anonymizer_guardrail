@@ -27,6 +27,20 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
+    # Launcher (tools/launcher/) — Click for the flag-driven CLI,
+    # Textual for the interactive menu (single-screen menuconfig-
+    # style UI, mirrors what scripts/menu.sh did with the bash
+    # `dialog` tool), rich for status/plan rendering (color, tables,
+    # NO_COLOR support). Dev-only because the launcher lives outside
+    # src/ and isn't shipped in the wheel (see
+    # [tool.hatch.build.targets.wheel] below). Production operators
+    # install `anonymizer-guardrail` without [dev] and never see these.
+    # rich is a transitive dep of Textual but listed explicitly because
+    # we import it directly in the runner — pinning it here keeps the
+    # contract visible.
+    "click>=8.1",
+    "textual>=0.50",
+    "rich>=13.0",
 ]
 # Pulls in the dependencies needed to run the local privacy-filter NER
 # detector (openai/privacy-filter on HuggingFace). Heavy: torch alone is
@@ -48,6 +62,10 @@ anonymizer-guardrail = "anonymizer_guardrail.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/anonymizer_guardrail"]
+# tools/launcher/ is dev-only — explicitly left out so the wheel
+# (and the production container image) doesn't carry typer /
+# questionary or the launcher source. Operators install the
+# launcher via `pip install -e ".[dev]"` from a checkout.
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
