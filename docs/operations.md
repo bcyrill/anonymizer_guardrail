@@ -101,9 +101,12 @@ LiteLLM forwards the *full* conversation history in `texts` on every
 turn — see [examples → Multi-text batch](examples.md#multi-text-batch).
 For long chats this means every slow detector re-classifies every
 prior turn from scratch on each call. The detector result cache is an
-opt-in process-wide LRU keyed by input text plus the overrides that
-affect that detector's output, letting repeat calls skip the slow
-detection work entirely.
+opt-in store keyed by input text plus the overrides that affect that
+detector's output, letting repeat calls skip the slow detection work
+entirely. Two backends ship: a process-local LRU (default,
+zero-dependency) and a Redis-backed shared store (opt-in, suitable
+for multi-replica deployments and cache survival across guardrail
+restarts).
 
 ### Configuration
 
@@ -120,6 +123,12 @@ structures, so caching would add overhead for negligible savings.
 | `LLM_CACHE_BACKEND` | `memory` | `memory` (process-local LRU) or `redis` (shared store). |
 | `PRIVACY_FILTER_CACHE_BACKEND` | `memory` | Same shape as `LLM_CACHE_BACKEND`. |
 | `GLINER_PII_CACHE_BACKEND` | `memory` | Same shape as `LLM_CACHE_BACKEND`. |
+
+**Bounds asymmetry:** the memory backend caps by *entry count* via
+`*_MAX_SIZE` (LRU eviction); the redis backend caps by *wall-clock
+TTL* via `*_CACHE_TTL_S` plus Redis-side `maxmemory` policy. Each
+backend's knob is silently ignored on the other — operators should
+tune whichever pair their backend uses and leave the other at default.
 
 #### Memory-backend knobs
 
@@ -289,13 +298,77 @@ If Redis becomes unreachable, the cache becomes a passthrough:
 and a warning is logged at most once per minute per detector
 namespace. The detector itself keeps serving requests — this is a
 deliberate departure from the vault's stricter policy
-(see [vault.md](vault.md)) because the cache is an *efficiency*
-mechanism (lost cache hits ⇒ slower detection), not a *correctness*
-mechanism (lost mappings ⇒ unredacted responses). The two share
-`redis-py` but ship as independent extras (`vault-redis` and
-`cache-redis`) and take separate URLs (`VAULT_REDIS_URL`,
+(see [vault → Backends](vault.md#backends)) because the cache is an
+*efficiency* mechanism (lost cache hits ⇒ slower detection), not a
+*correctness* mechanism (lost mappings ⇒ unredacted responses). The
+two share `redis-py` but ship as independent extras (`vault-redis`
+and `cache-redis`) and take separate URLs (`VAULT_REDIS_URL`,
 `CACHE_REDIS_URL`) so operators can mix-and-match — e.g. memory
 vault with redis cache, or redis vault with memory cache.
+
+The `enabled` field on `<prefix>_cache_backend` stays `redis` even
+when Redis is unreachable — the passthrough is internal to
+`get_or_compute`, not a backend swap. Operators reading `/health` see
+the *configured* backend, not the *current* state. Watch the WARNING
+log line `Redis cache GET failed for namespace=…` (or `SET failed`)
+as the canonical signal that the cache is degraded.
+
+**What an operator does when Redis is down:**
+
+1. Grep guardrail logs for `"Redis cache "` to confirm the cache layer
+   has been seeing failures (rate-limited to one per minute per
+   namespace, so absence of recent lines doesn't prove health —
+   tail the active log too).
+2. Verify the URL works from the guardrail container:
+   `redis-cli -u $CACHE_REDIS_URL ping` should return `PONG`.
+3. No guardrail restart needed. The cache reconnects per-call via
+   redis-py's connection pool; once Redis is reachable again the
+   warning stops firing and hits resume on the next request.
+
+### Redis backend: diagnosing low hit rate
+
+`<prefix>_cache_hits` / `<prefix>_cache_misses` on `/health` give
+per-replica counters. Hit-rate well below expectations on a
+multi-turn workload usually means one of:
+
+- **Different replicas are computing different cache-key digests.**
+  Each replica logs `CACHE_SALT unset — generated a random 16-byte
+  salt for this process` once at INFO when the operator-facing
+  `CACHE_SALT` is empty. If you see that line in any replica's logs,
+  cross-replica cache hits are impossible: each process has a
+  different salt → different digest → no shared keys. Set
+  `CACHE_SALT` to a fixed value on every replica.
+- **Override fragmentation.** The cache key includes the per-call
+  overrides that affect output (`(text, llm_model, llm_prompt)` for
+  LLM, `(text, labels, threshold)` for gliner, `(text,)` for PF). If
+  callers pass different `additional_provider_specific_params` per
+  request, each variant occupies its own slot. Look at LiteLLM
+  request-side instrumentation to see whether `llm_model` /
+  `llm_prompt` / `labels` are stable across the calls you'd expect
+  to be cached.
+- **Caching a high-cardinality detector.** Per-call salt-rotation,
+  unique IDs in the input text, etc. all defeat caching. If the
+  workload is structurally low-repetition, the cache won't help —
+  switch back to `<DETECTOR>_CACHE_BACKEND=memory` +
+  `<DETECTOR>_CACHE_MAX_SIZE=0` to skip the Redis writes.
+
+### Redis backend: flushing one detector's cache
+
+After a label change (gliner), prompt rotation (LLM), or any other
+operator action that should invalidate cached verdicts:
+
+```bash
+# Approximate; non-blocking. Use this in production.
+redis-cli -u $CACHE_REDIS_URL --scan --pattern 'cache:gliner_pii:*' \
+    | xargs redis-cli -u $CACHE_REDIS_URL del
+
+# When the namespace owns its own logical DB index — instant.
+redis-cli -u $CACHE_REDIS_URL -n 2 FLUSHDB
+```
+
+Replace `gliner_pii` with `llm` or `privacy_filter` for the matching
+detector. Flushing is safe at runtime — affected detectors will see
+fresh misses and recompute from the current model / prompt.
 
 ### Redis backend: stats asymmetry
 
@@ -364,10 +437,18 @@ adds boundary-spanning false positives without amortization upside.
 
 - **Mutually exclusive with the result cache.** A merged blob is
   unique per request by construction (the new user message is
-  always different), so `InMemoryDetectionCache` would 100% miss.
-  Setting both `LLM_INPUT_MODE=merged` AND `LLM_CACHE_MAX_SIZE>0`
-  logs a warning at boot; the cache is bypassed. Pick one
-  optimization per detector.
+  always different), so the cache is 100% miss in merged mode and
+  entries only consume storage. Both backends are affected:
+  - Memory backend: setting `LLM_INPUT_MODE=merged` AND
+    `LLM_CACHE_MAX_SIZE>0` fills the LRU with one-shot entries that
+    immediately compete for the cap.
+  - Redis backend: setting `LLM_INPUT_MODE=merged` AND
+    `LLM_CACHE_BACKEND=redis` populates Redis with one-shot entries
+    until TTL evicts them; Redis-side `maxmemory` is the only bound.
+
+  Either combination logs a warning at boot. Pick one optimization
+  per detector — set `*_INPUT_MODE=per_text` to use the cache, or
+  set `*_CACHE_BACKEND=memory` + `*_CACHE_MAX_SIZE=0` to disable it.
 - **Failure mode worsens.** Today one LLM call failing only
   loses detection for one text; under `fail_closed=False` the
   others still get coverage. Merged, a single bad response loses

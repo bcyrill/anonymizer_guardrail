@@ -641,3 +641,147 @@ def test_factory_redis_random_salt_when_unset(monkeypatch) -> None:
     assert c1._salt == c2._salt
     # And the resolved salt is 16 bytes (the documented random size).
     assert len(c1._salt) == 16
+
+
+# ── Pinning contracts surfaced in code review ───────────────────────────
+
+
+async def test_match_with_unknown_entity_type_round_trips_via_normalization(
+    cache: RedisDetectionCache,
+) -> None:
+    """A Match stored under an unknown entity_type is normalised to
+    "OTHER" by `Match.__post_init__`. The JSON serialisation writes the
+    *normalised* value, so deserialisation also reads "OTHER" — no
+    surprise mismatch where wire and constructor disagree. Pin the
+    invariant so a future refactor that drops normalisation in one path
+    but keeps it in the other (or adds a new normalisation) doesn't
+    silently rot."""
+    async def compute() -> list[Match]:
+        # entity_type=BOGUS gets normalised to OTHER on construction.
+        m = Match(text="alice", entity_type="BOGUS_NOT_IN_ENUM")
+        assert m.entity_type == "OTHER", "sanity check: normalisation fired"
+        return [m]
+
+    r1 = await cache.get_or_compute("k", compute)
+    assert r1[0].entity_type == "OTHER"
+    # Read back from Redis — should still be OTHER, no surprise re-mapping.
+    r2 = await cache.get_or_compute("k", compute)
+    assert r2[0].entity_type == "OTHER"
+    assert r2[0].text == "alice"
+
+
+def test_redis_key_deterministic_across_instances() -> None:
+    """Two RedisDetectionCache instances with identical (namespace,
+    salt) MUST produce the same digest for the same input — that's
+    what makes multi-replica cache hits work. Implicitly covered by
+    `test_namespace_isolation_across_detectors` (different namespaces
+    differ) and `test_salt_changes_invalidate_cache_keys` (different
+    salts differ); pin the positive direction explicitly."""
+    import fakeredis.aioredis as fakeredis
+
+    fake_client_1 = fakeredis.FakeRedis(decode_responses=True)
+    fake_client_2 = fakeredis.FakeRedis(decode_responses=True)
+    with patch("redis.asyncio.from_url", return_value=fake_client_1):
+        c1 = RedisDetectionCache(
+            namespace="llm", url="redis://fake/0",
+            ttl_s=60, salt=b"shared",
+        )
+    with patch("redis.asyncio.from_url", return_value=fake_client_2):
+        c2 = RedisDetectionCache(
+            namespace="llm", url="redis://fake/0",
+            ttl_s=60, salt=b"shared",
+        )
+
+    # Same input, same digest — independent of which instance hashed it.
+    assert c1._redis_key("hello") == c2._redis_key("hello")
+    assert c1._redis_key(("text", "model", "prompt")) == \
+        c2._redis_key(("text", "model", "prompt"))
+
+
+async def test_aclose_is_idempotent(cache: RedisDetectionCache) -> None:
+    """Calling aclose twice must not raise. The redis-py async client
+    handles this on its side, but pin the contract — `Pipeline.aclose`
+    fires aclose with `wait_for(timeout)`, and a hung first call could
+    in principle race with a teardown second call."""
+    await cache.aclose()
+    # Second call is a no-op on a closed client — must not raise.
+    await cache.aclose()
+
+
+async def test_enabled_stays_true_under_redis_down() -> None:
+    """`enabled` reports True unconditionally on the redis backend —
+    even when GET / SET fail. The Redis-down passthrough is internal
+    to `get_or_compute`; consumers don't gate on `enabled`. Documented
+    in the cache_redis docstring; pin so a future refactor that flips
+    `enabled` to False on connection error doesn't silently break the
+    /health contract."""
+    import fakeredis.aioredis as fakeredis
+
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    async def boom(*_args, **_kwargs):
+        raise ConnectionError("simulated Redis down")
+
+    with patch("redis.asyncio.from_url", return_value=fake_client):
+        c = RedisDetectionCache(
+            namespace="llm", url="redis://fake/0",
+            ttl_s=60, salt=b"s",
+        )
+
+    c._client.get = boom  # type: ignore[method-assign]
+    c._client.set = boom  # type: ignore[method-assign]
+
+    assert c.enabled is True
+
+    async def compute() -> list[Match]:
+        return [_m("alice")]
+
+    # Run a full cycle through the passthrough.
+    result = await c.get_or_compute("k", compute)
+    assert result == [_m("alice")]
+    # Still True afterwards.
+    assert c.enabled is True
+    await c.aclose()
+
+
+async def test_set_uses_nx_to_dedupe_thundering_herd() -> None:
+    """The redis SET path uses `nx=True` so a thundering herd of N
+    concurrent identical computes only writes once. Verified by
+    pre-populating the key, then doing a get_or_compute that misses
+    via decoded-shape rejection — the second SET would normally
+    overwrite, but nx=True keeps the original (pre-populated) value."""
+    import fakeredis.aioredis as fakeredis
+
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+    with patch("redis.asyncio.from_url", return_value=fake_client):
+        c = RedisDetectionCache(
+            namespace="llm", url="redis://fake/0",
+            ttl_s=60, salt=b"s",
+        )
+
+    redis_key = c._redis_key("k")
+    # Pre-populate with a valid JSON value.
+    await fake_client.set(
+        redis_key,
+        json.dumps([{"text": "first-writer", "type": "PERSON"}]),
+        ex=60,
+    )
+
+    async def compute() -> list[Match]:
+        return [_m("would-overwrite")]
+
+    # First call hits the pre-populated entry → cache hit.
+    r1 = await c.get_or_compute("k", compute)
+    assert r1[0].text == "first-writer"
+
+    # Now poison the entry to force a miss-and-resave path. The
+    # nx=True on the resave should NOT overwrite because the poisoned
+    # key already exists.
+    await fake_client.set(redis_key, "not-json", ex=60)
+    r2 = await c.get_or_compute("k", compute)
+    assert r2[0].text == "would-overwrite"
+    # The poisoned value stays in Redis (nx=True refused to overwrite).
+    raw = await fake_client.get(redis_key)
+    assert raw == "not-json"
+
+    await c.aclose()

@@ -45,6 +45,10 @@ src/anonymizer_guardrail/        # the importable package — what ships
     spec.py                      # DetectorSpec dataclass
     launcher.py                  # LauncherSpec / ServiceSpec dataclasses
     base.py                      # Detector Protocol, Match, ENTITY_TYPES
+    cache.py                     # DetectorResultCache Protocol +
+                                 # cache-salt resolver + factory
+    cache_memory.py              # InMemoryDetectionCache (default)
+    cache_redis.py               # RedisDetectionCache (opt-in)
     regex.py                     # Each detector module owns its
     denylist.py                  # CONFIG + SPEC + LAUNCHER_SPEC +
     llm.py                       # (optionally) Unavailable error class.
@@ -53,8 +57,12 @@ src/anonymizer_guardrail/        # the importable package — what ships
   pipeline.py                    # Iterates REGISTERED_SPECS to build
   main.py                        # everything dynamic.
   config.py                      # Cross-cutting config only (vault,
-                                 # surrogate, http server). Per-detector
-                                 # config lives in the detector module.
+                                 # surrogate, http server, cache redis).
+                                 # Per-detector config lives in the
+                                 # detector module.
+  vault.py                       # VaultBackend Protocol + factory
+  vault_memory.py                # MemoryVault (default)
+  vault_redis.py                 # RedisVault (opt-in)
 
 tools/launcher/                  # dev-only, NOT in the wheel
   __main__.py                    # `python -m tools.launcher` entry
@@ -295,6 +303,15 @@ see `detector/cache.py`'s `DetectorResultCache` Protocol. The
 `__post_init__` on `DetectorSpec` validates these at module
 import; misconfiguration crashes the import that defined the
 bad spec, not the request that first hit it.
+
+If you want operators to be able to pick the redis cache backend
+for your detector, also add `cache_backend: Literal["memory",
+"redis"] = "memory"` and `cache_ttl_s: int = 600` to your
+`*Config`. These are conventional (LLM/PF/gliner all carry them)
+but not validated by `DetectorSpec` — `BaseRemoteDetector.__init__`
+forwards them to `build_detector_cache()` if present. The central
+`Config` already owns the cross-cutting `CACHE_REDIS_URL` and
+`CACHE_SALT`, so you don't need to repeat them per-detector.
 
 Optional `prepare_call_kwargs=fn` if `detect()` takes per-request
 overrides from the `Overrides` dataclass — see

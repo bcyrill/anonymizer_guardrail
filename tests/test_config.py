@@ -112,3 +112,86 @@ def test_memory_backend_does_not_require_url() -> None:
     an empty URL — only the `redis` branch demands it."""
     cfg = Config(vault_backend="memory", vault_redis_url="")
     assert cfg.vault_backend == "memory"
+
+
+# ── Detector cache cross-field validator ────────────────────────────────
+
+
+def test_cache_backend_redis_without_url_fails_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any `<DETECTOR>_CACHE_BACKEND=redis` env var requires
+    `CACHE_REDIS_URL`. Mirrors the vault validator. Pins the
+    cross-field invariant in
+    `config.py:_cache_redis_url_required_when_any_detector_picks_redis`."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("LLM_CACHE_BACKEND", "redis")
+    monkeypatch.setenv("CACHE_REDIS_URL", "")
+    with pytest.raises(ValidationError, match="CACHE_REDIS_URL"):
+        Config()
+
+
+def test_cache_backend_redis_with_url_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIVACY_FILTER_CACHE_BACKEND", "redis")
+    monkeypatch.setenv("CACHE_REDIS_URL", "redis://localhost:6379/1")
+    cfg = Config()
+    assert cfg.cache_redis_url == "redis://localhost:6379/1"
+
+
+def test_cache_backend_memory_does_not_require_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All memory backends → no URL required."""
+    monkeypatch.setenv("LLM_CACHE_BACKEND", "memory")
+    monkeypatch.setenv("CACHE_REDIS_URL", "")
+    cfg = Config()
+    assert cfg.cache_redis_url == ""
+
+
+def test_cache_validator_names_offending_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error message must name the specific env var(s) the
+    operator set, so they don't have to grep three places to find
+    which detector triggered the boot failure."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("GLINER_PII_CACHE_BACKEND", "redis")
+    monkeypatch.setenv("CACHE_REDIS_URL", "")
+    with pytest.raises(ValidationError, match="GLINER_PII_CACHE_BACKEND"):
+        Config()
+
+
+def test_cache_validator_picks_up_unknown_detector_by_convention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validator scans env vars by pattern (`*_CACHE_BACKEND=redis`),
+    not from a hardcoded detector list. A future detector that ships
+    with env_prefix=NEW_DETECTOR_ + cache_backend field will trigger
+    this validator without any edit to `config.py` — pin that
+    "convention beats configuration" property so a future contributor
+    doesn't accidentally regress to a hardcoded list."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("HYPOTHETICAL_NEW_DETECTOR_CACHE_BACKEND", "redis")
+    monkeypatch.setenv("CACHE_REDIS_URL", "")
+    with pytest.raises(
+        ValidationError, match="HYPOTHETICAL_NEW_DETECTOR_CACHE_BACKEND",
+    ):
+        Config()
+
+
+def test_cache_validator_ignores_non_redis_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only `=redis` values trigger the check. An env var matching the
+    pattern but holding `memory` (or anything else) must not demand
+    CACHE_REDIS_URL."""
+    monkeypatch.setenv("LLM_CACHE_BACKEND", "memory")
+    monkeypatch.setenv("PRIVACY_FILTER_CACHE_BACKEND", "memory")
+    monkeypatch.setenv("CACHE_REDIS_URL", "")
+    cfg = Config()  # no raise
+    assert cfg.cache_redis_url == ""

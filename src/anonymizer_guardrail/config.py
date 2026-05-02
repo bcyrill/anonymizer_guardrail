@@ -177,5 +177,51 @@ class Config(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _cache_redis_url_required_when_any_detector_picks_redis(self) -> "Config":
+        """Cross-field check: any `<DETECTOR>_CACHE_BACKEND=redis` env
+        var demands `CACHE_REDIS_URL`. Mirrors the vault validator
+        above. The factory in `detector/cache.py` re-checks at
+        construction time too (defence-in-depth — covers programmatic
+        callers that bypass the env-var path), but the Pydantic-level
+        check makes the misconfig visible to anyone running
+        `python -c "from anonymizer_guardrail.config import config"`.
+
+        Detection is by env-var-name *pattern* rather than a hardcoded
+        list of detector names. Adding a new detector that follows the
+        `<PREFIX>_CACHE_BACKEND` convention picks this up automatically
+        — same rationale as `REGISTERED_SPECS` everywhere else (one
+        detector module = one place to edit). Iterating
+        `REGISTERED_SPECS` directly would be cleaner but creates a
+        boot-time cycle: pipeline.py imports `config` BEFORE
+        `detector/`, so the detector registry doesn't exist yet when
+        this validator runs.
+
+        Trade-off: an unrelated env var matching the pattern (e.g.
+        `MY_OTHER_TOOL_CACHE_BACKEND=redis` from another application
+        sharing the environment) would false-trigger this check and
+        demand `CACHE_REDIS_URL`. The cost is a clearer error message
+        naming the offending var, which an operator can resolve by
+        either setting the URL (no harm) or unsetting the unrelated
+        var. Acceptable given the alternative is hardcoding."""
+        if self.cache_redis_url.strip():
+            return self
+        import os
+        # Sorted for deterministic error messages — os.environ
+        # iteration order isn't guaranteed across Python versions.
+        redis_picked = sorted(
+            name for name, val in os.environ.items()
+            if name.endswith("_CACHE_BACKEND")
+            and val.strip().lower() == "redis"
+        )
+        if redis_picked:
+            raise ValueError(
+                f"{', '.join(redis_picked)}=redis requires CACHE_REDIS_URL "
+                "to be set (e.g. redis://localhost:6379/1). Either set "
+                "the URL or switch the affected detector(s) to "
+                "<DETECTOR>_CACHE_BACKEND=memory."
+            )
+        return self
+
 
 config = Config()

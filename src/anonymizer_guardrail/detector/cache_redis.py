@@ -194,7 +194,15 @@ class RedisDetectionCache:
         relies on `__hash__` over the same tuple shape; `repr()` is a
         deterministic stringification of the same content. The digest
         is BLAKE2b keyed with the operator-resolved cache salt — no
-        plaintext input ever reaches Redis."""
+        plaintext input ever reaches Redis.
+
+        Invariant on `key`: detectors hand us a tuple of stable-repr
+        values (str, int, float, bool, None, frozen tuple). Don't add
+        dicts, sets, or unsorted iterables to the cache-key tuple — their
+        `repr()` ordering is implementation-dependent and would silently
+        scatter cache hits across distinct digests for the same logical
+        input. Today's three detectors (LLM/PF/gliner) all use plain
+        string tuples; this comment exists for future detector authors."""
         blob = repr(key).encode("utf-8")
         digest = hashlib.blake2b(
             blob, key=self._salt, digest_size=32,
@@ -239,7 +247,16 @@ class RedisDetectionCache:
         per cache instance — enough to surface the outage, not enough
         to flood logs during a flap. Stays at WARNING (not ERROR)
         because the detector itself is still serving requests; only
-        cache hits are degraded."""
+        cache hits are degraded.
+
+        Thread-safety: read-then-assign on `self._last_warn_at` is not
+        synchronised. The detector layer is async-only on a single
+        event loop, so concurrent calls are interleaved at await
+        boundaries — `_maybe_warn` itself does no awaits, so a single
+        invocation runs atomically from the loop's perspective. If the
+        guardrail ever moves to running detection on a thread pool
+        (today only sync FastAPI handlers do), this would need a lock.
+        """
         now = time.monotonic()
         if now - self._last_warn_at >= _WARN_INTERVAL_S:
             log.warning(
@@ -292,8 +309,16 @@ class RedisDetectionCache:
         matches = await compute()
 
         try:
+            # `nx=True` makes the SET conditional on the key being
+            # absent. Under a thundering herd on a cold key, N
+            # concurrent identical computes all reach this point with
+            # the same matches — only the first SET wins; the rest no-op
+            # without overwriting. Saves N-1 wasted Redis writes (and
+            # the matching N-1 TTL resets) for free, since all the
+            # computes converge on the same value anyway.
             await self._client.set(
-                redis_key, self._serialize(matches), ex=self._ttl_s,
+                redis_key, self._serialize(matches),
+                ex=self._ttl_s, nx=True,
             )
         except Exception as exc:  # noqa: BLE001
             # Set failed — return the freshly-computed matches anyway,

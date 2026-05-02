@@ -53,8 +53,18 @@ async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
         "gliner_pii_cache_max",
         "gliner_pii_cache_hits",
         "gliner_pii_cache_misses",
+        # Per-detector cache backend selector — string ("memory" or
+        # "redis"). Lets operators verify their `<DETECTOR>_CACHE_BACKEND`
+        # env var landed without grepping logs.
+        "llm_cache_backend",
+        "pf_cache_backend",
+        "gliner_pii_cache_backend",
     }
     assert expected_keys.issubset(s.keys())
+    # Default config keeps every detector on the memory backend.
+    assert s["llm_cache_backend"] == "memory"
+    assert s["pf_cache_backend"] == "memory"
+    assert s["gliner_pii_cache_backend"] == "memory"
     assert s["vault_size"] == 0
     assert s["llm_in_flight"] == 0
     assert s["pf_in_flight"] == 0

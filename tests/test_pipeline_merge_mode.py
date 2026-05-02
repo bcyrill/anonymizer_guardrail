@@ -316,6 +316,46 @@ def test_no_warning_when_cache_or_merge_alone(
     ]
 
 
+def test_warning_fires_for_merged_plus_redis_cache_backend(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The redis backend has no `cache_max_size` to gate on (capacity
+    is bounded by Redis-side `maxmemory`), so the existing
+    cache_max_size>0 check would miss this config. Pin that the
+    warning still fires when an operator pairs `input_mode=merged`
+    with `cache_backend=redis` — every merged blob is unique, so
+    Redis just fills up with one-shot entries until TTL evicts them."""
+    from anonymizer_guardrail import config as config_mod
+    _patch_llm_config(
+        monkeypatch,
+        input_mode="merged",
+        cache_max_size=0,         # not the trigger
+        cache_backend="redis",    # the trigger
+    )
+    # Need a non-empty CACHE_REDIS_URL for the central Pydantic
+    # validator to accept the config.
+    monkeypatch.setattr(
+        config_mod, "config",
+        config_mod.config.model_copy(
+            update={"cache_redis_url": "redis://fake/0"},
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="anonymizer.pipeline"):
+        Pipeline()
+
+    matched = [
+        r for r in caplog.records
+        if "input_mode=merged" in r.message
+        and "backend=redis" in r.message
+        and "llm" in r.message.lower()
+    ]
+    assert matched, (
+        "expected a WARNING about merged + redis backend, got: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+
 # ── Privacy-filter detector merge mode ──────────────────────────────────
 # Same dispatch contract as the LLM tests above, just driving a different
 # detector. The pipeline dispatch is detector-agnostic (reads

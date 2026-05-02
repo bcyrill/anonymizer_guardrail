@@ -216,30 +216,44 @@ class Pipeline:
         )
 
         # Surface mutually-exclusive (cache + merge) configurations as
-        # a startup warning. The cache is process-wide and only
-        # consulted by the per_text dispatch path; a detector running
-        # in merged mode never reaches the cache, so any non-zero
-        # `cache_max_size` is dead weight in that mode. Warn but don't
+        # a startup warning. Every merged blob is unique by construction
+        # (the new user message is always different), so the cache is
+        # 100% miss in merged mode and entries only consume storage.
+        # Two ways the cache is "live": memory backend with cap > 0, or
+        # the redis backend at all (it has no per-detector cap to gate
+        # on — Redis-side maxmemory is the only bound). Warn but don't
         # fail — a typo in env vars shouldn't crash the service, and
-        # the detector still runs correctly (just without the cache).
+        # the detector still runs correctly (just stores 100%-miss
+        # cache entries until they evict).
         for spec in REGISTERED_SPECS:
             mode = getattr(spec.config, "input_mode", "per_text")
             cache_max = getattr(spec.config, "cache_max_size", 0)
-            if mode == "merged" and cache_max > 0:
+            cache_backend = getattr(spec.config, "cache_backend", "memory")
+            cache_active = cache_max > 0 or cache_backend == "redis"
+            if mode == "merged" and cache_active:
+                upper = spec.name.upper()
                 log.warning(
                     "%s detector configured with input_mode=merged AND "
-                    "cache_max_size=%d. The cache is bypassed in merged "
-                    "mode — every blob is unique by construction. Set "
-                    "%s_CACHE_MAX_SIZE=0 to silence this warning, or "
-                    "switch back to input_mode=per_text to use the cache.",
-                    spec.name, cache_max, spec.name.upper(),
+                    "a live cache (backend=%s, cache_max_size=%d). "
+                    "Every merged blob is unique by construction, so "
+                    "cache entries are 100%% miss and only consume "
+                    "storage. Either switch to %s_INPUT_MODE=per_text "
+                    "to use the cache, or set %s_CACHE_BACKEND=memory "
+                    "+ %s_CACHE_MAX_SIZE=0 to silence this warning.",
+                    spec.name, cache_backend, cache_max,
+                    upper, upper, upper,
                 )
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, object]:
         """Snapshot of pipeline-internal counters for the /health probe.
-        All reads are cheap and lock-free."""
+        All reads are cheap and lock-free.
+
+        Mostly `int` values, plus per-detector `<prefix>_cache_backend`
+        (`"memory"` / `"redis"`) string fields so operators can verify
+        their backend selection landed without consulting logs.
+        """
         cache_size, cache_max = self._surrogates.cache_stats()
-        out: dict[str, int] = {
+        out: dict[str, object] = {
             "vault_size": self._vault.size(),
             "surrogate_cache_size": cache_size,
             "surrogate_cache_max": cache_max,
@@ -284,6 +298,13 @@ class Pipeline:
             out[f"{spec.stats_prefix}_cache_max"]    = cs["max"]
             out[f"{spec.stats_prefix}_cache_hits"]   = cs["hits"]
             out[f"{spec.stats_prefix}_cache_misses"] = cs["misses"]
+            # `<prefix>_cache_backend` lets operators confirm their
+            # `<DETECTOR>_CACHE_BACKEND` env var landed without grepping
+            # logs. Read live from spec.config — same pattern as the
+            # other config-derived fields above.
+            out[f"{spec.stats_prefix}_cache_backend"] = (
+                getattr(spec.config, "cache_backend", "memory")
+            )
         return out
 
     @property

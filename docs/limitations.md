@@ -85,13 +85,29 @@ doesn't expose yet. Tracked in
 [`TASKS.md` → Prometheus-style /metrics endpoint](../TASKS.md#prometheus-style-metrics-endpoint);
 deferred until a metrics scraper is actually deployed in front of it.
 
-## In-memory only
+## In-memory by default
 
-Both stores ([vault](vault.md) and
-[surrogate cache](surrogates.md#surrogate-cache)) live in process
-memory. No persistence, no shared state. This keeps the guardrail
-zero-dependency and easy to deploy, at the cost of the limitations
-above. The detector result cache (`detector/cache.py`) follows the
-same in-memory-by-default pattern; cross-replica / persistent
-variants are tracked in
-[`TASKS.md` → Redis-backed detector result cache](../TASKS.md#redis-backed-detector-result-cache).
+Three internal stores back the guardrail's stateful behaviour. Default
+backends are all process-local; opt-in Redis backends ship for the two
+that need cross-replica or restart-persistent state:
+
+- [Vault](vault.md) — `MemoryVault` (default) or `RedisVault` (opt-in
+  via `VAULT_BACKEND=redis` + `VAULT_REDIS_URL`). Required for
+  multi-replica deployments where pre_call and post_call may land on
+  different replicas behind a load balancer.
+- [Detector result cache](operations.md#detector-result-caching) —
+  `InMemoryDetectionCache` (default) or `RedisDetectionCache` (opt-in
+  per detector via `<DETECTOR>_CACHE_BACKEND=redis` +
+  `CACHE_REDIS_URL`). Useful for multi-replica cache hits and
+  cache survival across guardrail restarts.
+- [Surrogate cache](surrogates.md#surrogate-cache) — process-local
+  only. Cross-replica surrogate consistency is achieved via a shared
+  `SURROGATE_SALT` (deterministic seeded BLAKE2b — every replica
+  derives the same surrogate without sharing state), not via a
+  shared cache. A Redis-backed surrogate cache would buy memoization
+  speedup, not correctness, so it isn't on the roadmap.
+
+Default backends keep single-replica deployments zero-dependency. The
+Redis-backed alternatives are bundled in the default container image
+(`pip install ".[vault-redis,cache-redis]"`) so flipping the env var
+doesn't require a rebuild.
