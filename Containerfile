@@ -1,10 +1,20 @@
 # syntax=docker/dockerfile:1.7
 # Containerfile for anonymizer-guardrail
 #
-# Single slim image — no ML deps. Privacy-filter and gliner-pii ship
-# as standalone services (see services/{privacy_filter,gliner_pii}/);
+# Single image — no ML deps. Privacy-filter and gliner-pii ship as
+# standalone services (see services/{privacy_filter,gliner_pii}/);
 # the guardrail talks to them over HTTP via PRIVACY_FILTER_URL /
 # GLINER_PII_URL.
+#
+# Two optional extras are bundled by default because they're tiny
+# and let operators flip a switch at runtime without rebuilding:
+#   * `denylist-aho`  → pyahocorasick C-extension (~600 KB) for the
+#                        DENYLIST_BACKEND=aho path.
+#   * `vault-redis`   → redis-py (~3 MB pure Python) for the
+#                        VAULT_BACKEND=redis path used in
+#                        multi-replica deployments.
+# Direct-pip-install users can still opt out by installing the
+# package without these extras.
 #
 # Build:
 #   podman build -t anonymizer-guardrail:latest -f Containerfile .
@@ -57,11 +67,17 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-# `denylist-aho` (pyahocorasick) is included unconditionally — it's a
-# ~600 KB C extension with prebuilt wheels for every platform that
-# matters, and including it lets operators flip DENYLIST_BACKEND=aho
-# at runtime without rebuilding the image. Direct `pip install` users
-# can still opt out via the regex backend (default) and skip the extra.
+# `denylist-aho` (pyahocorasick) and `vault-redis` (redis-py) are
+# both included unconditionally because they're tiny:
+#   * pyahocorasick is a ~600 KB C extension with prebuilt wheels
+#     for every platform that matters; lets DENYLIST_BACKEND=aho
+#     work without a rebuild.
+#   * redis-py is ~3 MB of pure Python with zero transitive deps;
+#     lets VAULT_BACKEND=redis work for multi-replica deployments
+#     without a rebuild. Lazy-imported in `vault.build_vault()` so
+#     memory-backend operators don't pay the import cost at
+#     runtime.
+# Direct `pip install` users can opt out by skipping the extras.
 #
 # `--mount=type=cache,target=/root/.cache/pip` keeps the wheel cache
 # across builds (rebuilds with the same pyproject.toml are nearly
@@ -69,7 +85,7 @@ COPY src/ ./src/
 # The mount IS the cache, and the wheels live in the cache mount,
 # not in the image layer.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install ".[denylist-aho]"
+    pip install ".[denylist-aho,vault-redis]"
 
 RUN chown -R app:app /app
 
