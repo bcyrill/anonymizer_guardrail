@@ -1,5 +1,5 @@
 """
-Reusable per-detector result cache.
+Reusable per-detector result cache — abstract surface.
 
 Slow detectors (LLM, remote gliner, remote privacy filter) repeat work
 in multi-turn conversations because each LiteLLM call replays the full
@@ -8,10 +8,12 @@ text + the overrides that affect output skips the re-detection on
 already-seen turns.
 
 Default off — operators opt in per detector via that detector's
-*_CACHE_MAX_SIZE env var. Caveat: caching a nondeterministic detector
-(LLM) freezes the first-seen result for a given input until eviction;
-turn-to-turn stability beats per-turn re-classification for chat
-workloads, but it is a behaviour change worth surfacing.
+*_CACHE_MAX_SIZE env var (memory backend) or by setting
+`<DETECTOR>_CACHE_BACKEND=redis` (redis backend). Caveat: caching a
+nondeterministic detector (LLM) freezes the first-seen result for a
+given input until eviction; turn-to-turn stability beats per-turn
+re-classification for chat workloads, but it is a behaviour change
+worth surfacing.
 
 Sizing note: pair with SURROGATE_CACHE_MAX_SIZE. A detector cache
 hit that finds a stale surrogate-cache miss can re-derive a different
@@ -20,29 +22,38 @@ cross-turn surrogate consistency. Operators enabling detector
 caching should keep the surrogate cache comfortably above the
 expected unique-entity count.
 
-# Backends
+This module owns the *interface* (`DetectorResultCache` Protocol),
+the *cross-cutting cache-salt resolution* used by the redis backend,
+and the *selection* (`build_detector_cache()` factory). Concrete
+implementations each live in their own module:
 
-`DetectorResultCache` is a Protocol the detector layer codes
-against; concrete backends plug in below it. One backend ships
-today: `InMemoryDetectionCache`, an in-process LRU. A
-Redis-backed implementation is a candidate for when horizontal
-scaling lands (see TASKS.md → Multi-replica support); the
-detector code does not change when that arrives — only the
-factory that constructs the cache instance.
+  * `cache_memory.py` → `InMemoryDetectionCache` (default;
+    process-local, zero deps).
+  * `cache_redis.py` → `RedisDetectionCache` (opt-in via
+    `<DETECTOR>_CACHE_BACKEND=redis`; shared store for multi-replica
+    deployments and restart-persistence). Imports `redis-py` only
+    when the backend is actually selected.
+
+Selection happens in `build_detector_cache()` based on each detector's
+own `cache_backend` config knob. The factory is the only place that
+imports a concrete backend; detectors reference the Protocol type so
+swapping doesn't ripple across the codebase.
+
+Test layout mirrors this split: `tests/test_detector_cache.py` holds
+the in-memory backend tests, `tests/test_detector_cache_redis.py`
+holds the redis-specific tests + cross-backend factory tests.
 """
 
 from __future__ import annotations
 
-import threading
-from collections import OrderedDict
-from typing import Awaitable, Callable, Hashable, Protocol, runtime_checkable
+import logging
+import secrets
+from typing import Awaitable, Callable, Hashable, Literal, Protocol, runtime_checkable
 
 from .base import Match
 
 
-# Cached values are tuples so the cache can hand them back without
-# defensive copying on every hit (callers receive a list — see get_or_compute).
-_CacheValue = tuple[Match, ...]
+log = logging.getLogger("anonymizer.detector.cache")
 
 
 @runtime_checkable
@@ -87,95 +98,123 @@ class DetectorResultCache(Protocol):
         ones today."""
         ...
 
+    async def aclose(self) -> None:
+        """Drain backend-side resources (e.g. Redis connection pool).
+        Wired to `Pipeline.aclose` via the detector's `aclose()` so
+        FastAPI shutdown closes Redis cleanly. No-op for in-memory
+        backends; required by the Protocol so consumers don't need
+        a `hasattr` guard."""
+        ...
 
-class InMemoryDetectionCache:
-    """Process-wide LRU cache of detector-result tuples, keyed by an
-    arbitrary hashable derived per-detector from (text, relevant overrides).
 
-    Thread-safe via a single lock — same shape as `SurrogateGenerator`'s
-    cache. Sub-millisecond hold time, so contention under realistic
-    concurrency is invisible.
+# ── Salt resolution ──────────────────────────────────────────────────────
+# Mirrors `surrogate._resolve_salt`: empty operator value → fresh random
+# bytes, non-empty → literal UTF-8. Truncated to BLAKE2b's max key length.
+# Resolved once per process and cached so multi-detector deployments
+# share the same salt without each reading `secrets.token_bytes`
+# independently.
+#
+# Lives here (not in cache_redis.py) because it's cross-cutting — used
+# only by the redis backend today, but conceptually a property of the
+# cache subsystem rather than any one backend, and the factory below
+# wires it in. Keeping it here also lets test code reach
+# `_reset_resolved_salt_for_tests` without importing the redis module.
+_MAX_BLAKE2B_KEY_LEN = 64
+_resolved_salt: bytes | None = None
 
-    Disabled state: when `max_size <= 0` the instance is a no-op
-    (`get_or_compute` always calls through, `stats` reports zeros).
-    Detectors construct one unconditionally in their __init__ and the
-    `enabled` short-circuit avoids paying for storage churn when the
-    cap is zero.
 
-    Process-local: not shared across replicas. See
-    `DetectorResultCache` docstring + TASKS.md for the multi-replica
-    plan if/when that lands.
+def _resolve_cache_salt(raw: str) -> bytes:
+    """Operator-provided cache salt → bytes for BLAKE2b's `key`.
+
+    Empty `raw` → 16 random bytes from `secrets.token_bytes` (logged
+    once at INFO so operators see the rotation). Non-empty → the
+    literal string, UTF-8-encoded and truncated to 64 bytes (BLAKE2b's
+    max key length). Cached at module level so subsequent factory
+    calls within the process see the same value — without that, every
+    detector would generate a different random salt and Redis cache
+    keys wouldn't collide across detectors deliberately, but they
+    also wouldn't be reproducible after a process restart for
+    diagnostic purposes."""
+    global _resolved_salt
+    if _resolved_salt is not None:
+        return _resolved_salt
+    if raw:
+        _resolved_salt = raw.encode("utf-8")[:_MAX_BLAKE2B_KEY_LEN]
+    else:
+        _resolved_salt = secrets.token_bytes(16)
+        log.info(
+            "CACHE_SALT unset — generated a random 16-byte salt for "
+            "this process. Set CACHE_SALT to a fixed value for "
+            "multi-replica cache hits or restart-persistent caching."
+        )
+    return _resolved_salt
+
+
+def _reset_resolved_salt_for_tests() -> None:
+    """Test-only hook: clears the cached salt so tests that
+    monkeypatch `CACHE_SALT` see fresh resolution. Not part of the
+    public API."""
+    global _resolved_salt
+    _resolved_salt = None
+
+
+# ── Factory ──────────────────────────────────────────────────────────────
+
+
+def build_detector_cache(
+    *,
+    namespace: str,
+    backend: Literal["memory", "redis"],
+    cache_max_size: int,
+    cache_ttl_s: int,
+) -> DetectorResultCache:
+    """Construct the configured cache backend for one detector.
+
+    Reads cross-cutting fields (`cache_redis_url`, `cache_salt`) from
+    the central config when `backend="redis"`; per-detector knobs
+    (`cache_max_size`, `cache_ttl_s`) come in as kwargs. Detectors
+    don't need to know which backend is in play — they hand a
+    hashable to `get_or_compute` and the backend takes it from there.
+
+    `namespace` is the detector's `spec.name` — used as the key prefix
+    for the redis backend (`cache:<namespace>:<digest>`) so multiple
+    detectors can share a Redis instance without colliding.
+
+    Imports are deferred inside each branch — same pattern as
+    `vault.build_vault()`. The redis import is the load-bearing one
+    (defers `redis-py` for memory-only operators); the memory import
+    is lazy too for symmetry, even though it has no extra cost.
     """
+    if backend == "memory":
+        from .cache_memory import InMemoryDetectionCache
+        return InMemoryDetectionCache(cache_max_size)
+    if backend == "redis":
+        # Local imports defer the redis-py + central-config touch until
+        # we know we need them. Tests that monkeypatch `cache_mod.config`
+        # see the patched value because we re-resolve here on every
+        # detector __init__.
+        from ..config import config
+        from .cache_redis import RedisDetectionCache
 
-    def __init__(self, max_size: int) -> None:
-        self._max_size = max(0, int(max_size))
-        self._cache: OrderedDict[Hashable, _CacheValue] = OrderedDict()
-        self._lock = threading.Lock()
-        # Counters are plain ints — atomic to read/increment under the
-        # GIL, no extra lock needed beyond the cache lock that already
-        # serialises hit/miss bookkeeping.
-        self._hits = 0
-        self._misses = 0
-
-    @property
-    def enabled(self) -> bool:
-        return self._max_size > 0
-
-    async def get_or_compute(
-        self,
-        key: Hashable,
-        compute: Callable[[], Awaitable[list[Match]]],
-    ) -> list[Match]:
-        """Return cached matches for `key`, or run `compute()` and cache
-        its result. The returned list is a fresh copy on every hit —
-        the cache keeps an immutable tuple internally so callers can
-        mutate the returned list without poisoning the cache.
-
-        When the cache is disabled (`max_size <= 0`) this is a thin
-        passthrough — same async signature, no bookkeeping.
-
-        The compute is run OUTSIDE the lock. Holding the lock across an
-        LLM call (hundreds of ms) would serialise every cache miss and
-        defeat the per-detector concurrency cap. Trade-off: a thundering
-        herd on a cold key (N concurrent identical inputs all do the
-        work, last writer wins). Acceptable — duplicate concurrent
-        inputs are rare in detection workloads, and the result is the
-        same regardless of who wins.
-        """
-        if not self.enabled:
-            return await compute()
-
-        with self._lock:
-            cached = self._cache.get(key)
-            if cached is not None:
-                self._cache.move_to_end(key)
-                self._hits += 1
-                return list(cached)
-            self._misses += 1
-
-        matches = await compute()
-
-        with self._lock:
-            self._cache[key] = tuple(matches)
-            self._cache.move_to_end(key)
-            while len(self._cache) > self._max_size:
-                self._cache.popitem(last=False)
-        return matches
-
-    def stats(self) -> dict[str, int]:
-        """Snapshot of cache counters for the /health probe.
-
-        `len()` on a CPython dict is atomic and the int counters are
-        read under the GIL, so the snapshot is lock-free. Values may
-        be momentarily inconsistent across a concurrent put — that's
-        acceptable for a stats endpoint.
-        """
-        return {
-            "size": len(self._cache),
-            "max": self._max_size,
-            "hits": self._hits,
-            "misses": self._misses,
-        }
+        if not config.cache_redis_url:
+            raise RuntimeError(
+                f"<DETECTOR>_CACHE_BACKEND=redis (namespace={namespace!r}) "
+                "requires CACHE_REDIS_URL to be set. Either set the URL "
+                "or switch to <DETECTOR>_CACHE_BACKEND=memory."
+            )
+        return RedisDetectionCache(
+            namespace=namespace,
+            url=config.cache_redis_url,
+            ttl_s=cache_ttl_s,
+            salt=_resolve_cache_salt(config.cache_salt),
+        )
+    raise RuntimeError(
+        f"Unknown cache backend={backend!r} for namespace={namespace!r}. "
+        "Allowed: memory, redis."
+    )
 
 
-__all__ = ["DetectorResultCache", "InMemoryDetectionCache"]
+__all__ = [
+    "DetectorResultCache",
+    "build_detector_cache",
+]

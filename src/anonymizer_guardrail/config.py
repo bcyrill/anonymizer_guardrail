@@ -97,6 +97,29 @@ class Config(BaseSettings):
     # it can brute-force low-entropy entities like IPs and phone numbers).
     surrogate_salt: str = ""
 
+    # ── Detector result cache (cross-cutting) ──────────────────────────────────
+    # Redis URL for the cache backend, shared across every detector that
+    # opts into `<DETECTOR>_CACHE_BACKEND=redis`. ONE URL — operators don't
+    # want N Redis instances to deploy and monitor just because we have N
+    # detectors. To shard across logical DBs, use the existing `/<n>` URL
+    # suffix (`redis://host/0` for LLM, `redis://host/1` for gliner, etc.).
+    # Required when any detector selects `cache_backend=redis`; ignored
+    # otherwise. Distinct from `vault_redis_url` so vault and detector
+    # cache can target different Redis instances if operators want
+    # (different durability / availability requirements).
+    cache_redis_url: str = ""
+    # Keying material mixed into the BLAKE2b digest used for Redis cache
+    # keys. Empty (the default) → a fresh random salt is generated each
+    # process start (logged once at INFO). Set to a fixed value for:
+    #   * Multi-replica cache hits across replicas (every replica must
+    #     hash the same key the same way).
+    #   * Cache survival across process restarts (otherwise the digest
+    #     space rotates and old entries become unreachable; Redis-side
+    #     TTL still evicts them).
+    # Independent from `surrogate_salt`. They could share a value, but
+    # rotating one shouldn't force a rotation on the other.
+    cache_salt: str = ""
+
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     # Backend selection. "memory" (default) is process-local — fine
     # for single-replica deployments. "redis" routes the vault through

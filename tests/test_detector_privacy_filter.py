@@ -408,3 +408,69 @@ async def test_pf_cache_hit_returns_independent_list(
 
     r2 = await detector.detect("Email alice@example.com please")
     assert [m.text for m in r2] == ["alice@example.com"]
+
+
+# ── Redis-backed cache integration ──────────────────────────────────────
+# Same shape as the LLM detector's redis tests — verifies the
+# BaseRemoteDetector → factory → RedisDetectionCache wiring is intact
+# for the PF detector's namespace.
+
+
+def _redis_cached_pf_detector(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis_client,
+) -> RemotePrivacyFilterDetector:
+    from anonymizer_guardrail import config as config_mod
+    from anonymizer_guardrail.detector import cache as cache_mod
+
+    monkeypatch.setattr(
+        pf_mod, "CONFIG",
+        _fake_config(cache_backend="redis", cache_ttl_s=60),
+    )
+    monkeypatch.setattr(
+        config_mod, "config",
+        config_mod.config.model_copy(update={
+            "cache_redis_url": "redis://fake/0",
+            "cache_salt": "test-salt",
+        }),
+    )
+    cache_mod._reset_resolved_salt_for_tests()
+
+    from unittest.mock import patch
+    with patch("redis.asyncio.from_url", return_value=fake_redis_client):
+        return RemotePrivacyFilterDetector(
+            url="http://privacy-filter-service:8001", timeout_s=5,
+        )
+
+
+async def test_pf_redis_cache_hit_skips_http_call(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """PF detector with redis backend: identical inputs go to HTTP
+    once, subsequent calls hit redis. Namespace is `privacy_filter`."""
+    import fakeredis.aioredis as fakeredis
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    detector = _redis_cached_pf_detector(monkeypatch, fake_client)
+    mock_post.return_value = _ok_response([
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+    ])
+
+    r1 = await detector.detect("Email alice@example.com please")
+    r2 = await detector.detect("Email alice@example.com please")
+    r3 = await detector.detect("Email alice@example.com please")
+
+    assert mock_post.call_count == 1
+    assert [m.text for m in r1] == ["alice@example.com"]
+    assert [m.text for m in r2] == ["alice@example.com"]
+    assert [m.text for m in r3] == ["alice@example.com"]
+    s = detector.cache_stats()
+    assert s["hits"] == 2
+    assert s["misses"] == 1
+
+    # PF namespace, distinct from the LLM and gliner ones.
+    keys = [k async for k in fake_client.scan_iter() if k.startswith("cache:")]
+    assert all(k.startswith("cache:privacy_filter:") for k in keys)
+    assert len(keys) == 1
+    await detector.aclose()

@@ -561,3 +561,85 @@ async def test_gliner_cache_eviction_recomputes(
 
     assert mock_post.call_count == 3
     assert detector.cache_stats()["misses"] == 3
+
+
+# ── Redis-backed cache integration ──────────────────────────────────────
+# Same shape as the LLM and PF redis-cache tests — verifies the
+# BaseRemoteDetector → factory → RedisDetectionCache wiring is intact
+# for the gliner_pii namespace + that labels/threshold continue to
+# fragment the cache key correctly under the redis backend.
+
+
+def _redis_cached_gliner_detector(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis_client,
+) -> RemoteGlinerPIIDetector:
+    from anonymizer_guardrail import config as config_mod
+    from anonymizer_guardrail.detector import cache as cache_mod
+
+    monkeypatch.setattr(
+        gp_mod, "CONFIG",
+        _fake_config(cache_backend="redis", cache_ttl_s=60),
+    )
+    monkeypatch.setattr(
+        config_mod, "config",
+        config_mod.config.model_copy(update={
+            "cache_redis_url": "redis://fake/0",
+            "cache_salt": "test-salt",
+        }),
+    )
+    cache_mod._reset_resolved_salt_for_tests()
+
+    from unittest.mock import patch
+    with patch("redis.asyncio.from_url", return_value=fake_redis_client):
+        return RemoteGlinerPIIDetector(
+            url="http://gliner-pii-service:8002", timeout_s=5,
+        )
+
+
+async def test_gliner_redis_cache_hit_skips_http_call(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Gliner detector with redis backend: identical inputs go to
+    HTTP once, subsequent calls hit redis. Namespace is `gliner_pii`."""
+    import fakeredis.aioredis as fakeredis
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    detector = _redis_cached_gliner_detector(monkeypatch, fake_client)
+    mock_post.return_value = _ok_response([
+        {"label": "email", "text": "alice@example.com"},
+    ])
+
+    r1 = await detector.detect("Email alice@example.com")
+    r2 = await detector.detect("Email alice@example.com")
+
+    assert mock_post.call_count == 1
+    assert [m.text for m in r1] == ["alice@example.com"]
+    assert [m.text for m in r2] == ["alice@example.com"]
+
+    keys = [k async for k in fake_client.scan_iter() if k.startswith("cache:")]
+    assert all(k.startswith("cache:gliner_pii:") for k in keys)
+    assert len(keys) == 1
+    await detector.aclose()
+
+
+async def test_gliner_redis_cache_keys_separate_per_labels(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Gliner's cache key includes (text, labels, threshold) — so
+    different label sets occupy different redis entries even on the
+    same input. Pin the contract so a future refactor that sorts
+    labels (changing the digest) doesn't silently change behaviour."""
+    import fakeredis.aioredis as fakeredis
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    detector = _redis_cached_gliner_detector(monkeypatch, fake_client)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", labels=["person"])
+    await detector.detect("hello", labels=["person", "email"])
+
+    assert mock_post.call_count == 2
+    keys = [k async for k in fake_client.scan_iter() if k.startswith("cache:gliner_pii:")]
+    assert len(keys) == 2
+    await detector.aclose()

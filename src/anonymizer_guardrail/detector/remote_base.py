@@ -34,12 +34,12 @@ explicitly. Inheritance is the lighter weight here.
 
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Hashable
+from typing import Awaitable, Callable, Hashable, Literal
 
 import httpx
 
 from .base import Match
-from .cache import DetectorResultCache, InMemoryDetectionCache
+from .cache import DetectorResultCache, build_detector_cache
 
 
 class BaseRemoteDetector:
@@ -59,14 +59,26 @@ class BaseRemoteDetector:
 
     name: str  # Set by subclasses to their DETECTOR_MODE token.
 
-    def __init__(self, *, timeout_s: int, cache_max_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_s: int,
+        cache_max_size: int,
+        cache_backend: Literal["memory", "redis"] = "memory",
+        cache_ttl_s: int = 600,
+    ) -> None:
         self.timeout_s = timeout_s
         self._client = httpx.AsyncClient(timeout=timeout_s)
-        # Annotated as the Protocol so a future swap to a different
-        # cache backend (e.g. a Redis-backed implementation when
-        # multi-replica lands — see TASKS.md) is a one-line factory
-        # change here, with no edits to the subclasses.
-        self._cache: DetectorResultCache = InMemoryDetectionCache(cache_max_size)
+        # Annotated as the Protocol so the per-detector backend swap
+        # (memory → redis) is invisible to subclasses. The factory
+        # reads central-config fields (CACHE_REDIS_URL, CACHE_SALT)
+        # itself when `cache_backend=redis`.
+        self._cache: DetectorResultCache = build_detector_cache(
+            namespace=self.name,
+            backend=cache_backend,
+            cache_max_size=cache_max_size,
+            cache_ttl_s=cache_ttl_s,
+        )
 
     async def _detect_via_cache(
         self,
@@ -92,10 +104,14 @@ class BaseRemoteDetector:
         return self._cache.stats()
 
     async def aclose(self) -> None:
-        """Drain the httpx connection pool. Wired to `Pipeline.aclose()`
-        which fires on FastAPI shutdown so the connection pool drains
-        cleanly across all configured remote detectors."""
+        """Drain the httpx connection pool AND the cache backend.
+        Wired to `Pipeline.aclose()` which fires on FastAPI shutdown
+        so external resources (httpx pool, redis pool when the cache
+        backend is redis) drain cleanly across all configured remote
+        detectors. The in-memory cache's `aclose` is a no-op so the
+        call shape is uniform regardless of backend."""
         await self._client.aclose()
+        await self._cache.aclose()
 
 
 __all__ = ["BaseRemoteDetector"]

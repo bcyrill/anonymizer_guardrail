@@ -44,6 +44,21 @@ docs:
 | `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. Applies to both backends. See [vault](vault.md). |
 | `VAULT_MAX_ENTRIES` | `10000` | Memory backend only. Hard cap; LRU-evicted on overflow. Redis bounds via its own `maxmemory` policy. Floor of 1 protects against typos. |
 
+## Detector cache (cross-cutting)
+
+Per-detector cache backends and capacity knobs live in each detector's
+own page (see `<DETECTOR>_CACHE_*` rows in
+[LLM detector](detectors/llm.md#configuration),
+[privacy filter](detectors/privacy-filter.md#configuration),
+[GLiNER PII](detectors/gliner-pii.md#configuration)). The two
+cross-cutting fields below are shared across every detector that
+selects `<DETECTOR>_CACHE_BACKEND=redis`:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CACHE_REDIS_URL` | *(empty)* | Required when any detector picks `cache_backend=redis`. Format: `redis://[user:pass@]host:port/db`. Distinct from `VAULT_REDIS_URL` so vault and cache can target different Redis instances. Install `pip install "anonymizer-guardrail[cache-redis]"` to get the redis dep. |
+| `CACHE_SALT` | *(empty → random per process)* | Secret keying material for the BLAKE2b digest used in Redis cache keys. Closes a confirmation-attack oracle on Redis read access — see [operations → Redis backend: why the cache key is salted](operations.md#redis-backend-why-the-cache-key-is-salted). Empty → fresh 16 random bytes generated at process start (logged once). Set to a fixed value for multi-replica cache hits or cache survival across process restarts. Distinct from `SURROGATE_SALT` so they can be rotated independently. |
+
 ## Capping detector concurrency
 
 Each remote / model-backed detector has its own semaphore set via

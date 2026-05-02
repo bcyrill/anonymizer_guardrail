@@ -599,3 +599,117 @@ async def test_cache_eviction_recomputes(
     assert s["misses"] == 3
     assert s["hits"] == 0
     assert s["size"] == 1
+
+
+# ── Redis-backed cache integration ──────────────────────────────────────
+# End-to-end: LLM detector with `cache_backend=redis` + a fakeredis
+# instance. Verifies the BaseRemoteDetector → factory → RedisDetectionCache
+# wiring is intact: a hit on the second call skips the HTTP layer, the
+# /health-shaped stats reflect the redis-backend asymmetry (size=0,
+# max=0), and the `aclose()` chain drains the redis connection pool.
+
+
+def _redis_cached_detector(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis_client,
+) -> LLMDetector:
+    """Configure the LLM detector to use the redis cache backend
+    against a fakeredis instance. The factory reads CACHE_REDIS_URL +
+    CACHE_SALT from the central config, so we patch both."""
+    from anonymizer_guardrail import config as config_mod
+    from anonymizer_guardrail.detector import cache as cache_mod
+
+    monkeypatch.setattr(
+        llm_mod, "CONFIG",
+        _fake_config(cache_backend="redis", cache_ttl_s=60, cache_max_size=0),
+    )
+    monkeypatch.setattr(
+        config_mod, "config",
+        config_mod.config.model_copy(update={
+            "cache_redis_url": "redis://fake/0",
+            "cache_salt": "test-salt",
+        }),
+    )
+    cache_mod._reset_resolved_salt_for_tests()
+
+    from unittest.mock import patch
+    with patch("redis.asyncio.from_url", return_value=fake_redis_client):
+        return LLMDetector(
+            api_base="http://test", api_key="", model="test", timeout_s=5
+        )
+
+
+async def test_redis_cache_hit_skips_http_call(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """LLM detector with redis backend: identical inputs go to HTTP
+    once, subsequent calls hit redis."""
+    import fakeredis.aioredis as fakeredis
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    detector = _redis_cached_detector(monkeypatch, fake_client)
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    r1 = await detector.detect("hello alice")
+    r2 = await detector.detect("hello alice")
+    r3 = await detector.detect("hello alice")
+
+    assert mock_post.call_count == 1
+    assert [m.text for m in r1] == ["alice"]
+    assert [m.text for m in r2] == ["alice"]
+    assert [m.text for m in r3] == ["alice"]
+    s = detector.cache_stats()
+    assert s["hits"] == 2
+    assert s["misses"] == 1
+    # Redis backend asymmetry — size and max are placeholders.
+    assert s["size"] == 0
+    assert s["max"] == 0
+    await detector.aclose()
+
+
+async def test_redis_cache_keys_separate_per_model_override(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Cache key includes (text, model, prompt_name) — different
+    `model` overrides occupy different redis keys. Same contract as
+    the in-memory backend."""
+    import fakeredis.aioredis as fakeredis
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    detector = _redis_cached_detector(monkeypatch, fake_client)
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    await detector.detect("hello alice")                         # default model
+    await detector.detect("hello alice", model="other-model")    # different slot
+    await detector.detect("hello alice", model="other-model")    # hits second
+
+    assert mock_post.call_count == 2
+    # Two distinct redis keys.
+    keys = [k async for k in fake_client.scan_iter() if k.startswith("cache:llm:")]
+    assert len(keys) == 2
+    await detector.aclose()
+
+
+async def test_redis_cache_aclose_drains_redis_pool(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """`detector.aclose()` chains through to the cache's aclose()
+    so the redis connection pool drains on FastAPI shutdown."""
+    import fakeredis.aioredis as fakeredis
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+
+    detector = _redis_cached_detector(monkeypatch, fake_client)
+    mock_post.return_value = _ok_response([])
+    await detector.detect("warmup")  # creates the connection
+
+    # Track aclose invocation on the underlying redis client.
+    aclose_called = {"flag": False}
+    original_aclose = detector._cache._client.aclose
+
+    async def tracking_aclose():
+        aclose_called["flag"] = True
+        await original_aclose()
+
+    detector._cache._client.aclose = tracking_aclose  # type: ignore[method-assign]
+    await detector.aclose()
+    assert aclose_called["flag"] is True

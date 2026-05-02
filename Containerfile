@@ -6,13 +6,17 @@
 # the guardrail talks to them over HTTP via PRIVACY_FILTER_URL /
 # GLINER_PII_URL.
 #
-# Two optional extras are bundled by default because they're tiny
+# Three optional extras are bundled by default because they're tiny
 # and let operators flip a switch at runtime without rebuilding:
 #   * `denylist-aho`  → pyahocorasick C-extension (~600 KB) for the
 #                        DENYLIST_BACKEND=aho path.
 #   * `vault-redis`   → redis-py (~3 MB pure Python) for the
 #                        VAULT_BACKEND=redis path used in
 #                        multi-replica deployments.
+#   * `cache-redis`   → same redis-py (pip dedupes) for the
+#                        <DETECTOR>_CACHE_BACKEND=redis path used to
+#                        share / persist detector result caches across
+#                        replicas and restarts.
 # Direct-pip-install users can still opt out by installing the
 # package without these extras.
 #
@@ -67,16 +71,17 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-# `denylist-aho` (pyahocorasick) and `vault-redis` (redis-py) are
-# both included unconditionally because they're tiny:
+# `denylist-aho` (pyahocorasick), `vault-redis` (redis-py), and
+# `cache-redis` (same redis-py — pip dedupes) are all included
+# unconditionally because they're tiny:
 #   * pyahocorasick is a ~600 KB C extension with prebuilt wheels
 #     for every platform that matters; lets DENYLIST_BACKEND=aho
 #     work without a rebuild.
 #   * redis-py is ~3 MB of pure Python with zero transitive deps;
-#     lets VAULT_BACKEND=redis work for multi-replica deployments
-#     without a rebuild. Lazy-imported in `vault.build_vault()` so
-#     memory-backend operators don't pay the import cost at
-#     runtime.
+#     lets VAULT_BACKEND=redis and <DETECTOR>_CACHE_BACKEND=redis
+#     work without a rebuild. Lazy-imported in `vault.build_vault()`
+#     and `cache.build_detector_cache()` so memory-backend operators
+#     don't pay the import cost at runtime.
 # Direct `pip install` users can opt out by skipping the extras.
 #
 # `--mount=type=cache,target=/root/.cache/pip` keeps the wheel cache
@@ -85,7 +90,7 @@ COPY src/ ./src/
 # The mount IS the cache, and the wheels live in the cache mount,
 # not in the image layer.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install ".[denylist-aho,vault-redis]"
+    pip install ".[denylist-aho,vault-redis,cache-redis]"
 
 RUN chown -R app:app /app
 

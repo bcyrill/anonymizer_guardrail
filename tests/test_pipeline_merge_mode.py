@@ -24,7 +24,7 @@ import pytest
 
 from anonymizer_guardrail.detector import llm as llm_mod
 from anonymizer_guardrail.detector.base import Match
-from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
 from anonymizer_guardrail.detector.llm import LLMDetector
 from anonymizer_guardrail.pipeline import Pipeline, _MERGE_SENTINEL
 

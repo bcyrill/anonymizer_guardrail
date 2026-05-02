@@ -20,10 +20,8 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 import pytest
 
 from anonymizer_guardrail.detector.base import Match
-from anonymizer_guardrail.detector.cache import (
-    DetectorResultCache,
-    InMemoryDetectionCache,
-)
+from anonymizer_guardrail.detector.cache import DetectorResultCache
+from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
 
 
 def _m(text: str, etype: str = "PERSON") -> Match:

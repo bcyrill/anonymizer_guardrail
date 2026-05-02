@@ -73,6 +73,16 @@ denylist-aho = [
 vault-redis = [
     "redis>=5.0",
 ]
+# Redis-backed detector result cache. Same dep as `vault-redis` (pip
+# dedupes when both extras are installed); kept as a separate extra
+# because the features ship independently and operators may opt into
+# one without the other (e.g. memory vault with redis cache, or
+# redis vault with memory cache). Selected per detector via
+# `<DETECTOR>_CACHE_BACKEND=redis` plus the central `CACHE_REDIS_URL`.
+# Bundled into the default container image alongside `vault-redis`.
+cache-redis = [
+    "redis>=5.0",
+]
 
 [project.scripts]
 anonymizer-guardrail = "anonymizer_guardrail.main:app"

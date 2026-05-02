@@ -83,7 +83,7 @@ async def test_llm_in_flight_increments_around_detect(
     started = asyncio.Event()
     finish = asyncio.Event()
 
-    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+    from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
     from anonymizer_guardrail.detector.llm import LLMDetector
     bad = LLMDetector.__new__(LLMDetector)
     bad.name = "llm"
@@ -118,7 +118,7 @@ async def test_pf_in_flight_increments_around_detect(
     started = asyncio.Event()
     finish = asyncio.Event()
 
-    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+    from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
     from anonymizer_guardrail.detector.remote_privacy_filter import (
         RemotePrivacyFilterDetector,
     )
@@ -153,7 +153,7 @@ async def test_gliner_pii_in_flight_increments_around_detect(
     started = asyncio.Event()
     finish = asyncio.Event()
 
-    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+    from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
     from anonymizer_guardrail.detector.remote_gliner_pii import (
         RemoteGlinerPIIDetector,
     )

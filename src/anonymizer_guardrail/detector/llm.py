@@ -71,7 +71,21 @@ class LLMConfig(BaseSettings):
     # multi-turn conversations where each turn replays the full history
     # in `texts`. See detector/cache.py for the trade-offs (notably
     # that it freezes the first-seen result for a given input).
+    # Memory-backend only: ignored when `cache_backend=redis`.
     cache_max_size: int = 0
+    # Cache backend selection. "memory" (default) is process-local —
+    # fine for single-replica deployments. "redis" routes the cache
+    # through `RedisDetectionCache` (in `cache_redis.py`) for
+    # multi-replica deployments and restart-persistence. The redis
+    # dependency is opt-in via the `cache-redis` extra; selecting
+    # "redis" without installing the extra fails loud at boot. The
+    # central `CACHE_REDIS_URL` is required.
+    cache_backend: Literal["memory", "redis"] = "memory"
+    # TTL for redis-backed cache entries, in seconds. Redis evicts
+    # expired entries server-side via `EXPIRE`. Reset on every cache
+    # write — frequently-hit keys stay warm. Memory backend ignores
+    # this knob (LRU eviction is bounded by `cache_max_size`).
+    cache_ttl_s: int = 600
     # How the pipeline dispatches `req.texts` to the LLM detector:
     #   "per_text" (default) — one detect() call per text, in
     #     parallel under the LLM concurrency cap. Compatible with the
@@ -270,6 +284,8 @@ class LLMDetector(BaseRemoteDetector):
         super().__init__(
             timeout_s=timeout_s or CONFIG.timeout_s,
             cache_max_size=CONFIG.cache_max_size,
+            cache_backend=CONFIG.cache_backend,
+            cache_ttl_s=CONFIG.cache_ttl_s,
         )
         self.api_base = (api_base or CONFIG.api_base).rstrip("/")
         self.api_key = api_key if api_key is not None else CONFIG.api_key

@@ -75,8 +75,18 @@ class PrivacyFilterConfig(BaseSettings):
     # (default). When enabled, repeat calls with the same input text
     # skip the remote PF round-trip. The PF detector has no per-call
     # overrides today, so the cache key is just (text,). See
-    # detector/cache.py for the trade-offs.
+    # detector/cache.py for the trade-offs. Memory-backend only:
+    # ignored when `cache_backend=redis`.
     cache_max_size: int = 0
+    # Cache backend selection. "memory" (default) is process-local —
+    # fine for single-replica deployments. "redis" routes the cache
+    # through `RedisDetectionCache` for multi-replica deployments
+    # and restart-persistence. Requires the central CACHE_REDIS_URL
+    # and the `cache-redis` extra. Same shape as LLM and gliner.
+    cache_backend: Literal["memory", "redis"] = "memory"
+    # TTL for redis-backed cache entries, in seconds. Memory backend
+    # ignores this knob (LRU eviction is bounded by `cache_max_size`).
+    cache_ttl_s: int = 600
     # How the pipeline dispatches `req.texts` to this detector:
     #   "per_text" (default) — one detect() call per text, in
     #     parallel under the PF concurrency cap. Compatible with the
@@ -345,6 +355,8 @@ class RemotePrivacyFilterDetector(BaseRemoteDetector):
         super().__init__(
             timeout_s=timeout_s or CONFIG.timeout_s,
             cache_max_size=CONFIG.cache_max_size,
+            cache_backend=CONFIG.cache_backend,
+            cache_ttl_s=CONFIG.cache_ttl_s,
         )
         self.url = resolved_url
         log.info(

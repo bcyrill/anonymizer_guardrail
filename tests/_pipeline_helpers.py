@@ -89,7 +89,7 @@ def _detector_stub_that_raises(detector_cls, name: str, exc_factory):
     """Build a bare detector instance whose `detect()` raises whatever
     `exc_factory` returns. Generic factory; the per-detector shims
     below pin the class + name for readable call sites."""
-    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+    from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
 
     bad = detector_cls.__new__(detector_cls)
     bad.name = name

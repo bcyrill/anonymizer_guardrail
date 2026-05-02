@@ -42,7 +42,14 @@ Wire format on Redis:
   * **Key:** `vault:{call_id}`. The `vault:` prefix is reserved so
     the backend can share a Redis instance with other consumers
     without colliding. A dedicated logical DB index is still
-    recommended.
+    recommended. The `call_id` is used **directly, not hashed**:
+    LiteLLM mints it as an opaque random UUID with no correlation
+    to user content, so it's not a confirmation-attack vector. (The
+    detector result cache, by contrast, hashes its keys with a
+    secret salt because they're derived from raw input text — see
+    [operations → Redis backend: why the cache key is salted](operations.md#redis-backend-why-the-cache-key-is-salted).)
+    Direct keys also keep `redis-cli GET vault:<call_id>` available
+    for oncall debugging.
   * **Value:** JSON-encoded `dict[str, str]` (the surrogate→original
     mapping). JSON over msgpack so operators can debug entries
     directly: `redis-cli GET vault:abc-123`.

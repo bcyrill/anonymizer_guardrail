@@ -88,8 +88,18 @@ class GlinerPIIConfig(BaseSettings):
     # LRU cap for the per-detector result cache. 0 disables caching
     # (default). When enabled, repeat calls with the same
     # (text, labels, threshold) skip the remote gliner round-trip.
-    # See detector/cache.py for the trade-offs.
+    # See detector/cache.py for the trade-offs. Memory-backend only:
+    # ignored when `cache_backend=redis`.
     cache_max_size: int = 0
+    # Cache backend selection. "memory" (default) is process-local —
+    # fine for single-replica deployments. "redis" routes the cache
+    # through `RedisDetectionCache` for multi-replica deployments
+    # and restart-persistence. Requires the central CACHE_REDIS_URL
+    # and the `cache-redis` extra. Same shape as LLM and PF.
+    cache_backend: Literal["memory", "redis"] = "memory"
+    # TTL for redis-backed cache entries, in seconds. Memory backend
+    # ignores this knob (LRU eviction is bounded by `cache_max_size`).
+    cache_ttl_s: int = 600
     # How the pipeline dispatches `req.texts` to this detector:
     #   "per_text" (default) — one detect() call per text, in
     #     parallel under the gliner-pii concurrency cap. Compatible
@@ -233,6 +243,8 @@ class RemoteGlinerPIIDetector(BaseRemoteDetector):
         super().__init__(
             timeout_s=timeout_s or CONFIG.timeout_s,
             cache_max_size=CONFIG.cache_max_size,
+            cache_backend=CONFIG.cache_backend,
+            cache_ttl_s=CONFIG.cache_ttl_s,
         )
         self.url = resolved_url
         self.labels = labels if labels is not None else _parse_labels(CONFIG.labels)

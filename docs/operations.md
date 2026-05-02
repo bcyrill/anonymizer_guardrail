@@ -107,19 +107,56 @@ detection work entirely.
 
 ### Configuration
 
-Three detectors opt into caching. Each has its own cap, default
-off (`0` disables). The cap controls the in-memory LRU; eviction
-fires once the size grows past the cap.
-
-| Variable | Default | Notes |
-|---|---|---|
-| `LLM_CACHE_MAX_SIZE` | `0` | LRU cap on the LLM detector's result cache. |
-| `PRIVACY_FILTER_CACHE_MAX_SIZE` | `0` | LRU cap on the privacy-filter detector's result cache. |
-| `GLINER_PII_CACHE_MAX_SIZE` | `0` | LRU cap on the gliner-pii detector's result cache. |
-
+Three detectors opt into caching. Each carries its own backend
+selector and per-backend knobs; defaults are off and process-local.
 The fast detectors (`regex`, `denylist`) are intentionally not on
 this list — they're microseconds per call against pre-built data
 structures, so caching would add overhead for negligible savings.
+
+#### Backend selection
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_CACHE_BACKEND` | `memory` | `memory` (process-local LRU) or `redis` (shared store). |
+| `PRIVACY_FILTER_CACHE_BACKEND` | `memory` | Same shape as `LLM_CACHE_BACKEND`. |
+| `GLINER_PII_CACHE_BACKEND` | `memory` | Same shape as `LLM_CACHE_BACKEND`. |
+
+#### Memory-backend knobs
+
+LRU cap for the in-process cache. `0` disables the cache entirely
+(detector calls go straight to the wire — same behaviour as before
+caching shipped). Eviction fires once size grows past the cap.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_CACHE_MAX_SIZE` | `0` | LRU cap. Memory backend only. |
+| `PRIVACY_FILTER_CACHE_MAX_SIZE` | `0` | LRU cap. Memory backend only. |
+| `GLINER_PII_CACHE_MAX_SIZE` | `0` | LRU cap. Memory backend only. |
+
+#### Redis-backend knobs
+
+Per-detector TTL plus the shared connection URL and salt. The
+`*_MAX_SIZE` knobs above are ignored when the backend is `redis` —
+Redis-side `maxmemory` policy bounds the global footprint.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CACHE_REDIS_URL` | *(empty)* | Connection URL shared across every detector that selects `cache_backend=redis`. Required when any detector picks redis. To shard, use the existing `/<n>` logical-DB suffix per detector. |
+| `CACHE_SALT` | *(empty → random per process)* | Keying material for the BLAKE2b digest used in Redis cache keys. Empty → fresh 16 random bytes at process start (logged once). Set to a fixed value for multi-replica cache hits or restart-persistent caching. Distinct from `SURROGATE_SALT`. |
+| `LLM_CACHE_TTL_S` | `600` | Per-key TTL via `EXPIRE`, reset on every cache write. Redis backend only. |
+| `PRIVACY_FILTER_CACHE_TTL_S` | `600` | Same shape as `LLM_CACHE_TTL_S`. |
+| `GLINER_PII_CACHE_TTL_S` | `600` | Same shape as `LLM_CACHE_TTL_S`. |
+
+Each detector occupies its own Redis namespace (`cache:llm:<digest>`,
+`cache:privacy_filter:<digest>`, `cache:gliner_pii:<digest>`) so they
+can share a single Redis instance without colliding.
+
+The `cache-redis` extra (`pip install ".[cache-redis]"`) ships the
+`redis-py` client. The default container image bundles it
+unconditionally — the client is ~3 MB of pure Python and lazy-imported,
+so memory-backend deployments pay nothing at runtime. Direct-pip-install
+operators selecting `*_CACHE_BACKEND=redis` without the extra fail
+loud at boot with a remediation message.
 
 The cache key per detector is the input text plus the overrides
 that affect that detector's output:
@@ -180,11 +217,105 @@ comfortably above the conversation's expected unique-entity count.
 
 ### Restart behaviour
 
-Process-local, like every other in-memory store. After a restart the
-cache is cold and the first occurrence of each input pays the full
-detection cost again. There's no on-disk persistence and no
-replication across replicas — see [limitations](limitations.md) for
-the broader single-replica story.
+The memory backend is process-local — after a restart the cache is
+cold and the first occurrence of each input pays the full detection
+cost again. There's no on-disk persistence; for multi-replica or
+restart-persistent caching, switch to the redis backend.
+
+The redis backend keeps entries server-side under per-key `EXPIRE`,
+so they survive a guardrail restart up to the configured TTL. To
+share cache hits across replicas, set `CACHE_SALT` to a fixed value
+on every replica — otherwise each replica generates a different
+random salt at boot and computes a different digest for the same
+input.
+
+### Redis backend: why the cache key is salted
+
+The cache key in Redis is
+
+```
+cache:<detector>:<BLAKE2b-keyed digest of the cache key tuple>
+```
+
+where the cache-key tuple includes the raw input text — `(text,)` for
+PF, `(text, llm_model, llm_prompt)` for LLM, `(text, labels, threshold)`
+for gliner. The BLAKE2b digest is keyed with `CACHE_SALT`.
+
+Without the salt, anyone with `SCAN`/`KEYS` access to Redis could mount
+a **confirmation attack**:
+
+1. Pick a candidate input X (e.g. a particular SSN, email, customer name).
+2. Compute `BLAKE2b(repr((X, …)))` locally — same code path, public hash.
+3. Check Redis: if the key exists, X was processed by the guardrail
+   within the TTL window.
+
+Low-entropy inputs make this cheap. A nine-digit SSN is 10⁹ candidates;
+an email check against a 10M-name list is 10⁷. With the salt, computing
+candidate digests requires knowing the salt — the salt is server-side
+state never sent to Redis, so the attacker hits a brick wall even with
+full read-access on the keyspace.
+
+Cache *values* (`[{"text": "alice@example.com", "type": "EMAIL_ADDRESS"}, …]`)
+also leak content, of course — this is mostly defence-in-depth against
+asymmetric Redis access shapes that surface keys but not values:
+
+- Sysadmins running `redis-cli --scan` to count keys for diagnostics.
+- Metrics agents aggregating by key prefix.
+- Compromised replicas with Redis ACL `+@keyspace -@string` (read keys,
+  not values).
+- Backup snapshots that retain key metadata after value retention has
+  expired.
+
+Salting the key adds one env var of operational complexity and closes
+the confirmation oracle under all of those shapes for free.
+
+**The vault is structurally different and does not need a salt.** Its
+Redis key is `vault:<call_id>` where `call_id` is the `litellm_call_id`
+LiteLLM mints for the request — a random opaque token with no
+correlation to user content. Knowing `vault:9f2c-…` exists tells an
+attacker nothing they didn't already know (LiteLLM's own logs already
+carry the call_id). Hashing or salting it would only obscure
+`redis-cli GET vault:<call_id>` — exactly the lookup an oncall wants
+during a vault incident — without buying any privacy.
+
+The rule the codebase follows: **hash + salt any Redis key derived
+from sensitive content; pass through any Redis key that's already a
+random opaque token from elsewhere in the system.**
+
+### Redis backend: failure handling
+
+If Redis becomes unreachable, the cache becomes a passthrough:
+`get_or_compute` calls through to the detector, nothing is cached,
+and a warning is logged at most once per minute per detector
+namespace. The detector itself keeps serving requests — this is a
+deliberate departure from the vault's stricter policy
+(see [vault.md](vault.md)) because the cache is an *efficiency*
+mechanism (lost cache hits ⇒ slower detection), not a *correctness*
+mechanism (lost mappings ⇒ unredacted responses). The two share
+`redis-py` but ship as independent extras (`vault-redis` and
+`cache-redis`) and take separate URLs (`VAULT_REDIS_URL`,
+`CACHE_REDIS_URL`) so operators can mix-and-match — e.g. memory
+vault with redis cache, or redis vault with memory cache.
+
+### Redis backend: stats asymmetry
+
+For the memory backend `/health` reports `<prefix>_cache_size` (live
+length) and `<prefix>_cache_max` (the LRU cap). For the redis
+backend both fields report `0` by design — `SCAN MATCH cache:<ns>:*`
+is async; `stats()` is sync. Operators query Redis directly when
+they need the actual count:
+
+```bash
+# Approximate count — non-blocking.
+redis-cli SCAN 0 MATCH 'cache:llm:*' COUNT 1000
+
+# Exact count when the namespace owns its own logical DB.
+redis-cli -n 2 DBSIZE
+```
+
+`<prefix>_cache_hits` and `<prefix>_cache_misses` remain
+process-local on both backends — they reflect this replica's
+traffic, not cluster-wide totals.
 
 ## Merged-input mode
 
