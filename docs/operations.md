@@ -39,7 +39,9 @@ How to read each counter:
 - **`vault_size`** — number of *open* round-trips. A steady-state value
   near zero is healthy; a monotonically growing value points at
   LiteLLM losing the response side, which the TTL eventually catches
-  up with. Full lifecycle in [vault](vault.md).
+  up with. Full lifecycle in [vault](vault.md). Multi-replica
+  deployments need a shared store for the vault — tracked in
+  [`TASKS.md` → Multi-replica support](../TASKS.md#multi-replica-support-redis-backed-vault).
 - **`surrogate_cache_size`** vs **`surrogate_cache_max`** — when these
   converge, LRU eviction is firing and the oldest cross-request
   consistency invariants are quietly being lost. Bump
@@ -63,6 +65,12 @@ When extra detectors with semaphores are configured (e.g. `gliner_pii`),
 their `<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency`
 keys appear in `/health` automatically — see
 [Adding a new detector](development.md#adding-a-new-detector).
+
+`/health` exposes point-in-time gauges only. Time-series questions
+— request rate, p95 detector latency, hourly entity counts by type,
+saturation events over time — need a Prometheus-style `/metrics`
+endpoint, which is tracked in
+[`TASKS.md` → Prometheus-style /metrics endpoint](../TASKS.md#prometheus-style-metrics-endpoint).
 
 ## Detector result caching
 
