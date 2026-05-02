@@ -408,3 +408,70 @@ shows the override would catch real misses on real fixtures.
   shapes yet. The seven listed above are the empirically-needed
   set; expand only with evidence.
 
+---
+
+## Pin Viterbi calibration JSON for privacy-filter
+
+**What:** ship a default `services/privacy_filter/calibration.json`
+(loaded automatically when present at `/app/calibration.json` in
+the container, or via `PRIVACY_FILTER_CALIBRATION` env), with the
+six transition-bias values tuned for whatever corpus is driving
+the precision/recall gap.
+
+**Why deferred:** opf's stock decoder already produces clean spans
+on the two fixtures the spike measured — see
+`services/privacy_filter/scripts/PROBE.md` → "After the opf
+migration", and the `default` profile column in
+`services/privacy_filter/scripts/spike_opf.py`. The
+`anti-merge` profile we built differed from `default` on exactly
+one span (the NTDS-hash boundary on `engagement_notes.txt`), which
+isn't enough to justify pinning corpus-specific values.
+Calibration is ammunition for when a real deployment surfaces a
+recall/precision gap default doesn't close.
+
+**Trigger:** any of these is sufficient evidence to start tuning.
+
+  * A production corpus shows recall regressions vs the bundled
+    fixtures (e.g. opf misses entities the regex detector catches
+    despite labelling concepts in its trained vocabulary).
+  * A new fixture in `services/privacy_filter/scripts/` exposes
+    spans the merge or split passes have to repair frequently —
+    the post-processing layer firing routinely is a sign the
+    decoder isn't terminating where it should.
+  * An opf upstream update changes default decoder semantics in
+    a way that drifts our pinned post-migration tables (re-run
+    `spike_opf.py` after every `OPF_GIT_REF` bump in
+    `services/privacy_filter/Containerfile`).
+
+**Sketch:**
+
+1. Run `python services/privacy_filter/scripts/spike_opf.py`
+   against whatever fixture motivates the work. Confirm `default`
+   underperforms and one of the alternative profiles (or a
+   freshly-tuned one) closes the gap.
+2. If a fresh tune is needed, iterate on a calibration JSON in
+   `/tmp/`, then re-run the script with that JSON injected as a
+   fourth profile (small edit in `_PROFILES`).
+3. Pin the chosen biases at
+   `services/privacy_filter/calibration.json` and have the
+   `services/privacy_filter/Containerfile` `COPY` it into
+   `/app/calibration.json`. Both the in-process detector
+   (`PrivacyFilterConfig.calibration` field) and the service
+   (`PRIVACY_FILTER_CALIBRATION` env, default `/app/calibration.json`)
+   load it automatically.
+4. Add the new fixture to `spike_opf.py`'s `_FIXTURES` tuple so
+   regressions are caught on every future spike run.
+5. Update `services/privacy_filter/scripts/PROBE.md` "After the
+   opf migration" with a calibration-comparison row showing
+   default vs pinned on the new fixture.
+
+**Non-goals:**
+
+- Don't pin calibration values speculatively. The biases are
+  corpus-dependent — values that improve recall on one shape of
+  text often hurt precision on another. Default decoder is the
+  honest baseline until a corpus says otherwise.
+- Don't expose individual biases as runtime env vars. Operators
+  who need different tuning ship a different JSON; the env var
+  selects the file, not the values.
+
