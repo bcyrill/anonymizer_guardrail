@@ -49,6 +49,7 @@ from .specs import (
     GROUP_GLINER,
     GROUP_GUARDRAIL,
     GROUP_PF,
+    GROUP_PF_HF,
     PRESETS,
     flavours_in_group,
     match_preset,
@@ -56,13 +57,16 @@ from .specs import (
 )
 
 
-# Display order for group section headers. Mirrors the bash menu's
-# layout the user sketched: guardrail → privacy-filter → gliner-pii →
-# companion. Adding a new group means inserting the constant here
-# (and one in specs.py).
+# Display order for group section headers. Adding a new group means
+# inserting the constant here (and one in specs.py). Missing a group
+# here is a hard bug: any flavour in that group is in FLAVOURS but
+# its checkbox is never rendered, so the preset "check these
+# flavours" path fails with `NoMatches` when it tries to query the
+# checkbox by id.
 _GROUP_ORDER: tuple[tuple[str, str], ...] = (
     (GROUP_GUARDRAIL, "anonymizer_guardrail"),
     (GROUP_PF, "privacy-filter"),
+    (GROUP_PF_HF, "privacy-filter (HF variant)"),
     (GROUP_GLINER, "gliner-pii"),
     (GROUP_COMPANION, "companion"),
 )

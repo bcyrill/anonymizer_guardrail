@@ -10,16 +10,37 @@ IP/MAC, etc.) — a *complement* to, not a replacement for, the LLM
 detector.
 
 The detector is HTTP-only: the guardrail talks to a standalone
-[`privacy-filter-service`](../../services/privacy_filter/) sidecar
-over HTTP. The slim guardrail image carries no ML deps — torch,
-[`opf`](https://github.com/openai/privacy-filter) (OpenAI's own
-inference wrapper for this model), and the model weights all live
-in the sidecar.
+sidecar over HTTP. The slim guardrail image carries no ML deps —
+torch, [`opf`](https://github.com/openai/privacy-filter) (OpenAI's
+own inference wrapper for this model), and the model weights all
+live in the sidecar.
 
 Mirrors gliner-pii's architectural split: thin model wrapper in the
 service container, label canonicalisation + merge / split / per-label
 gap caps in the guardrail-side
 [`RemotePrivacyFilterDetector`](../../src/anonymizer_guardrail/detector/remote_privacy_filter.py).
+
+## Variants
+
+Two ghcr-published service images implement the same wire format —
+the guardrail-side detector talks to either with no client changes.
+Pick by deployment topology and CPU/GPU availability.
+
+| Variant | Image | Wire format | When to pick |
+|---|---|---|---|
+| **opf-only** *(default)* | [`privacy-filter-service`](../../services/privacy_filter/) | `{spans: [{label, start, end, text}]}` | Default and reference implementation. Conservative pick. Ships a baked-model image flavour for air-gapped deployments. |
+| **HF + opf-decoder** *(experimental)* | [`privacy-filter-hf-service`](../../services/privacy_filter_hf/) | identical | Pairs HF Transformers' forward pass with opf's Viterbi decoder. **~7x faster on CPU** than the opf-only variant on bundled fixtures (see [COMPARE.md](../../services/privacy_filter_hf/COMPARE.md)) at full span-quality parity, because opf reimplements the Transformer from scratch and isn't CPU-tuned while HF's loader gets the official library's CPU optimisations. Recommended for new CPU deployments once the speed-quality trade has been validated against a representative corpus. No baked-model variant (build hits disk-space pressure during commit). |
+
+The launcher's `--privacy-filter-variant opf|hf` selects which
+sidecar to auto-start (default `opf`); the menu has the same prompt.
+For external (operator-managed) services, point
+`PRIVACY_FILTER_URL` at whichever sidecar you're running and the
+choice is implicit. See [Selecting the backend](#selecting-the-backend)
+below.
+
+The rest of this document focuses on the opf-only variant since it's
+the current default; everything that's not flavour-specific applies
+equally to both variants. Variant-specific notes are flagged inline.
 
 ## Configuration (guardrail-side)
 
@@ -49,8 +70,11 @@ so a single shell-side `export` configures both ends.
 
 Build via `scripts/image_builder.sh -f <flavour>`. The launcher's
 `--privacy-filter-backend service` path uses whichever `pf-service-*`
-image is installed locally, preferring the baked variant when
-present (avoids the cold-start model fetch).
+or `pf-hf-service-*` image is installed locally (per `--privacy-filter-variant`),
+preferring a baked variant when present (avoids the cold-start
+model fetch).
+
+### opf-only variant
 
 | Flavour | Notes |
 |---|---|
@@ -59,39 +83,91 @@ present (avoids the cold-start model fetch).
 | `pf-service-cu130` | CUDA-13.0 torch wheels, runtime download. `PRIVACY_FILTER_DEVICE` defaults to `cuda` in this image. Host needs nvidia-container-toolkit. |
 | `pf-service-baked-cu130` | CUDA-13.0 + baked weights. |
 
-When the auto-started service is a `cu*` flavour, the launcher
-emits the engine-specific GPU flag (`--device nvidia.com/gpu=all`
-on podman, `--gpus all` on docker) automatically. Operators
-running CUDA images outside the launcher need the same flag on
-their `podman run` invocation. The host requires
+### HF + opf-decoder variant
+
+| Flavour | Notes |
+|---|---|
+| `pf-hf-service` | CPU torch + transformers, runtime model download from HuggingFace Hub on first request (~3 GB pulled into `/app/.cache/huggingface` — mount a named volume there for persistence). |
+| `pf-hf-service-cu130` | CUDA-13.0 torch wheels + transformers, runtime download. `PRIVACY_FILTER_DEVICE` defaults to `cuda` in this image. Host needs nvidia-container-toolkit. |
+
+No `*-baked` variants for the HF flavour: the build hits disk-space
+pressure during commit (transformers + opf + ~3 GB of weights, with
+overlayfs duplicating cached files via snapshot symlinks). For
+air-gapped HF deployment, populate the cache via a bind mount or a
+sidecar that pre-fetches the model.
+
+### GPU access
+
+When the auto-started service is a `cu*` flavour (either variant),
+the launcher emits the engine-specific GPU flag (`--device nvidia.com/gpu=all`
+on podman, `--gpus all` on docker) automatically. Operators running
+CUDA images outside the launcher need the same flag on their
+`podman run` invocation. The host requires
 [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
 installed.
 
 ## Selecting the backend
 
-The launcher exposes the choice as `--privacy-filter-backend`:
+The launcher exposes two related choices:
+
+* `--privacy-filter-backend service|external` — whether to
+  auto-start the sidecar or point at one the operator manages.
+* `--privacy-filter-variant opf|hf` — which sidecar implementation
+  to start. Default `opf`. Only meaningful when
+  `--privacy-filter-backend=service`.
+
+### `--privacy-filter-backend`
 
 | Value | What happens |
 |---|---|
-| `service` *(default)* | Auto-start a `privacy-filter-service` container on the shared network and point the guardrail at it. Same UX as `--llm-backend service`. |
-| `external` | Use the URL given by `--privacy-filter-url` / `PRIVACY_FILTER_URL`. Nothing is auto-started. Use this for production deployments where the service is managed separately (Kubernetes, docker-compose, etc.). |
+| `service` *(default)* | Auto-start a sidecar container on the shared network and point the guardrail at it. The variant chosen via `--privacy-filter-variant` determines which image starts. Same UX as `--llm-backend service`. |
+| `external` | Use the URL given by `--privacy-filter-url` / `PRIVACY_FILTER_URL`. Nothing is auto-started. Use this for production deployments where the service is managed separately (Kubernetes, docker-compose, etc.). The variant is implicit in whichever sidecar the URL points at. |
 
-The auto-start path mounts an `anonymizer-hf-cache` volume at
-`/app/.opf` inside the container, so the model download survives
-container recreation. opf writes its checkpoint there directly
-(it ignores `HF_HOME` for its own checkpoint location).
+### `--privacy-filter-variant`
+
+| Value | Image | Cache mount path | Volume name |
+|---|---|---|---|
+| `opf` *(default)* | `privacy-filter-service` (port 8001) | `/app/.opf` | `anonymizer-hf-cache` |
+| `hf` *(experimental)* | `privacy-filter-hf-service` (port 8003) | `/app/.cache/huggingface` | `privacy-filter-hf-cache` |
+
+Distinct volume names because the cache layouts are not
+interchangeable: opf writes to a flat `~/.opf/privacy_filter`
+snapshot dir; HF Transformers uses the standard Hub
+`hub/blobs/...` + `hub/snapshots/...` tree. Mounting one variant's
+volume at the other's path produces "model not found" errors at
+startup.
 
 ## Decoder
 
-The service loads the model via OpenAI's
-[`opf`](https://github.com/openai/privacy-filter) package — specifically
-`OPF.redact()` with `decode_mode="viterbi"`. The Viterbi path is the
-decoder OpenAI actually trained the model with; tighter span
-boundaries (no trailing punctuation absorbed), zero `\n\n`
-over-merges, and high recall on emails / API keys / plaintext
-passwords compared to the older transformers integration. See
+Both variants use opf's
+[`ViterbiCRFDecoder`](https://github.com/openai/privacy-filter/blob/main/opf/_core/decoding.py),
+the constrained-BIOES Viterbi OpenAI actually trained the model with.
+This is what gives the privacy-filter its tight span boundaries (no
+trailing punctuation absorbed), zero `\n\n` over-merges, and high
+recall on emails / API keys / plaintext passwords compared to the
+greedy `transformers.pipeline(aggregation_strategy="first")`
+integration we ran pre-migration. See
 [`services/privacy_filter/scripts/PROBE.md`](../../services/privacy_filter/scripts/PROBE.md)
 for the empirical span tables.
+
+The variants differ only in *forward-pass implementation*:
+
+* The opf-only variant uses opf's from-scratch Transformer
+  (`opf/_model/model.py`) for both forward and decode.
+* The HF variant uses
+  `transformers.AutoModelForTokenClassification.from_pretrained("openai/privacy-filter")`
+  for the forward pass and feeds the resulting logits into the same
+  `ViterbiCRFDecoder`. transformers ≥5.7.0 has the
+  `OpenAIPrivacyFilterForTokenClassification` architecture
+  registered, so HF's loader handles the model natively.
+
+Decode quality is therefore identical across variants by
+construction. The HF variant adds a small post-decode whitespace
+trim to match opf's `trim_whitespace=True` default — without it,
+HF's BPE tokenizer's leading-space handling produces spans that
+are off by one character at word-initial positions. See
+[COMPARE.md → Implementation note](../../services/privacy_filter_hf/COMPARE.md#implementation-note-whitespace-trimming)
+for the full story.
 
 The post-processing pipeline on the guardrail side (per-label merge
 gap caps, paragraph-break split pass) is kept as defense in depth —

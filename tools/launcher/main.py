@@ -328,6 +328,15 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
     help="service (auto-start the sidecar) | external (operator-managed URL). Default service.",
 )
 @grouped_option(
+    "--privacy-filter-variant", "pf_variant",
+    type=click.Choice(["opf", "hf"]), default=None, group=_S_PF,
+    help=(
+        "opf (default) → privacy-filter-service (opf forward + Viterbi). "
+        "hf → privacy-filter-hf-service (HF forward + opf Viterbi; ~7x "
+        "faster on CPU; experimental). Only applies when --privacy-filter-backend=service."
+    ),
+)
+@grouped_option(
     "--privacy-filter-url", "pf_url",
     type=str, default=None, group=_S_PF,
     help="PRIVACY_FILTER_URL — pointing at an externally-managed privacy-filter-service. Implies --privacy-filter-backend external.",
@@ -422,6 +431,7 @@ def cli(
     denylist_path: str | None,
     denylist_backend: str | None,
     pf_backend: str | None,
+    pf_variant: str | None,
     pf_url: str | None,
     pf_fail_open: bool,
     gliner_backend: str | None,
@@ -506,6 +516,13 @@ def cli(
         cfg.env_overrides["PRIVACY_FILTER_URL"] = pf_url
         if not pf_backend:
             pf_backend = "external"
+    # `--privacy-filter-variant` is only meaningful when the launcher
+    # auto-starts the sidecar (backend=service). For external backends
+    # the operator's URL already pins which service is in play, so we
+    # don't set the variant at all in that case (the variant flag
+    # would be silently ignored — fine, but worth noting).
+    if pf_variant and pf_variant != "opf":
+        cfg.service_variants["privacy_filter"] = pf_variant
     if pf_fail_open:
         cfg.env_overrides["PRIVACY_FILTER_FAIL_CLOSED"] = "false"
     if gliner_url is not None:
@@ -577,6 +594,7 @@ def cli(
                 engine, det_name,
                 log_level=cfg.log_level,
                 extra_volumes=extra_volumes or None,
+                variant=cfg.service_variants.get(det_name) or None,
             )
             auto_started_detectors.append(det_name)
 

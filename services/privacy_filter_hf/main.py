@@ -24,11 +24,16 @@ service with no client-side changes. A/B is just `PRIVACY_FILTER_URL`
 pointing at port 8001 (opf-only) vs 8003 (HF + opf-decoder).
 
 Configuration:
-  MODEL_NAME           default `openai/privacy-filter`. HF Hub model
-                       id; tokenizer + weights download to
-                       `~/.cache/huggingface/hub/` on first call.
-  HOST / PORT          default 0.0.0.0:8003
-  LOG_LEVEL            python logging level, default INFO
+  MODEL_NAME              default `openai/privacy-filter`. HF Hub
+                          model id; tokenizer + weights download to
+                          `~/.cache/huggingface/hub/` on first call.
+  PRIVACY_FILTER_DEVICE   `cpu` (default on the cpu image) or `cuda`
+                          (default on the cu130 image). Mirrors the
+                          opf-only service's env so a single
+                          shell-side `export PRIVACY_FILTER_DEVICE=…`
+                          configures both variants identically.
+  HOST / PORT             default 0.0.0.0:8003
+  LOG_LEVEL               python logging level, default INFO
 """
 
 from __future__ import annotations
@@ -62,10 +67,11 @@ log = logging.getLogger("privacy-filter-hf-service")
 
 # ── Configuration ──────────────────────────────────────────────────────────
 DEFAULT_MODEL = os.environ.get("MODEL_NAME", "openai/privacy-filter")
+DEFAULT_DEVICE = os.environ.get("PRIVACY_FILTER_DEVICE", "cpu")
 
 
 # ── Model loading ──────────────────────────────────────────────────────────
-def _load_model(model_name: str) -> dict[str, Any]:
+def _load_model(model_name: str, device: str) -> dict[str, Any]:
     """Pull the HF model + tokenizer, build the Viterbi decoder.
 
     Both the model and the decoder are constructed once at startup and
@@ -73,11 +79,20 @@ def _load_model(model_name: str) -> dict[str, Any]:
     `id2label` so the BIOES tag list matches exactly — feeding the
     decoder a different label space than the model produced would
     silently misroute spans.
+
+    `device` is `"cpu"` or `"cuda"` (set via PRIVACY_FILTER_DEVICE,
+    which the Containerfile baked from the build's TARGET_DEVICE).
+    `model.to(device)` is a no-op for cpu and a memcpy to GPU for
+    cuda; we rely on a sensible default rather than `device_map="auto"`
+    so the env-var override is the single point of truth (auto can
+    silently shard across multiple GPUs and produce surprising
+    placement).
     """
     log.info("Loading tokenizer %s", model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    log.info("Loading model %s", model_name)
+    log.info("Loading model %s onto device=%s", model_name, device)
     model = AutoModelForTokenClassification.from_pretrained(model_name)
+    model = model.to(device)
     model.eval()
 
     # The model's id2label is keyed by str on JSON-loaded configs and by
@@ -216,13 +231,16 @@ _state: dict[str, Any] = {
     "decoder": None,
     "id2label": None,
     "model_name": DEFAULT_MODEL,
+    "device": DEFAULT_DEVICE,
 }
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
     log.info("Loading privacy-filter (HF variant) — first start downloads ~3 GB…")
-    loaded = await asyncio.to_thread(_load_model, _state["model_name"])
+    loaded = await asyncio.to_thread(
+        _load_model, _state["model_name"], _state["device"],
+    )
     # Warm the model so first /detect doesn't pay torch's lazy-init
     # cost (cuDNN handles, eager-mode op caches, etc.). Mirrors the
     # opf-only service.

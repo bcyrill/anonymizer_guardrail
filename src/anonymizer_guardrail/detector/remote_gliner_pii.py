@@ -86,8 +86,20 @@ class GlinerPIIConfig(BaseSettings):
 
     @field_validator("url", mode="after")
     @classmethod
-    def _strip_url(cls, v: str) -> str:
-        return v.strip()
+    def _validate_url(cls, v: str) -> str:
+        """Strip whitespace and require an http(s):// scheme on non-empty
+        values. Empty means "detector not deployable in this process";
+        the factory raises a clearer error there. Non-empty without a
+        scheme would otherwise surface at first request as a confusing
+        httpx error — fail loud at boot instead."""
+        v = v.strip()
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError(
+                f"GLINER_PII_URL={v!r} must start with http:// or https:// "
+                f"(got no scheme). Set the full URL of the gliner-pii "
+                f"service, e.g. http://gliner-pii-service:8002."
+            )
+        return v
 
 
 CONFIG = GlinerPIIConfig()

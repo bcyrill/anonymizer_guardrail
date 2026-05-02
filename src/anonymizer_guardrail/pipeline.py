@@ -186,9 +186,8 @@ class Pipeline:
 
         Operators can narrow the active set per call (e.g. "skip the LLM
         for this request") but cannot expand it: every detector has
-        boot-time setup that isn't safe to run mid-request — the
-        in-process privacy_filter loads torch + the model, the remote
-        variants set up httpx clients against configured URLs, and the
+        boot-time setup that isn't safe to run mid-request — the remote
+        detectors set up httpx clients against configured URLs, and the
         LLM detector needs the configured api_base / model. Names that
         aren't currently configured are dropped with a warning.
         """

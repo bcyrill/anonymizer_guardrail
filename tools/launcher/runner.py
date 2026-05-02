@@ -83,6 +83,14 @@ class LaunchConfig:
     # Keys are detector names; values are "service" / "external" / "" (skip).
     backends: dict[str, str] = field(default_factory=dict)
 
+    # Per-detector service-variant selection. Empty / missing = use
+    # the LauncherSpec's default `service`; a string keys into
+    # `service_variants` for that detector. Today only privacy_filter
+    # has more than one variant ("hf" → privacy-filter-hf-service);
+    # the dict shape leaves room for other detectors to grow variants
+    # without a schema change.
+    service_variants: dict[str, str] = field(default_factory=dict)
+
     # Optional path to a fake-llm rules file (mounted into the auto-
     # started fake-llm container at /app/rules.yaml). Empty = use the
     # bundled rules.example.yaml.
@@ -132,7 +140,11 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
         # values from Step 1 because the auto-start URL is canonical
         # (the operator picked `service` backend → they want the
         # auto-started service, not whatever URL they had in their env).
-        if det_name in auto_started and spec.service:
+        # Resolve through service_variants so the URL points at the
+        # actually-started container (e.g. privacy-filter-hf-service
+        # on port 8003 vs the opf-only privacy-filter-service on 8001).
+        active_service = spec.resolve_service(cfg.service_variants.get(det_name))
+        if det_name in auto_started and active_service:
             # Drop any earlier `-e <K>=...` for the same K to avoid
             # duplicate flags (the engine resolves to the LAST -e but
             # readability suffers).
@@ -141,7 +153,7 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
                 for i in range(0, len(env_args), 2)
                 if i + 1 < len(env_args) and env_args[i] == "-e"
             }
-            for k, v in spec.service.guardrail_env_when_started.items():
+            for k, v in active_service.guardrail_env_when_started.items():
                 if k in already_set_keys:
                     # Replace the previous binding.
                     for i in range(0, len(env_args) - 1, 2):
@@ -201,11 +213,24 @@ def print_plan(engine: Engine, cfg: LaunchConfig) -> None:
         if spec is None or spec.service is None:
             continue
         backend = cfg.backends.get(det_name, "")
+        chosen_variant = cfg.service_variants.get(det_name, "")
         if det_name in auto_started:
+            # Append the variant name to the row label when one was
+            # explicitly chosen, so the printed plan distinguishes
+            # the opf-only `privacy-filter-service` from
+            # `privacy-filter-hf-service`. Empty variant = the default,
+            # which we elide for the no-variant case.
+            label = det_name + (f" ({chosen_variant})" if chosen_variant else "")
+            active_service = spec.resolve_service(chosen_variant)
+            container_label = (
+                f"{active_service.container_name}:{active_service.port}"
+                if active_service else
+                f"{spec.service.container_name}:{spec.service.port}"
+            )
             table.add_row(
-                det_name,
+                label,
                 f"[green]service[/green] "
-                f"[dim](auto-started, {spec.service.container_name}:{spec.service.port})[/dim]",
+                f"[dim](auto-started, {container_label})[/dim]",
             )
         elif backend == "external":
             url = cfg.env_overrides.get(

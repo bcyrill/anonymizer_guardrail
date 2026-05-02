@@ -9,13 +9,15 @@ name: Publish privacy-filter-hf-service image
 # implementations. See services/privacy_filter_hf/COMPARE.md for the
 # rationale and measurement context.
 #
-# A `+pf-hf-service` tag publishes the CPU variant only:
+# A `+pf-hf-service` tag fans out to a CPU and a CUDA build:
 #
 #   ghcr.io/<owner>/privacy-filter-hf-service:vX.Y.Z-cpu     CPU
+#   ghcr.io/<owner>/privacy-filter-hf-service:vX.Y.Z-cu130   CUDA 13.0
 #
-# A `-cu130` matrix entry will be added once a `pf-hf-service-cu130`
-# build flavour exists (services/privacy_filter_hf/ doesn't ship the
-# cu130 variant yet — see TASKS.md).
+# Both variants are explicitly suffixed (no implicit "default" tag)
+# so `podman pull privacy-filter-hf-service:vX.Y.Z` fails fast with
+# "tag not found" rather than silently giving a CPU image to an
+# operator who meant CUDA. Mirrors publish-pf-service-image.yml.
 #
 # Triggers:
 #   - push of vX.Y.Z+pf-hf-service → CPU image build
@@ -49,12 +51,26 @@ jobs:
       id-token: write
 
     strategy:
+      # One variant failing shouldn't cancel the others — operators
+      # should still get the CPU image even if a CUDA wheel mirror has
+      # a transient hiccup.
       fail-fast: false
       matrix:
         variant:
+          # CPU variant. Explicitly suffixed `-cpu` so `:vX.Y.Z` (no
+          # suffix) errors out clearly instead of silently giving a CPU
+          # image where CUDA was intended.
           - name: cpu
             torch_index: https://download.pytorch.org/whl/cpu
+            target_device: cpu
             suffix: '-cpu'
+          # CUDA 13.0. Suffix `-cu130` matches PyTorch's wheel-index
+          # naming so the image tag and the underlying torch wheel
+          # set agree at a glance.
+          - name: cu130
+            torch_index: https://download.pytorch.org/whl/cu130
+            target_device: cuda
+            suffix: '-cu130'
 
     steps:
       - name: Checkout
@@ -113,6 +129,7 @@ jobs:
           push: true
           build-args: |
             TORCH_INDEX_URL=${{ matrix.variant.torch_index }}
+            TARGET_DEVICE=${{ matrix.variant.target_device }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=pf-hf-service-${{ matrix.variant.name }}

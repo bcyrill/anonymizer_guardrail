@@ -134,8 +134,30 @@ class LauncherSpec:
     container without a flag."""
 
     service: ServiceSpec | None = None
-    """Optional auto-startable service. None for in-process detectors
-    (regex, denylist)."""
+    """Optional auto-startable service — the *default* variant. None
+    for in-process detectors (regex, denylist)."""
+
+    service_variants: dict[str, ServiceSpec] = field(default_factory=dict)
+    """Named alternative ServiceSpecs for detectors that ship more
+    than one backing service (e.g. privacy_filter has an opf-only and
+    an HF-pipeline variant). The launcher's `--<name>-variant` flag
+    selects from this dict; absent / empty means there's only the
+    default `service` and the variant flag is a no-op."""
+
+    def resolve_service(self, variant: str | None = None) -> ServiceSpec | None:
+        """Pick the ServiceSpec to use for an auto-start.
+
+        - `variant` is None or empty → return `self.service` (the
+          default).
+        - `variant` matches a key in `service_variants` → return that
+          alternative.
+        - Unknown variant → fall back to `self.service` (the launcher
+          CLI / menu validates the choice list, so this branch only
+          fires under programmer error).
+        """
+        if variant and variant in self.service_variants:
+            return self.service_variants[variant]
+        return self.service
 
 
 # ── Per-detector metadata ─────────────────────────────────────────────────
@@ -204,6 +226,42 @@ LAUNCHER_METADATA: dict[str, LauncherSpec] = {
                 "PRIVACY_FILTER_CALIBRATION": "PRIVACY_FILTER_CALIBRATION",
             },
         ),
+        # Experimental HF-pipeline variant. Same wire format, separate
+        # ghcr package, port 8003, distinct cache volume so the two
+        # variants don't fight over HF cache layout. Selected via
+        # `--privacy-filter-variant hf` (CLI) or the variant prompt in
+        # the launcher menu. See services/privacy_filter_hf/COMPARE.md
+        # for the speed/quality measurements.
+        service_variants={
+            "hf": ServiceSpec(
+                container_name="privacy-filter-hf-service",
+                image_tag_envs=("TAG_PF_HF_SERVICE",),
+                image_tag_defaults=("privacy-filter-hf-service:cpu",),
+                port=8003,
+                readiness_timeout_s=300,
+                # HF Transformers writes to ~/.cache/huggingface/hub.
+                # Distinct volume name from the opf-only variant: the
+                # cache layouts are NOT interchangeable (opf writes to
+                # ~/.opf with a flat snapshot dir; HF uses the standard
+                # Hub blob/snapshot/refs tree).
+                hf_cache_volume="privacy-filter-hf-cache",
+                cache_mount_path="/app/.cache/huggingface",
+                guardrail_env_when_started={
+                    "PRIVACY_FILTER_URL": "http://privacy-filter-hf-service:8003",
+                },
+                # PRIVACY_FILTER_DEVICE works the same way on both
+                # variants — same env var name, same semantics. The HF
+                # variant doesn't read PRIVACY_FILTER_CALIBRATION
+                # (calibration applies to opf's Viterbi decoder, which
+                # the HF variant also reuses, so we forward it here too
+                # for forward-compat — current main.py doesn't read
+                # it but a future rev might).
+                service_env_passthroughs={
+                    "PRIVACY_FILTER_DEVICE": "PRIVACY_FILTER_DEVICE",
+                    "PRIVACY_FILTER_CALIBRATION": "PRIVACY_FILTER_CALIBRATION",
+                },
+            ),
+        },
     ),
     "gliner_pii": LauncherSpec(
         guardrail_env_passthroughs=[

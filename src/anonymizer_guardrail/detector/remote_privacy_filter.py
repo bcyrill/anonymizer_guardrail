@@ -72,10 +72,21 @@ class PrivacyFilterConfig(BaseSettings):
 
     @field_validator("url", mode="after")
     @classmethod
-    def _strip_url(cls, v: str) -> str:
-        # Trailing whitespace on a copy-pasted URL is the kind of typo
-        # we'd rather absorb than turn into a confusing 404.
-        return v.strip()
+    def _validate_url(cls, v: str) -> str:
+        """Strip whitespace and require an http(s):// scheme on non-empty
+        values. Empty means "detector not deployable in this process";
+        the factory raises a clearer error there. Non-empty without a
+        scheme would otherwise surface at first request as a confusing
+        httpx error — fail loud at boot instead, matching the project's
+        wider "fail-loud-on-misconfiguration" stance."""
+        v = v.strip()
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError(
+                f"PRIVACY_FILTER_URL={v!r} must start with http:// or https:// "
+                f"(got no scheme). Set the full URL of the privacy-filter "
+                f"service, e.g. http://privacy-filter-service:8001."
+            )
+        return v
 
 
 CONFIG = PrivacyFilterConfig()
@@ -373,8 +384,9 @@ class RemotePrivacyFilterDetector:
 class _RawSpan:
     """Duck-typed stand-in for opf's DetectedSpan, built from the JSON
     wire shape so `_to_matches` can read `.label / .start / .end /
-    .text` without caring whether its input came from the in-process
-    opf model or from the HTTP service."""
+    .text` against either the privacy-filter-service (opf-only) or the
+    privacy-filter-hf-service (HF forward + opf decode) — both emit
+    the same wire shape."""
 
     __slots__ = ("label", "start", "end", "text")
 

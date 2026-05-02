@@ -18,6 +18,7 @@ import sys
 from typing import Any
 
 import httpx
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..bundled_resource import read_bundled_default, resolve_spec
@@ -62,6 +63,27 @@ class LLMConfig(BaseSettings):
     # Failure mode when the LLM detector errors out. true (default) →
     # block; false → fall back to coverage from the other detectors.
     fail_closed: bool = True
+
+    @field_validator("api_base", mode="after")
+    @classmethod
+    def _validate_api_base(cls, v: str) -> str:
+        """Strip whitespace and require an http(s):// scheme. Without
+        this, an operator who sets `LLM_API_BASE=litellm:4000/v1` (no
+        scheme) gets a confusing httpx error at first request rather
+        than a fail-loud at boot."""
+        v = v.strip()
+        if not v:
+            raise ValueError(
+                "LLM_API_BASE is required and must be set to a full URL "
+                "(e.g. http://litellm:4000/v1)."
+            )
+        if not v.startswith(("http://", "https://")):
+            raise ValueError(
+                f"LLM_API_BASE={v!r} must start with http:// or https:// "
+                f"(got no scheme). Set the full URL, e.g. "
+                f"http://litellm:4000/v1."
+            )
+        return v
 
 
 CONFIG = LLMConfig()

@@ -90,14 +90,15 @@ service-side image flavours and their device knobs.
 |---|---|---|---|
 | `slim` | ~200 MB | `:vX.Y.Z` | regex / denylist / LLM detectors in-process; remote clients for privacy_filter / gliner_pii. |
 
-### Privacy-filter-service (`privacy-filter-service`)
+### Privacy-filter-service (`privacy-filter-service`) — opf-only variant
 
-Standalone HTTP wrapper around opf's constrained-Viterbi decoder for
-the openai/privacy-filter model. Pair with the slim guardrail and
-auto-started by `scripts/launcher.sh` when `DETECTOR_MODE` includes
-`privacy_filter`. Each variant gets an explicit tag suffix (no
-implicit default) so a typoed pull fails loud rather than handing
-back the wrong torch build. CUDA variants set
+Default privacy-filter sidecar. Standalone HTTP wrapper around
+opf's full inference stack (forward + constrained-Viterbi decode)
+for the openai/privacy-filter model. Pair with the slim guardrail
+and auto-started by `scripts/launcher.sh` when `DETECTOR_MODE`
+includes `privacy_filter`. Each variant gets an explicit tag suffix
+(no implicit default) so a typoed pull fails loud rather than
+handing back the wrong torch build. CUDA variants set
 `PRIVACY_FILTER_DEVICE=cuda` automatically (via `TARGET_DEVICE`
 build-arg) so the launcher's auto-start does the right thing without
 operator-side env juggling.
@@ -108,6 +109,35 @@ operator-side env juggling.
 | `pf-service-cu130` | CUDA 13.0 | downloads on first start | `:vX.Y.Z-cu130` | nvidia GPU + nvidia-container-toolkit |
 | `pf-service-baked` | CPU-only | shipped inside image | local only | none beyond the container |
 | `pf-service-baked-cu130` | CUDA 13.0 | shipped inside image | local only | nvidia GPU + nvidia-container-toolkit |
+
+### Privacy-filter-hf-service (`privacy-filter-hf-service`) — HF + opf-decoder variant *(experimental)*
+
+Sibling sidecar that pairs HuggingFace Transformers' forward pass
+with opf's Viterbi decoder. Same wire format as the opf-only
+service (the guardrail's `RemotePrivacyFilterDetector` consumes
+either with no client changes), but ~7x faster on CPU on bundled
+fixtures because HF's loader gets the official library's CPU
+optimisations while opf's from-scratch reimplementation isn't
+CPU-tuned. See
+[`services/privacy_filter_hf/COMPARE.md`](../services/privacy_filter_hf/COMPARE.md)
+for the speed/quality measurements.
+
+Auto-start via `scripts/launcher.sh --privacy-filter-variant hf`
+(default is the opf-only variant above). Different port (8003 vs
+8001), different cache volume (`privacy-filter-hf-cache` vs
+`anonymizer-hf-cache`); the two variants can run side-by-side for
+A/B benchmarks without colliding.
+
+| flavour | torch wheels | model | published as | runtime needs |
+|---|---|---|---|---|
+| `pf-hf-service` | CPU-only | downloads on first start | `:vX.Y.Z-cpu` | none beyond the container |
+| `pf-hf-service-cu130` | CUDA 13.0 | downloads on first start | `:vX.Y.Z-cu130` | nvidia GPU + nvidia-container-toolkit |
+
+No baked-model variants for the HF flavour: the build hits
+disk-space pressure during commit (transformers + opf + ~3 GB of
+weights, with overlayfs duplicating cached files via snapshot
+symlinks). For air-gapped HF deployment, populate the HF cache via
+a bind mount or a sidecar that pre-fetches the model.
 
 ### GLiNER-PII service (`gliner-pii-service`)
 

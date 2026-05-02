@@ -97,6 +97,7 @@ def start_service(
     name: str,
     log_level: str = "info",
     extra_volumes: Iterable[tuple[str, str]] | None = None,
+    variant: str | None = None,
 ) -> None:
     """Auto-start the service container for detector `name`.
 
@@ -115,6 +116,12 @@ def start_service(
     ``/app/rules.yaml:ro``). Used today to mount a custom fake-llm
     rules file when the operator passes ``--rules``; kept generic so
     other services can opt in without adding a second special case.
+
+    `variant` selects an alternative service implementation when the
+    detector ships more than one (e.g. privacy_filter has an opf-only
+    default and a `hf` variant). None / empty → the default. Unknown
+    variants fall back to the default (the CLI / menu validate the
+    choice list, so this is just programmer-error tolerance).
     """
     spec = LAUNCHER_METADATA.get(name)
     if spec is None or spec.service is None:
@@ -122,7 +129,8 @@ def start_service(
             f"Detector {name!r} has no service to auto-start. "
             f"Check LAUNCHER_METADATA in tools/launcher/spec_extras.py."
         )
-    service = spec.service
+    service = spec.resolve_service(variant)
+    assert service is not None  # spec.service was non-None above
 
     engine.ensure_network(SHARED_NETWORK)
 

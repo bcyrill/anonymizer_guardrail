@@ -572,6 +572,16 @@ class LauncherApp(App):
             backend = cfg.backends.get("privacy_filter") or "service"
             items.append(_header("Privacy-filter", hint=backend))
             items.append(_row("privacy_filter_backend", "Backend", backend))
+            # Variant picker — only meaningful for backend=service. With
+            # backend=external the operator's URL pins which sidecar is
+            # in play, so the variant choice is silently ignored
+            # there; we hide the row to avoid surfacing a knob that
+            # does nothing.
+            if backend == "service":
+                items.append(_row(
+                    "privacy_filter_variant", "Variant",
+                    cfg.service_variants.get("privacy_filter") or "opf (default)",
+                ))
             if cfg.backends.get("privacy_filter") == "external":
                 items.append(_row(
                     "privacy_filter_url", "URL",
@@ -745,6 +755,19 @@ class LauncherApp(App):
                 cfg.backends.get("privacy_filter", "service"),
                 lambda v: self._set_backend("privacy_filter", v),
             )
+        elif key == "privacy_filter_variant":
+            # The "opf" choice clears the entry rather than storing it
+            # so the printed plan elides "(opf)" from the row label.
+            # Mirrors the CLI's `--privacy-filter-variant opf` semantics.
+            self._pick(
+                "Privacy-filter variant",
+                [
+                    ("opf", "opf (default — privacy-filter-service)"),
+                    ("hf", "hf (experimental — privacy-filter-hf-service, ~7x faster on CPU)"),
+                ],
+                cfg.service_variants.get("privacy_filter", "opf"),
+                lambda v: self._set_pf_variant(v),
+            )
         elif key == "privacy_filter_url":
             self._text(
                 "PRIVACY_FILTER_URL",
@@ -904,6 +927,17 @@ class LauncherApp(App):
             self.cfg.backends[det] = value
         else:
             self.cfg.backends.pop(det, None)
+
+    def _set_pf_variant(self, value: str) -> None:
+        """Store the privacy-filter variant on the LaunchConfig. The
+        "opf" choice (the default) is stored as an empty entry — the
+        runner / printed plan distinguish the default from explicitly
+        chosen variants by the dict's presence, not its value. Same
+        normalisation as the CLI flag's handler."""
+        if value and value != "opf":
+            self.cfg.service_variants["privacy_filter"] = value
+        else:
+            self.cfg.service_variants.pop("privacy_filter", None)
 
     def _set_flavour(self, value: str) -> None:
         self.cfg.flavour = value

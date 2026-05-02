@@ -198,10 +198,11 @@ def _build_generators(use_faker: bool, salt: bytes) -> dict[str, _FakerGen]:
     return out
 
 
-# Cap on how many salted retries we attempt to find a non-colliding
-# surrogate. Three retries is plenty: collisions are rare to begin with,
-# and the salted-seed/salted-text path is independent of the original.
-_MAX_COLLISION_RETRIES = 4
+# Total attempts (1 natural pass at attempt=0, plus 3 salted retries at
+# attempt=1..3). Three salted retries is plenty: collisions are rare to
+# begin with, and the salted-seed/salted-text path is independent of the
+# original.
+_MAX_COLLISION_ATTEMPTS = 4
 # Golden-ratio-derived constant. Used to perturb the seed across retries
 # so each attempt explores a different Faker output.
 _SALT_MULTIPLIER = 0x9E3779B97F4A7C15
@@ -290,10 +291,18 @@ class SurrogateGenerator:
         after __init__. Used by Pipeline.stats() for the /health probe."""
         return len(self._cache), self._max_cache_size
 
-    def _resolve_faker(
+    def _resolve_faker_locked(
         self, locale_tuple: tuple[str, ...] | None, use_faker: bool
     ) -> Faker | None:
         """Return the Faker instance to use for one for_match call.
+
+        Caller MUST hold `self._lock`. The lock is shared with the
+        surrogate cache because (a) `move_to_end` + `popitem(last=False)`
+        on the per-locale OrderedDict aren't thread-atomic on their own,
+        and (b) the resolved Faker is then immediately used inside the
+        same critical section for `seed_instance + gen()`, which has its
+        own non-interleaving requirement. Sharing one lock keeps both
+        invariants under the same hold.
 
         - use_faker=False → no Faker (opaque-token gens); return None.
         - locale_tuple is None → the configured default (self._fake), if any.
@@ -368,8 +377,6 @@ class SurrogateGenerator:
         else:
             generators = _build_generators(effective_use_faker, self._salt)
 
-        fake = self._resolve_faker(effective_locale, effective_use_faker)
-
         key: _CacheKey = (
             match.entity_type, match.text, effective_use_faker, effective_locale,
         )
@@ -377,9 +384,17 @@ class SurrogateGenerator:
             cached = self._cache.get(key)
             if cached is not None:
                 # Mark this entry as most-recently-used so a busy entity
-                # survives eviction churn from one-shot lookups.
+                # survives eviction churn from one-shot lookups. Cache hits
+                # skip Faker resolution entirely — saves a dict lookup
+                # plus the locale-tuple LRU bookkeeping on the hot path.
                 self._cache.move_to_end(key)
                 return cached
+
+            # Faker resolution must run under the lock: the per-locale
+            # LRU's move_to_end + popitem aren't thread-atomic on their
+            # own, and the resolved Faker is then used immediately
+            # inside this critical section for seed_instance + gen().
+            fake = self._resolve_faker_locked(effective_locale, effective_use_faker)
 
             seed = _seed_for(match.text, match.entity_type, self._salt)
             gen = generators.get(match.entity_type, generators["OTHER"])
@@ -395,7 +410,7 @@ class SurrogateGenerator:
             # the reseed; opaque types respond to the text-salt. Doing both
             # is harmless overlap and lets us share one retry loop.
             surrogate: str | None = None
-            for attempt in range(_MAX_COLLISION_RETRIES):
+            for attempt in range(_MAX_COLLISION_ATTEMPTS):
                 attempt_seed = seed if attempt == 0 else seed ^ (attempt * _SALT_MULTIPLIER)
                 attempt_text = match.text if attempt == 0 else f"{match.text}#{attempt}"
                 if fake is not None:

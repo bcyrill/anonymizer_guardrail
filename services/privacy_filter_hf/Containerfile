@@ -70,6 +70,14 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # both variants decode against identical Viterbi logic + transition
 # constraints. Bump this in lockstep with the opf-only image.
 ARG OPF_GIT_REF=f7f00ca7fb86
+# `TARGET_DEVICE` baked into PRIVACY_FILTER_DEVICE env so the runtime
+# default matches the wheel index. CPU images (default) keep
+# device=cpu; cu130 images pass --build-arg TARGET_DEVICE=cuda from
+# the image_builder's flavour config. Operators can still override at
+# run time via `-e PRIVACY_FILTER_DEVICE=…`. Mirrors the opf-only
+# Containerfile's pattern so both variants share the same operator
+# experience for device selection.
+ARG TARGET_DEVICE=cpu
 
 # transformers must be 5.7.0+ — that's the first stable release with
 # `OpenAIPrivacyFilterForTokenClassification` registered in the model
@@ -98,7 +106,8 @@ RUN mkdir -p /app/.cache/huggingface \
 ENV HOST=0.0.0.0 \
     PORT=8003 \
     LOG_LEVEL=info \
-    MODEL_NAME=openai/privacy-filter
+    MODEL_NAME=openai/privacy-filter \
+    PRIVACY_FILTER_DEVICE=$TARGET_DEVICE
 
 EXPOSE 8003
 
