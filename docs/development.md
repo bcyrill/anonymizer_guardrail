@@ -65,10 +65,26 @@ tools/launcher/                  # dev-only, NOT in the wheel
   main.py                        # Click CLI
   menu.py                        # Textual TUI
 
+tools/image_builder/             # dev-only, NOT in the wheel
+  __main__.py                    # `python -m tools.image_builder`
+  specs.py                       # FLAVOURS catalog + PRESETS
+  runner.py                      # `<engine> build` argv + exec
+  main.py                        # Click CLI
+  menu.py                        # Textual TUI (preset radio + grid)
+
+tools/detector_bench/            # dev-only, NOT in the wheel
+  __main__.py                    # `python -m tools.detector_bench`
+  corpus.py                      # YAML loader + schema validation
+  runner.py                      # per-case execution + scoring
+  cli.py                         # Click CLI
+
 scripts/                         # bash wrappers, ~5 lines each
   launcher.sh                    # exec python -m tools.launcher
                                  #   (CLI by default, --ui opens TUI)
-  image_builder.sh                 # podman/docker build wrapper
+  image_builder.sh               # exec python -m tools.image_builder
+                                 #   (CLI by default, --ui opens TUI)
+  detector_bench.sh              # exec python -m tools.detector_bench
+  test-examples.sh               # end-to-end curl recipes
   release.sh                     # git tag + push for CI
 
 services/                        # auxiliary inference containers
@@ -79,7 +95,8 @@ services/                        # auxiliary inference containers
 tests/                           # pytest suite
 
 docs/                            # operator-facing documentation
-  configuration.md               # main env-var table
+  configuration.md               # cross-cutting env vars (per-
+                                 # detector vars live in detectors/<name>.md)
   litellm-integration.md         # LiteLLM wiring
   surrogates.md                  # surrogates / salt / Faker / locales
   per-request-overrides.md       # additional_provider_specific_params
@@ -161,6 +178,75 @@ argv from `REGISTERED_SPECS` + `LAUNCHER_METADATA` and exec's the
 container in the foreground. Auto-startable services (fake-llm,
 privacy-filter-service, gliner-pii-service) are started before the
 guardrail and torn down via `atexit`.
+
+## The image builder
+
+`scripts/image_builder.sh` execs into `python -m tools.image_builder`.
+Same shape as the launcher: dev-only Python under `tools/`, never
+shipped in the wheel; one bash wrapper, two interlocking modes
+(Click CLI by default, Textual TUI on `--ui`).
+
+The catalog of build targets lives in
+`tools/image_builder/specs.py` as `FLAVOURS` (one `Flavour` per
+buildable image — guardrail slim/pf/pf-baked, the privacy-filter and
+gliner-pii sidecars across CPU/CUDA/baked variants, the fake-llm
+companion) and `PRESETS` (named subsets — `all`, `guardrail`,
+`privacy-filter`, `gliner-pii`, `minimal`, `minimal-fakellm`). Adding
+an image flavour is one entry in `_build_catalog()`; the CLI's
+`--flavour` validation, the menu's checkbox grid, and `--list` all
+read `FLAVOURS` directly.
+
+- **CLI** — `--flavour/-f NAME` (repeatable), `--preset NAME`,
+  `--list`, `--tag/-T`, `--engine podman|docker`, `--yes/-y`, plus
+  passthrough args after `--` (e.g. `-- --no-cache --pull`). Engine
+  detection is the same `tools.launcher.engine.detect_engine` —
+  prefers podman, falls back to docker, honours `ENGINE=…` and the
+  per-flavour `TAG_*` env overrides the old bash script accepted.
+- **TUI (`--ui`)** — preset radio at the top, grouped checkbox grid
+  (two columns per group) below, Build/Cancel buttons. Up/down move
+  focus between widgets; left/right cycles the preset radio; ctrl+b
+  builds, q/Esc cancels.
+
+The runner shells out to `<engine> build` (subprocess, no
+podman-py / docker-py dep — the surface we use is one call). Podman
+gets `--format=docker` so the Containerfile's HEALTHCHECK isn't
+silently dropped (OCI is podman's default and has no HEALTHCHECK
+field). Multiple flavours run in sequence; the runner bails on the
+first failure and returns the engine's exit code.
+
+## The detector benchmark
+
+`scripts/detector_bench.sh` execs into `python -m tools.detector_bench`.
+Sister tool to `scripts/test-examples.sh` — where test-examples
+answers *"do the curl recipes still work?"*, the benchmark answers
+*"for THIS corpus on THIS detector mix, what fraction of expected
+entities does the guardrail catch, and how often does it falsely
+flag stuff that should be left alone?"* (recall, type accuracy,
+precision, latency).
+
+Three modules:
+
+- `corpus.py` — YAML loader + schema validation. Fail-loud at load
+  time so a typo surfaces before any HTTP traffic (rather than as a
+  mysterious zero-recall score). `bundled:NAME` resolves to
+  `tests/corpus/NAME.yaml`.
+- `runner.py` — per-case execution + scoring. Forces
+  `use_faker: false` per request so the response carries opaque
+  `[TYPE_HEX]` tokens — that's how the script recovers types
+  without per-entity attribution from the guardrail.
+- `cli.py` — Click CLI, two operating modes. Default connects to
+  `$BASE_URL` (caller manages the guardrail). `--preset NAME`
+  spawns a fresh test guardrail via `scripts/launcher.sh --preset`,
+  waits for `/health`, runs the corpus, and tears it down on exit
+  (same `--port`/`--name`/`--keep` semantics as `test-examples.sh`).
+
+`--compare` runs the corpus once per active detector (using the
+per-request `detector_mode` override to filter the active set
+down) plus once with the full mix, then prints a side-by-side
+metric table. Always exits 0 — exploratory, not a CI gate.
+
+Operator-facing docs live in [docs/benchmark.md](benchmark.md);
+this section is the implementation map.
 
 ## Adding a new detector
 
@@ -334,7 +420,7 @@ Mirror the existing `_pf_detector_that_raises` /
 
 ### 6. (If your detector has an auto-startable service container)
 
-Five additional touches:
+Two required touches plus one optional convenience:
 
 **a. `services/my_service/`** — new directory:
 
@@ -343,24 +429,7 @@ Five additional touches:
   `services/privacy_filter/Containerfile` for shape.
 - `README.md` — service-specific docs.
 
-**b. `tools/image_builder/specs.py`** — add the new flavour:
-
-- New `Flavour(...)` entry in `_build_catalog()`. Set `containerfile`,
-  `context`, any `build_args` (e.g. CUDA index, baked-model toggle),
-  the default tag (with a matching `TAG_MY_SERVICE` env override via
-  `_resolve_default_tag`), and `bakes_model=True` if the build pulls
-  weights from HuggingFace at build time.
-- If you want it grouped under a new menu section, add a
-  `GROUP_MY_GROUP = "my-group"` constant and an entry in
-  `_GROUP_ORDER` in `tools/image_builder/menu.py`. Otherwise reuse
-  one of the existing groups.
-- Add it to relevant entries in the `PRESETS` dict (`all` is computed
-  automatically; per-service presets are explicit).
-
-The CLI's `--flavour` validation, the menu's checkbox grid, and
-`--list` all read `FLAVOURS` directly, so nothing else needs touching.
-
-**c. `tools/launcher/spec_extras.py`** — add a `LauncherSpec(...)`
+**b. `tools/launcher/spec_extras.py`** — add a `LauncherSpec(...)`
 entry to `LAUNCHER_METADATA`:
 
 ```python
@@ -386,6 +455,31 @@ entry to `LAUNCHER_METADATA`:
 This single entry powers: launcher service auto-start, env-var
 forwarding to the guardrail container, network setup, /health probe,
 atexit cleanup. No further bash/Python wiring for the lifecycle.
+
+**c. `tools/image_builder/specs.py`** *(optional — convenience for
+local-dev builds via `scripts/image_builder.sh`)*. The image builder
+is a dev-loop wrapper around `<engine> build`; its catalog has no
+runtime effect on the launcher or the service. Operators can always
+build the new Containerfile directly (`podman build -f
+services/my_service/Containerfile services/my_service`), and CI
+publishes via its own workflow under `.github/workflows/`. Add a
+catalog entry only if you want the new image to show up in the
+builder's TUI / `--preset` / `--list`:
+
+- New `Flavour(...)` entry in `_build_catalog()`. Set `containerfile`,
+  `context`, any `build_args` (e.g. CUDA index, baked-model toggle),
+  the default tag (with a matching `TAG_MY_SERVICE` env override via
+  `_resolve_default_tag`), and `bakes_model=True` if the build pulls
+  weights from HuggingFace at build time.
+- If you want it grouped under a new menu section, add a
+  `GROUP_MY_GROUP = "my-group"` constant and an entry in
+  `_GROUP_ORDER` in `tools/image_builder/menu.py`. Otherwise reuse
+  one of the existing groups.
+- Add it to relevant entries in the `PRESETS` dict (`all` is computed
+  automatically; per-service presets are explicit).
+
+The CLI's `--flavour` validation, the menu's checkbox grid, and
+`--list` all read `FLAVOURS` directly, so nothing else needs touching.
 
 ### 7. (If you want CLI / menu support)
 
@@ -418,12 +512,12 @@ if my_detector_url is not None:
 
 ### 8. (If you want documentation)
 
-**`docs/detectors/my-detector.md`** — when to use it, env-var
-reference, failure-mode notes. Mirror the shape of the existing
-files in `docs/detectors/`.
-
-**`docs/configuration.md`** — env-var table rows for every new
-`MY_DETECTOR_*` knob.
+**`docs/detectors/my-detector.md`** — when to use it, the full
+`MY_DETECTOR_*` env-var reference (under a `## Configuration`
+section), failure-mode notes. Mirror the shape of the existing
+files in `docs/detectors/`. `docs/configuration.md` deliberately
+keeps only the cross-cutting knobs and links out to each detector's
+page for its own env vars, so per-detector tables stay in one place.
 
 **`services/my_service/README.md`** — service-specific docs (API,
 build, run).
@@ -434,10 +528,10 @@ build, run).
 |---|---|
 | **In-process detector only** | 2 — new detector module + `detector/__init__.py` |
 | **+ tests** | +1 to +2 — `tests/test_my_detector.py`, optional `tests/test_pipeline.py` |
-| **+ service container** | +5 — `services/my_service/{main.py,Containerfile,README.md}`, `scripts/image_builder.sh`, `tools/launcher/spec_extras.py` |
+| **+ service container** | +4 — `services/my_service/{main.py,Containerfile,README.md}`, `tools/launcher/spec_extras.py`. Optionally +1 (`tools/image_builder/specs.py`) so the new image shows up in the local-dev image-builder catalog. |
 | **+ launcher CLI** | +1 — `tools/launcher/main.py` |
 | **+ launcher menu** | +1 — `tools/launcher/menu.py` |
-| **+ docs** | +1 to +2 — `docs/detectors/<name>.md`, optional row in `docs/configuration.md` |
+| **+ docs** | +1 — `docs/detectors/<name>.md` (per-detector env vars live there, not in `docs/configuration.md`) |
 
 What you don't have to touch: `pipeline.py`, `main.py`, `config.py`,
 the bash wrapper script (`launcher.sh`), or any "list of detectors"
