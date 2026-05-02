@@ -9,20 +9,29 @@
 # Pushing a tag triggers the workflows in .github/workflows/:
 #   - publish-image.yml                  (guardrail image → ghcr.io)
 #   - publish-pf-service-image.yml       (privacy-filter-service → ghcr.io)
+#   - publish-pf-hf-service-image.yml    (privacy-filter-hf-service → ghcr.io)
 #   - publish-gliner-service-image.yml   (gliner-pii-service → ghcr.io)
 #   - release.yml                        (GitHub Release; canonical tag only)
 #
 # After the canonical vX.Y.Z tag, the script optionally also pushes
 # flavour-variant tags pointing at the same commit:
-#   vX.Y.Z+pf-service     → publishes the standalone privacy-filter-service
+#   vX.Y.Z+pf-service     → publishes the standalone privacy-filter-service (opf)
+#   vX.Y.Z+pf-hf-service  → publishes the experimental privacy-filter-hf-service
+#                           (HF forward + opf Viterbi decode)
 #   vX.Y.Z+gliner-service → publishes the standalone gliner-pii-service
 # Each one triggers its matching workflow separately. release.yml only
 # creates a GitHub Release for the canonical tag (variants reuse it).
 #
+# Note: pf and pf-hf publish to SEPARATE ghcr packages
+# (privacy-filter-service vs privacy-filter-hf-service), not as image
+# tags, because both packages already use the tag axis for hardware
+# variants (cpu / cu130 / etc).
+#
 # Baked variants (`+pf-service-baked`, `+gliner-service-baked`) are
 # NOT published from CI — the images are multi-GB. Build them locally
 # with `scripts/image_builder.sh -f pf-service-baked` (or
-# `-f gliner-service-baked`).
+# `-f gliner-service-baked`). The pf-hf-service has no baked variant —
+# its build hits disk-space pressure during commit.
 
 set -euo pipefail
 
@@ -151,18 +160,24 @@ git push "$remote" "$new_tag"
 ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create the release."
 
 # ── Flavour variants ─────────────────────────────────────────────────────────
-# Two independent axes, each prompted separately so an operator can
+# Three independent axes, each prompted separately so an operator can
 # decide per-axis instead of navigating a combined menu.
 #
 # Axis 1 — standalone privacy-filter-service (publish-pf-service-image.yml):
 #   vX.Y.Z+pf-service → separate ghcr package: privacy-filter-service
 #
-# Axis 2 — standalone gliner-pii-service (publish-gliner-service-image.yml):
+# Axis 2 — experimental privacy-filter-hf-service (publish-pf-hf-service-image.yml):
+#   vX.Y.Z+pf-hf-service → separate ghcr package: privacy-filter-hf-service
+#   HF Transformers forward + opf Viterbi decode. Same wire format as
+#   the opf-only pf-service. See services/privacy_filter_hf/COMPARE.md.
+#
+# Axis 3 — standalone gliner-pii-service (publish-gliner-service-image.yml):
 #   vX.Y.Z+gliner-service → separate ghcr package: gliner-pii-service
 #
 # Baked variants of any axis are intentionally absent — they're
 # local-build only (`scripts/image_builder.sh -f pf-service-baked` /
-# `-f gliner-service-baked`).
+# `-f gliner-service-baked`). The pf-hf-service has no baked variant
+# at all (build hits disk-space pressure during commit).
 variants=()
 
 say ""
@@ -175,6 +190,19 @@ read -r -p "Choose [1-2, default 1]: " sv_choice || true
 case "${sv_choice:-1}" in
   1) ;;
   2) variants+=("pf-service") ;;
+  *) err "Invalid choice."; exit 1 ;;
+esac
+
+say ""
+say "Also publish the experimental privacy-filter-hf-service image?"
+say "(HF forward + opf Viterbi; same wire format as pf-service. Separate ghcr package.)"
+say ""
+say "  ${c_grn}1)${c_rst} no"
+say "  ${c_grn}2)${c_rst} +pf-hf-service"
+read -r -p "Choose [1-2, default 1]: " hsv_choice || true
+case "${hsv_choice:-1}" in
+  1) ;;
+  2) variants+=("pf-hf-service") ;;
   *) err "Invalid choice."; exit 1 ;;
 esac
 

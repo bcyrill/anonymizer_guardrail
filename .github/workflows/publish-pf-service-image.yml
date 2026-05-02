@@ -42,10 +42,14 @@ env:
 
 jobs:
   build-and-push:
-    # Only fire for +pf-service tags (or workflow_dispatch). The other
-    # tag shapes are handled by publish-image.yml; this skip is the
-    # mirror of that workflow's `!contains(..., '+pf-service')`.
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.ref_name, '+pf-service') }}
+    # Only fire for +pf-service tags (or workflow_dispatch). Use
+    # endsWith (not contains) so `+pf-hf-service` — which contains
+    # the `+pf-service` substring — doesn't accidentally trigger this
+    # workflow alongside publish-pf-hf-service-image.yml.
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || endsWith(github.ref_name, '+pf-service')
+      || endsWith(github.ref_name, '+pf-service-baked')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -82,7 +86,7 @@ jobs:
       # rather than a surprise multi-GB CI run that we then refuse to
       # tag. Mirrors publish-image.yml's pf-baked handling.
       - name: Reject baked variant
-        if: ${{ github.event_name == 'push' && contains(github.ref_name, '+pf-service-baked') }}
+        if: ${{ github.event_name == 'push' && endsWith(github.ref_name, '+pf-service-baked') }}
         run: |
           echo "::error::Tag '${{ github.ref_name }}' refers to the baked pf-service flavour."
           echo "::error::Baked images are not published from CI — they're multi-GB."

@@ -38,11 +38,15 @@ env:
 
 jobs:
   build-and-push:
-    # Only fire for +gliner-service tags (or workflow_dispatch). The
-    # other tag shapes are handled by publish-image.yml /
-    # publish-pf-service-image.yml; this skip is the mirror of those
-    # workflows' negative checks.
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.ref_name, '+gliner-service') }}
+    # Only fire for +gliner-service tags (or workflow_dispatch). Use
+    # endsWith (not contains) for symmetry with the other per-service
+    # workflows; gliner doesn't currently collide with any other tag
+    # suffix, but the precise pattern keeps that property locked in
+    # if a future variant adopts a `+gliner-something` shape.
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || endsWith(github.ref_name, '+gliner-service')
+      || endsWith(github.ref_name, '+gliner-service-baked')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -80,7 +84,7 @@ jobs:
       # tag. Mirrors publish-pf-service-image.yml's pf-service-baked
       # handling.
       - name: Reject baked variant
-        if: ${{ github.event_name == 'push' && contains(github.ref_name, '+gliner-service-baked') }}
+        if: ${{ github.event_name == 'push' && endsWith(github.ref_name, '+gliner-service-baked') }}
         run: |
           echo "::error::Tag '${{ github.ref_name }}' refers to the baked gliner-service flavour."
           echo "::error::Baked images are not published from CI — they're multi-GB."

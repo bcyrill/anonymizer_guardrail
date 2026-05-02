@@ -1,0 +1,121 @@
+name: Publish privacy-filter-hf-service image
+
+# Builds the experimental HF-pipeline-based privacy-filter service from
+# services/privacy_filter_hf/Containerfile and pushes to a SEPARATE GHCR
+# package — `privacy-filter-hf-service` — under the same owner.
+# Sibling of publish-pf-service-image.yml; the two services share the
+# wire format (same /detect request/response shapes) and decode logic
+# (both use opf's ViterbiCRFDecoder), but use different forward-pass
+# implementations. See services/privacy_filter_hf/COMPARE.md for the
+# rationale and measurement context.
+#
+# A `+pf-hf-service` tag publishes the CPU variant only:
+#
+#   ghcr.io/<owner>/privacy-filter-hf-service:vX.Y.Z-cpu     CPU
+#
+# A `-cu130` matrix entry will be added once a `pf-hf-service-cu130`
+# build flavour exists (services/privacy_filter_hf/ doesn't ship the
+# cu130 variant yet — see TASKS.md).
+#
+# Triggers:
+#   - push of vX.Y.Z+pf-hf-service → CPU image build
+#   - workflow_dispatch            → ad-hoc build off any branch
+#
+# pf-hf-service-baked is deliberately NOT published from CI — same
+# rationale as the opf-only baked variants: multi-GB image, indefinite
+# storage on GHCR, low payoff. Anyone who needs it can build locally
+# with `scripts/image_builder.sh -f pf-hf-service-baked`.
+
+on:
+  push:
+    tags: ['v*.*.*']  # also matches v*.*.*+pf-hf-service
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    # endsWith (not contains) so the substring `+pf-service` inside
+    # `+pf-hf-service` doesn't accidentally trigger the wrong workflow.
+    # The opf-only pf-service workflow uses the same endsWith pattern.
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || endsWith(github.ref_name, '+pf-hf-service')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: cpu
+            torch_index: https://download.pytorch.org/whl/cpu
+            suffix: '-cpu'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Lowercase owner for image name
+        id: owner
+        run: |
+          echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute clean ref for metadata
+        id: cleanref
+        run: |
+          ref="${{ github.ref_name }}"
+          clean="${ref%%+*}"
+          echo "ref=$clean" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/privacy-filter-hf-service
+          flavor: |
+            suffix=${{ matrix.variant.suffix }},onlatest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.cleanref.outputs.ref }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.cleanref.outputs.ref }}
+            type=semver,pattern={{major}},value=${{ steps.cleanref.outputs.ref }}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=privacy-filter-hf-service
+            org.opencontainers.image.description=HF-pipeline-based forward + opf Viterbi decode wrapper around openai/privacy-filter
+            org.opencontainers.image.variant=${{ matrix.variant.name }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/privacy_filter_hf
+          file: services/privacy_filter_hf/Containerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            TORCH_INDEX_URL=${{ matrix.variant.torch_index }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=pf-hf-service-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=pf-hf-service-${{ matrix.variant.name }}
+          provenance: true
+          sbom: true

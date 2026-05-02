@@ -142,18 +142,12 @@ def _build_catalog() -> tuple[Flavour, ...]:
                 "TAG_PF_HF_SERVICE", "privacy-filter-hf-service:cpu"
             ),
         ),
-        Flavour(
-            name="pf-hf-service-baked",
-            group=GROUP_PF_HF,
-            label="cpu + model (baked)",
-            containerfile="services/privacy_filter_hf/Containerfile",
-            context="services/privacy_filter_hf",
-            build_args={"BAKE_MODEL": "true"},
-            default_tag=_resolve_default_tag(
-                "TAG_PF_HF_SERVICE_BAKED", "privacy-filter-hf-service:baked-cpu"
-            ),
-            bakes_model=True,
-        ),
+        # No baked variant — the build hits disk-space pressure during
+        # the layer commit (transformers + opf + ~3 GB of weights, with
+        # overlayfs duplicating cached files via snapshot symlinks,
+        # balloons the working set well past the image's nominal size).
+        # See services/privacy_filter_hf/Containerfile for the full
+        # rationale.
         # ── GLiNER-PII standalone service ───────────────────────────────
         Flavour(
             name="gliner-service",

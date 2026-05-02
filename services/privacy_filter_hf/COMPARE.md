@@ -121,10 +121,14 @@ The opf-only variant remains useful for:
 - **GPU deployments** where opf's MoE Triton kernel
   (`OPF_MOE_TRITON=1`) and the `OPF_VITERBI_CUDA_BATCH_SIZE` paths
   may close or reverse the gap (untested here).
-- **Air-gapped runs from the opf checkpoint cache** — the hf+opf
-  variant uses HF Hub directly, so its baked-image story would
-  download from HF rather than reusing the opf checkpoint at
-  `~/.opf/privacy_filter`.
+- **Air-gapped runs.** Only the opf-only variant ships a baked
+  image (`pf-service-baked` / `pf-service-baked-cu130`) — the hf+opf
+  build hits disk-space pressure during the bake's layer commit
+  (transformers + opf + ~3 GB of weights, with overlayfs duplicating
+  cached files via snapshot symlinks, balloons the working set well
+  past the image's nominal size), so it ships runtime-download only.
+  For an air-gapped hf+opf deployment, populate the HF cache via a
+  bind mount or a sidecar that pre-fetches.
 - **Reference behaviour for span quality** — opf is the upstream
   source of truth for the Viterbi decoder; the hf+opf variant
   consumes the same `ViterbiCRFDecoder` class but should be

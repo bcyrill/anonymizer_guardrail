@@ -27,13 +27,15 @@ env:
 
 jobs:
   build-and-push:
-    # Skip on +pf-service* / +gliner-service* tags — those are handled
-    # by publish-pf-service-image.yml / publish-gliner-service-image.yml
-    # (different images, different Containerfiles). The skip lives at the
-    # job level rather than as a negative tag pattern because GitHub
-    # Actions' minimatch parser treats `+*` as the extglob "one or more"
-    # quantifier and rejects the workflow with "invalid tags patterns".
-    if: ${{ !contains(github.ref_name, '+pf-service') && !contains(github.ref_name, '+gliner-service') }}
+    # Skip on any +<service> tags — those are handled by the
+    # per-service publish workflows (different images, different
+    # Containerfiles). The skip lives at the job level rather than as a
+    # negative tag pattern because GitHub Actions' minimatch parser
+    # treats `+*` as the extglob "one or more" quantifier and rejects
+    # the workflow with "invalid tags patterns". Skip whenever the tag
+    # contains any `+` suffix; the per-service workflows then claim
+    # their own slice via endsWith.
+    if: ${{ !contains(github.ref_name, '+') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,18 +45,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Reject any unknown tag suffix so accidental `+foo` tags don't
-      # silently fall through to a slim build.
-      - name: Validate tag suffix
-        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-        run: |
-          set -eu
-          case '${{ github.ref_name }}' in
-            *+*)
-              echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf-service or +gliner-service."
-              exit 1
-              ;;
-          esac
+      # The skip condition above already excludes any tag with a `+`
+      # suffix, so by the time we reach this step the tag is either
+      # plain semver (vX.Y.Z) or a workflow_dispatch invocation.
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

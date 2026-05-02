@@ -394,3 +394,64 @@ below fires.
   who need different tuning ship a different JSON; the env var
   selects the file, not the values.
 
+---
+
+## Promote `privacy-filter-hf-service` to default
+
+**What:** the experimental hf+opf-decoder variant
+([`services/privacy_filter_hf/`](services/privacy_filter_hf/)) is
+~7x faster than the opf-only service on CPU at full quality parity
+on the bundled fixtures (see
+`services/privacy_filter_hf/COMPARE.md`). Once it's been validated
+on more diverse corpora, replace the opf-only service as the
+production default — keep both packages published while the
+transition lands, then deprecate the opf-only path.
+
+**Status:** experimental. Wired into `image_builder` (one CPU
+flavour, `pf-hf-service`), published from CI as a separate ghcr
+package via `publish-pf-hf-service-image.yml`. Not wired into the
+launcher's auto-start path — operators run it manually with
+`podman run -p 8003:8003 …` and point `PRIVACY_FILTER_URL` at it.
+
+**Why deferred:** the speed/quality numbers come from two bundled
+fixtures plus a one-line probe. Production corpora will surface
+edge cases (long inputs, rare unicode, code blocks, tokeniser
+quirks) where the two variants might diverge. Promoting to default
+without that signal is premature.
+
+**Trigger:** any of these is sufficient to start the promotion.
+
+  * A real corpus shows the hf+opf variant matches the opf-only
+    variant span-for-span on >99% of inputs.
+  * Operators report the opf-only variant's CPU latency as a
+    real production blocker.
+  * A `pf-hf-service-cu130` flavour gets added and tested on GPU,
+    showing it doesn't *regress* against the opf-only CUDA path.
+
+**Sketch + effort** (when triggered, ~1-2 person-days total):
+
+| Phase | Effort | What |
+|---|---|---|
+| 1. Build a `pf-hf-service-cu130` flavour | ~1-2 hrs | Add to `tools/image_builder/specs.py`, parameterise the Containerfile on `TORCH_INDEX_URL` (already set up) and `TARGET_DEVICE` (mirror the opf-only's pattern). Add the cu130 entry to the matrix in `publish-pf-hf-service-image.yml`. |
+| 2. Run a wider corpus comparison | ~2-3 hrs | Probe both variants on a real customer-data corpus (or the `engagement_notes.txt` fixture extended). Diff span-for-span. Fix any divergence at the BIOES→span layer in `services/privacy_filter_hf/main.py`. |
+| 3. Promote in the launcher | ~2 hrs | Add `pf-hf-service` as a service option in `tools/launcher/spec_extras.py` (parallel to the existing `pf-service` block). Add a CLI flag / menu prompt to pick between the two variants when starting the auto-managed sidecar. |
+| 4. Rewrite docs | ~2 hrs | Switch `docs/detectors/privacy-filter.md` to point at the hf+opf variant by default; demote the opf-only path to "alternate / reference implementation". Update `docs/deployment.md`'s deployment matrix similarly. |
+| 5. Add a migration note | ~30 min | Stick a one-paragraph migration guide at the top of `docs/detectors/privacy-filter.md` so existing `PRIVACY_FILTER_URL` consumers know the wire format hasn't changed and the swap is just an image-tag edit. |
+| 6. Deprecate opf-only on a timer | ~30 min | Add a CHANGELOG entry committing to keep the opf-only image published for N releases (3?) before retiring it. Don't actually delete the workflow until that period elapses. |
+
+**Non-goals:**
+
+- Don't add a baked variant of `pf-hf-service`. The build hits
+  disk-space pressure during the layer commit (transformers + opf
+  + ~3 GB of weights, with overlayfs duplicating cached files via
+  snapshot symlinks). If a corpus needs air-gapped HF deployment,
+  ship a sidecar that pre-fetches into a bind-mounted cache rather
+  than baking the model into the image.
+- Don't merge the two services into one image with a switch. The
+  whole point of having both is to keep them comparable and roll
+  back cleanly if hf+opf turns out to misbehave on production
+  inputs. Two packages, two workflows, one wire format.
+- Don't change the wire format during promotion. The guardrail-side
+  detector is shape-stable across both variants today; promoting
+  without preserving that guarantee defeats the rollback story.
+
