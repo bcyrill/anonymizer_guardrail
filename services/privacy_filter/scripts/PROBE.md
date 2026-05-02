@@ -390,8 +390,8 @@ secrets in any meaningful sense (`dc01.acmecorp.local` → `secret`,
 `4FFL339` → `account_number`, `svc_jenkins` → `private_person`).
 These are model-side training-data choices, not decoder issues —
 the regex layer or gliner-pii's specific labels are the right
-place to disambiguate. See TASKS.md → "Shape-anchored regex
-override tier in privacy-filter" for the planned fix.
+place to disambiguate if a real corpus surfaces them as a
+recurring problem.
 
 **7. Calibration tuning is now optional.** The spike's three
 calibration profiles (default / anti-merge / privacy-parser)
