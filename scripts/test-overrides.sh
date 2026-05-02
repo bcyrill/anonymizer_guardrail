@@ -37,7 +37,7 @@ Without --preset:
   Connects to \$BASE_URL (default http://localhost:8000).
 
 With --preset NAME:
-  Boots a self-contained guardrail via scripts/cli.sh, runs the
+  Boots a self-contained guardrail via scripts/launcher.sh, runs the
   tests, tears it down. Default port ${TEST_PORT}, container name "${TEST_NAME}".
 
 Options:
@@ -114,12 +114,12 @@ start_test_guardrail() {
   detect_engine
   BASE_URL="http://localhost:${TEST_PORT}"
   say ""
-  say "${c_bld}Setting up test environment via cli.sh --preset ${PRESET}${c_rst}"
+  say "${c_bld}Setting up test environment via launcher.sh --preset ${PRESET}${c_rst}"
   say "  port=${TEST_PORT}  name=${TEST_NAME}  log=${TEST_LOG}"
-  # Inject the named-alternative registries via cli.sh's `--` passthrough.
+  # Inject the named-alternative registries via launcher.sh's `--` passthrough.
   # Tests for regex_patterns / llm_prompt then reference these names.
   # `pentest` is a name we made up; the operator picks any name they want.
-  "$SCRIPT_DIR/cli.sh" --preset "$PRESET" \
+  "$SCRIPT_DIR/launcher.sh" --preset "$PRESET" \
     --port "$TEST_PORT" --name "$TEST_NAME" --replace \
     -- \
     -e "REGEX_PATTERNS_REGISTRY=pentest=bundled:regex_pentest.yaml" \
@@ -136,7 +136,7 @@ start_test_guardrail() {
       return 0
     fi
     if ! kill -0 "$GUARDRAIL_PID" 2>/dev/null; then
-      err "cli.sh exited before guardrail came up. Tail of $TEST_LOG:"
+      err "launcher.sh exited before guardrail came up. Tail of $TEST_LOG:"
       tail -30 "$TEST_LOG" >&2
       exit 1
     fi

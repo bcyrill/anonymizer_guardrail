@@ -1,4 +1,4 @@
-"""Flag-driven launcher (replaces scripts/cli.sh).
+"""Flag-driven launcher.
 
 Plain Click, no Typer / rich. Each option carries a `_help_section`
 attribute (set via the `grouped_option` decorator) that the custom
@@ -6,9 +6,13 @@ attribute (set via the `grouped_option` decorator) that the custom
 `--help`. Column widths are computed globally across all sections so
 every section's option-name column lines up.
 
-The interactive menu lives in `tools/launcher/menu.py`; this module is
-the CLI entry point only. Both are dev-only — installed via
-`pip install -e ".[dev]"`, never shipped in the production image.
+`--ui` / `--interactive` hands off to the Textual menu in
+`tools/launcher/menu.py` via an eager callback — same entry point
+covers both modes. The bash wrapper (`scripts/launcher.sh`) just
+exec's into this module; flag dispatch is Python-side.
+
+Dev-only — installed via `pip install -e ".[dev]"`, never shipped in
+the production image.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import sys
 from typing import Any
 
 # Click is a dev-only dep (declared in pyproject's [dev] extras). The
-# bash wrappers (scripts/cli.sh) exec into us; if dev wasn't installed,
+# bash wrapper (scripts/launcher.sh) execs into us; if dev wasn't installed,
 # we want a clear ImportError pointing at the install command.
 try:
     import click
@@ -175,6 +179,7 @@ def _apply_preset(cfg: LaunchConfig, preset: str) -> str | None:
 # Constants so a typo in any one --help-section reference shows up at
 # import time as a NameError rather than as a "wrong section in help"
 # silent bug.
+_S_MODE = "Mode"
 _S_REQUIRED = "Required"
 _S_CONTAINER = "Container"
 _S_SURROGATE = "Logging & surrogates"
@@ -186,13 +191,32 @@ _S_LLM = "LLM detector"
 _S_OTHER = "Other"
 
 
+# ── --ui / --interactive eager callback ───────────────────────────────────
+def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """Hand off to the Textual TUI when --ui/--interactive is set.
+
+    Eager so it fires before any required-arg validation in the main
+    command (the TUI collects everything itself, no CLI flags needed).
+    `resilient_parsing` is true during shell-completion; skip the
+    handoff in that case so completion doesn't accidentally launch
+    a full TUI session.
+    """
+    if not value or ctx.resilient_parsing:
+        return
+    # Imported lazily so a CLI-only invocation doesn't pay the
+    # textual import cost (~50ms) on startup.
+    from .menu import run_interactive
+    rc = run_interactive()
+    ctx.exit(rc)
+
+
 # ── Click command ─────────────────────────────────────────────────────────
 # Decorator stack: applied bottom-up. Sections are declared per-option
 # via `grouped_option(group=...)`. Adding a new flag means picking the
 # right group; nothing else to wire.
 @click.command(
     cls=GroupedCommand,
-    # No args → show this command's help. Without this, `scripts/cli.sh`
+    # No args → show this command's help. Without this, `scripts/launcher.sh`
     # (no args) would call the function with all defaults and trip
     # validation deep inside, which is a noisier UX than just showing
     # the help up front.
@@ -202,6 +226,19 @@ _S_OTHER = "Other"
     # wider terminals. 200 is a generous ceiling that lets the actual
     # terminal width drive layout up to that cap.
     context_settings={"max_content_width": 200},
+)
+# ── Mode ──────────────────────────────────────────────────────────────────
+# Eager + expose_value=False: fires before required-arg validation,
+# never reaches the cli() function as a kwarg. Two flag spellings so
+# both `--ui` (canonical, short) and `--interactive` (verbose) work.
+@grouped_option(
+    "--ui", "--interactive",
+    is_flag=True,
+    expose_value=False,
+    is_eager=True,
+    callback=_open_menu,
+    group=_S_MODE,
+    help="Open the Textual interactive menu instead of CLI mode.",
 )
 # ── Required ──────────────────────────────────────────────────────────────
 @grouped_option(
@@ -405,7 +442,7 @@ def cli(
     """Launch the anonymizer-guardrail container with the given configuration.
 
     Anything after `--` is passed straight through to `podman/docker run`.
-    For an interactive walkthrough instead of flags, use scripts/menu.sh.
+    For an interactive walkthrough instead of flags, pass `--ui`.
     """
 
     cfg = LaunchConfig()
@@ -557,11 +594,12 @@ def cli(
 
 def main() -> None:
     """Entry point invoked by `python -m tools.launcher` and the
-    scripts/cli.sh wrapper.
+    scripts/launcher.sh wrapper.
 
     `LAUNCHER_PROG_NAME` is set by the bash wrapper so the Usage line
-    in --help reads `scripts/cli.sh` rather than `python -m tools.launcher`.
-    Without the env var we fall back to Click's default (sys.argv[0])."""
+    in --help reads `scripts/launcher.sh` rather than
+    `python -m tools.launcher`. Without the env var we fall back to
+    Click's default (sys.argv[0])."""
     prog_name = os.environ.get("LAUNCHER_PROG_NAME")
     if prog_name:
         cli.main(prog_name=prog_name)

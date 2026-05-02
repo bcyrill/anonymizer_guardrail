@@ -439,9 +439,9 @@ if [[ ${#BUILD_LIST[@]} -gt 1 ]]; then
   ok "Built ${#BUILD_LIST[@]} images."
   say ""
   say "${c_dim}Try them via:${c_rst}"
-  say "  scripts/menu.sh                       ${c_dim}# interactive picker${c_rst}"
-  say "  scripts/cli.sh --preset uuid-debug    ${c_dim}# slim + fake-llm${c_rst}"
-  say "  scripts/cli.sh --preset pentest       ${c_dim}# pf + fake-llm + pentest config${c_rst}"
+  say "  scripts/launcher.sh --ui                       ${c_dim}# interactive picker${c_rst}"
+  say "  scripts/launcher.sh --preset uuid-debug    ${c_dim}# slim + fake-llm${c_rst}"
+  say "  scripts/launcher.sh --preset pentest       ${c_dim}# pf + fake-llm + pentest config${c_rst}"
   exit 0
 fi
 TYPE="$RESOLVED_TYPE"
@@ -540,10 +540,10 @@ case "$TYPE" in
     say "  ${c_dim}# Self-contained CUDA build. Needs an nvidia GPU at run time.${c_rst}"
     ;;
   fake-llm)
-    say "  ${c_dim}# fake-llm is auto-started by scripts/cli.sh when you${c_rst}"
+    say "  ${c_dim}# fake-llm is auto-started by scripts/launcher.sh when you${c_rst}"
     say "  ${c_dim}# pick a DETECTOR_MODE that includes llm and choose the${c_rst}"
     say "  ${c_dim}# fake-llm backend. Just run a guardrail flavour:${c_rst}"
-    say "  scripts/cli.sh -t slim -d regex,llm --llm-backend fake-llm"
+    say "  scripts/launcher.sh -t slim -d regex,llm --llm-backend fake-llm"
     say ""
     say "  ${c_dim}# To run it standalone (e.g. to probe rules directly):${c_rst}"
     say "  ${ENGINE} run --rm -p 4000:4000 ${TAG}"

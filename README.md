@@ -17,12 +17,12 @@ sides of the round-trip.
 scripts/build-image.sh -t all
 
 # Interactive launcher.
-scripts/menu.sh
+scripts/launcher.sh --ui
 
 # Or flag-driven with a preset:
-scripts/cli.sh --preset uuid-debug      # slim + regex,llm + fake-llm
-scripts/cli.sh --preset pentest         # pf + privacy_filter,llm + pentest config
-scripts/cli.sh --preset regex-only      # slim + regex only — no LLM creds needed
+scripts/launcher.sh --preset uuid-debug      # slim + regex,llm + fake-llm
+scripts/launcher.sh --preset pentest         # pf + privacy_filter,llm + pentest config
+scripts/launcher.sh --preset regex-only      # slim + regex only — no LLM creds needed
 ```
 
 For LiteLLM wiring, see [docs/litellm-integration.md](docs/litellm-integration.md).

@@ -42,7 +42,7 @@ There are two ways to choose which detectors run during the benchmark
 — pick whichever fits the loop you're in:
 
 **1. Run your own guardrail manually.** Start the guardrail however
-you usually do (`scripts/cli.sh …`, podman/docker, Kubernetes, etc.)
+you usually do (`scripts/launcher.sh …`, podman/docker, Kubernetes, etc.)
 with whatever `DETECTOR_MODE` and per-detector env vars you want to
 score. The benchmark calls `/health` on connect, prints the active
 `DETECTOR_MODE`, and runs every case the running guardrail can serve.
@@ -52,7 +52,7 @@ detector tuning without restarting:
 
 ```bash
 # Terminal 1 — running guardrail with your preferred config
-scripts/cli.sh -t pf --detector-mode regex,denylist,privacy_filter
+scripts/launcher.sh -t pf --detector-mode regex,denylist,privacy_filter
 
 # Terminal 2 — score it
 scripts/benchmark.sh --config bundled:pentest
@@ -62,7 +62,7 @@ The wrapper reads `$BASE_URL` (default `http://localhost:8000`) or
 `--base-url`.
 
 **2. Spawn a fresh test guardrail via `--preset NAME`.** The
-benchmark backgrounds `scripts/cli.sh --preset NAME` on port 8001,
+benchmark backgrounds `scripts/launcher.sh --preset NAME` on port 8001,
 waits for `/health`, runs the corpus, and tears the guardrail down on
 exit (override with `--keep`). Use this for one-shot comparisons:
 
@@ -92,7 +92,7 @@ compare and pass `--compare`:
 
 ```bash
 # Terminal 1 — guardrail with everything switched on
-scripts/cli.sh -t pf --detector-mode regex,denylist,privacy_filter,llm \
+scripts/launcher.sh -t pf --detector-mode regex,denylist,privacy_filter,llm \
     --llm-backend service
 
 # Terminal 2 — score each detector individually + the full mix
@@ -169,7 +169,7 @@ detector wired in, then run `--compare` on the bundled pentest corpus.
 #      --rules ...                   deterministic fake-LLM responses for the
 #                                    benchmark (correct calls, mistypings,
 #                                    hallucinations, malformed output).
-./scripts/cli.sh -t slim -d regex,denylist,privacy_filter,gliner_pii,llm \
+./scripts/launcher.sh -t slim -d regex,denylist,privacy_filter,gliner_pii,llm \
     --privacy-filter-backend service \
     --gliner-pii-backend service \
     --llm-backend service \

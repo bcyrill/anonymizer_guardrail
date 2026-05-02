@@ -27,7 +27,7 @@ pytest -k surrogate                    # name match
 ```
 
 End-to-end tests exercise the full HTTP path against an actual
-container (builds + runs + asserts via `cli.sh --preset`):
+container (builds + runs + asserts via `launcher.sh --preset`):
 
 ```bash
 scripts/test-examples.sh --preset uuid-debug   # slim + regex,llm + fake-llm
@@ -66,8 +66,8 @@ tools/launcher/                  # dev-only, NOT in the wheel
   menu.py                        # Textual TUI
 
 scripts/                         # bash wrappers, ~5 lines each
-  cli.sh                         # exec python -m tools.launcher
-  menu.sh                        # exec python -m tools.launcher.menu
+  launcher.sh                    # exec python -m tools.launcher
+                                 #   (CLI by default, --ui opens TUI)
   build-image.sh                 # podman/docker build wrapper
   release.sh                     # git tag + push for CI
 
@@ -140,20 +140,20 @@ package because the launcher is dev-only.
 
 ## The launcher
 
-Two thin bash wrappers (`scripts/cli.sh`, `scripts/menu.sh`)
-exec into Python entry points under `tools/launcher/`. The launcher
-is **dev-only** — its Python source lives outside `src/` and isn't
-shipped in the production wheel.
+A single thin bash wrapper (`scripts/launcher.sh`) execs into
+`python -m tools.launcher`. The launcher is **dev-only** — its Python
+source lives outside `src/` and isn't shipped in the production wheel.
 
-- **`scripts/cli.sh`** → `python -m tools.launcher` → Click CLI.
-  Single-command app with options grouped per detector via a
-  custom `GroupedCommand` formatter (option-name columns aligned
-  globally across sections).
-- **`scripts/menu.sh`** → `python -m tools.launcher.menu` →
-  Textual TUI. Single-screen menuconfig-style — General / one
-  section per enabled detector / Faker. Arrow keys navigate;
-  Space toggles checkboxes; Enter confirms; Ctrl+↑/↓ reorders
-  detectors in the enable+order modal.
+Two modes share the entry point:
+
+- **CLI (default)** — Click single-command app with options grouped
+  per detector via a custom `GroupedCommand` formatter (option-name
+  columns aligned globally across sections).
+- **TUI (`--ui` / `--interactive`)** — eager Click callback hands off
+  to the Textual app in `tools/launcher/menu.py`. Single-screen
+  menuconfig-style — General / one section per enabled detector /
+  Faker. Arrow keys navigate; Space toggles checkboxes; Enter
+  confirms; Ctrl+↑/↓ reorders detectors in the enable+order modal.
 
 Both produce a `LaunchConfig` and hand it to
 `tools/launcher/runner.run_guardrail()`, which composes the engine
@@ -431,9 +431,9 @@ build, run).
 | **+ docs** | +1 to +2 — `docs/detectors/<name>.md`, optional row in `docs/configuration.md` |
 
 What you don't have to touch: `pipeline.py`, `main.py`, `config.py`,
-the bash wrapper scripts (`cli.sh` / `menu.sh`), or any "list of
-detectors" enumeration. They all consume `REGISTERED_SPECS` /
-`LAUNCHER_METADATA` and adapt automatically.
+the bash wrapper script (`launcher.sh`), or any "list of detectors"
+enumeration. They all consume `REGISTERED_SPECS` / `LAUNCHER_METADATA`
+and adapt automatically.
 
 ## Conventions
 

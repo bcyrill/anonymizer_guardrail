@@ -17,12 +17,12 @@ scripts/build-image.sh -t all
 
 # Interactive launcher — single-screen menuconfig-style UI, every
 # setting visible at once, drill in to edit, hit Launch.
-scripts/menu.sh
+scripts/launcher.sh --ui
 
 # Flag-driven launcher with bundled presets:
-scripts/cli.sh --preset uuid-debug      # slim + regex,llm + fake-llm + LOG_LEVEL=debug
-scripts/cli.sh --preset pentest         # pf + regex,privacy_filter,llm + pentest patterns/prompt + fake-llm
-scripts/cli.sh --preset regex-only      # slim + regex only — no LLM creds needed
+scripts/launcher.sh --preset uuid-debug      # slim + regex,llm + fake-llm + LOG_LEVEL=debug
+scripts/launcher.sh --preset pentest         # pf + regex,privacy_filter,llm + pentest patterns/prompt + fake-llm
+scripts/launcher.sh --preset regex-only      # slim + regex only — no LLM creds needed
 
 # Exercise the curl recipes against a running guardrail
 # (or pass --preset to spin one up + tear it down):
@@ -121,7 +121,7 @@ for the model license note.
 
 OpenAI-compatible Chat Completions server backed by a YAML rules file
 (see [`services/fake_llm/README.md`](../services/fake_llm/README.md)).
-Used by the test recipes and `scripts/cli.sh --llm-backend service`
+Used by the test recipes and `scripts/launcher.sh --llm-backend service`
 to exercise the LLM-detector path deterministically without an
 actual LLM. **Local-build only** — `scripts/build-image.sh -t fake-llm`.
 Not for production.

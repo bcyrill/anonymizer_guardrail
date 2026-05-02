@@ -7,13 +7,13 @@ whichever `DETECTOR_MODE` matches the example you want to try:
 
 ```bash
 # Regex-only (covers most examples below).
-scripts/cli.sh -t slim -d regex --no-faker
+scripts/launcher.sh -t slim -d regex --no-faker
 
 # Add the privacy-filter NER for the address / name examples.
-scripts/cli.sh -t pf -d regex,privacy_filter
+scripts/launcher.sh -t pf -d regex,privacy_filter
 
 # Full stack, requires LLM_API_BASE / LLM_API_KEY for the LLM examples.
-scripts/cli.sh -t pf -d regex,privacy_filter,llm \
+scripts/launcher.sh -t pf -d regex,privacy_filter,llm \
   --llm-backend external \
   --llm-api-base http://litellm:4000/v1 \
   --llm-api-key sk-litellm-master \
@@ -258,7 +258,7 @@ entries:
 Pass it via `--denylist-path`, or set `DENYLIST_PATH` directly:
 
 ```bash
-scripts/cli.sh -t slim -d denylist,regex --denylist-path /etc/anonymizer/deny.yaml
+scripts/launcher.sh -t slim -d denylist,regex --denylist-path /etc/anonymizer/deny.yaml
 ```
 
 Then a request mentioning any of the entries gets them flagged:

@@ -22,7 +22,7 @@ by changing the detector list.
 | `PRIVACY_FILTER_TIMEOUT_S` | `30` | Per-call timeout (seconds) on the remote privacy-filter HTTP requests. |
 | `PRIVACY_FILTER_FAIL_CLOSED` | `true` | Block requests when the privacy_filter detector errors. Independent flag — operators can fail closed on one detector and open on another. Applies to both the in-process and remote variants. |
 | `PRIVACY_FILTER_MAX_CONCURRENCY` | `10` | Semaphore on in-flight `privacy_filter` calls (in-process AND remote). Independent of `LLM_MAX_CONCURRENCY`. Surfaced as `pf_in_flight`/`pf_max_concurrency` on `/health`. |
-| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop transformers pinging HuggingFace Hub on every start. The `pf-baked` image flavour sets it automatically; runtime-download flavours leave it unset on first run. `scripts/cli.sh --hf-offline` / the menu offer it once the cache volume is populated. |
+| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop transformers pinging HuggingFace Hub on every start. The `pf-baked` image flavour sets it automatically; runtime-download flavours leave it unset on first run. `scripts/launcher.sh --hf-offline` / the menu offer it once the cache volume is populated. |
 
 ## In-process (default)
 

@@ -1,10 +1,14 @@
 """Interactive launcher (Textual TUI).
 
-Replaces the bash `menu.sh` dialog UI with a Textual single-screen
-menuconfig-style app. All current settings are visible at once on
-the main screen; each row drills into a modal for editing. Mirrors
-the bash menu's section layout (General, Detectors, Faker) but with
-better keyboard nav, mouse support, and theming.
+Single-screen menuconfig-style app. All current settings are visible
+at once on the main screen; each row drills into a modal for editing.
+Section layout (General, Detectors, Faker) keeps the same conceptual
+groupings the operator already knows.
+
+Invoked via `scripts/launcher.sh --ui` — the Click CLI in `main.py`
+catches that flag in an eager callback and hands off to
+`run_interactive()` here. There's no separate entry point for the
+TUI; the unified launcher always goes through `tools.launcher.main`.
 
 Per-detector submenus stay hand-written for the detectors with unique
 fields (gliner labels/threshold, llm prompt, etc.); the boilerplate
@@ -25,7 +29,6 @@ which exec's the engine in the foreground, replacing this process.
 
 from __future__ import annotations
 
-import sys
 from typing import Callable
 
 from textual import on
@@ -208,9 +211,8 @@ class DetectorOrderScreen(ModalScreen[list[str] | None]):
 
     Order matters because `pipeline._dedup` keeps the first-seen
     entity_type for duplicate text matches, so the detector listed
-    first wins type-resolution conflicts. Bash menu.sh and the older
-    Textual port both forced canonical order; this gives operators
-    full control without leaving the menu.
+    first wins type-resolution conflicts. Earlier UIs forced canonical
+    order; this gives operators full control without leaving the menu.
     """
 
     BINDINGS = [
@@ -1025,16 +1027,6 @@ def run_interactive() -> int:
     return run_guardrail(engine, cfg)
 
 
-def main() -> None:
-    """Entry point invoked by `python -m tools.launcher.menu` and the
-    scripts/menu.sh wrapper. Drives the Textual app and exits with the
-    engine's return code."""
-    rc = run_interactive()
-    sys.exit(rc)
-
-
-if __name__ == "__main__":
-    main()
 
 
 __all__ = ["run_interactive", "main", "LauncherApp"]

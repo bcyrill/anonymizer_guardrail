@@ -4,7 +4,7 @@ Two modes, mirroring scripts/test-examples.sh:
 
   default            connect to $BASE_URL (caller manages the
                      guardrail).
-  --preset NAME      spawn a fresh test guardrail via scripts/cli.sh,
+  --preset NAME      spawn a fresh test guardrail via scripts/launcher.sh,
                      run the benchmark, tear it down on exit.
 
 Output is a rich table per case + an aggregate summary. Operators
@@ -69,18 +69,18 @@ def _fetch_health(base_url: str, timeout_s: float = 5.0) -> dict[str, Any]:
 def _start_preset_guardrail(
     preset: str, port: int, name: str, log_path: str,
 ) -> subprocess.Popen:
-    """Background a `scripts/cli.sh --preset PRESET` and wait for
+    """Background a `scripts/launcher.sh --preset PRESET` and wait for
     /health. Mirrors test-examples.sh's start_test_guardrail.
     Returns the Popen handle so the caller can tear it down."""
     repo_root = _repo_root()
-    cli_sh = repo_root / "scripts" / "cli.sh"
-    if not cli_sh.is_file():
-        raise click.UsageError(f"{cli_sh} not found — are you in a checkout?")
+    launcher_sh = repo_root / "scripts" / "launcher.sh"
+    if not launcher_sh.is_file():
+        raise click.UsageError(f"{launcher_sh} not found — are you in a checkout?")
 
     log_file = open(log_path, "w")
     proc = subprocess.Popen(
         [
-            str(cli_sh),
+            str(launcher_sh),
             "--preset", preset,
             "--port", str(port),
             "--name", name,
@@ -90,14 +90,14 @@ def _start_preset_guardrail(
         stderr=subprocess.STDOUT,
         cwd=str(repo_root),
         # Detach into a new session so a Ctrl+C in the bench doesn't
-        # nuke cli.sh before its own EXIT trap fires (it stops the
+        # nuke launcher.sh before its own EXIT trap fires (it stops the
         # auto-started fake-llm / pf-service).
         start_new_session=True,
     )
 
     base_url = f"http://localhost:{port}"
     _console.print(
-        f"[dim]Spawning test guardrail: scripts/cli.sh --preset {preset} "
+        f"[dim]Spawning test guardrail: scripts/launcher.sh --preset {preset} "
         f"(port {port}, name {name}, log {log_path})[/dim]"
     )
     deadline = time.monotonic() + 90
@@ -105,7 +105,7 @@ def _start_preset_guardrail(
         if proc.poll() is not None:
             tail = _tail(log_path, 30)
             raise click.ClickException(
-                f"cli.sh exited (code {proc.returncode}) before guardrail came up.\n"
+                f"launcher.sh exited (code {proc.returncode}) before guardrail came up.\n"
                 f"Last lines of {log_path}:\n{tail}"
             )
         try:
@@ -123,7 +123,7 @@ def _start_preset_guardrail(
 
 
 def _stop_preset_guardrail(proc: subprocess.Popen, name: str, keep: bool) -> None:
-    """SIGTERM the cli.sh process group so its EXIT trap fires and
+    """SIGTERM the launcher.sh process group so its EXIT trap fires and
     tears down auto-started services. Belt-and-braces removes the
     container by name in case the signal got lost."""
     if keep:
@@ -394,7 +394,7 @@ def _print_comparison(corpus_name: str, results: list[tuple[str, "Summary"]]) ->
 @click.option(
     "--preset",
     type=str, default=None,
-    help="cli.sh preset (uuid-debug | pentest | regex-only). When set, spawn a test guardrail and tear it down on exit.",
+    help="launcher.sh preset (uuid-debug | pentest | regex-only). When set, spawn a test guardrail and tear it down on exit.",
 )
 @click.option(
     "--port",

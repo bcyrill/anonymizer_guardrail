@@ -64,16 +64,16 @@ podman run --rm --name anonymizer \
   anonymizer-guardrail:latest
 ```
 
-`scripts/cli.sh` exposes `--llm-backend service` which auto-starts
+`scripts/launcher.sh` exposes `--llm-backend service` which auto-starts
 this service on a shared network and points the guardrail at it — no
 manual `-v` / `--network` plumbing needed:
 
 ```bash
-scripts/cli.sh -t slim -d regex,llm --llm-backend service
+scripts/launcher.sh -t slim -d regex,llm --llm-backend service
 
 # With a custom rules file (mounted at /app/rules.yaml inside the
 # auto-started fake-llm container):
-scripts/cli.sh -t slim -d regex,llm --llm-backend service \
+scripts/launcher.sh -t slim -d regex,llm --llm-backend service \
     --rules services/fake_llm/my-rules.yaml
 ```
 
@@ -81,11 +81,11 @@ Pass `--llm-backend external` instead when the LLM endpoint is
 managed elsewhere (real OpenAI, an existing Ollama, etc.) and use
 `--llm-api-base` / `--llm-api-key` / `--llm-model` to point at it.
 
-If you'd rather wire it manually, `scripts/cli.sh` also accepts
+If you'd rather wire it manually, `scripts/launcher.sh` also accepts
 passthrough args after `--`:
 
 ```bash
-scripts/cli.sh -t slim -d regex,llm -- \
+scripts/launcher.sh -t slim -d regex,llm -- \
   --network anonymizer-net \
   -e LLM_API_BASE=http://fake-llm:4000/v1 \
   -e LLM_API_KEY=any \

@@ -14,7 +14,7 @@
 #
 # Two modes:
 #   default            connect to $BASE_URL (caller manages the guardrail).
-#   --preset NAME      spawn a fresh test guardrail via scripts/cli.sh
+#   --preset NAME      spawn a fresh test guardrail via scripts/launcher.sh
 #                      (in the background), run the tests, tear it down
 #                      on exit. Uses non-default ports/names so it
 #                      doesn't fight your regular containers.
@@ -45,14 +45,14 @@ Without --preset:
 
 With --preset NAME:
   Boots a self-contained test environment by invoking
-  scripts/cli.sh --preset NAME on port ${TEST_PORT} (--port to override)
+  scripts/launcher.sh --preset NAME on port ${TEST_PORT} (--port to override)
   with container name "${TEST_NAME}", waits for /health, runs the
   tests, then stops it. Skips teardown when --keep is set.
 
 Tests whose required detection layer isn't enabled are skipped.
 
 Options:
-  --preset NAME   Bundled cli.sh preset (uuid-debug | pentest | regex-only).
+  --preset NAME   Bundled launcher.sh preset (uuid-debug | pentest | regex-only).
   --port N        Host port for the test guardrail (default: ${TEST_PORT}).
   --keep          Don't tear down the test guardrail on exit.
   -h, --help      Show this help.
@@ -187,10 +187,10 @@ detect_engine() {
   fi
 }
 
-# ── Optional: spin up a test guardrail via cli.sh ──────────────────────────
-# We background cli.sh and watch /health on the chosen port. cli.sh
+# ── Optional: spin up a test guardrail via launcher.sh ──────────────────────────
+# We background launcher.sh and watch /health on the chosen port. launcher.sh
 # inherits a clean SIGTERM handler from _lib.sh that stops the
-# auto-started fake-llm — so a plain `kill` of the cli.sh PID tears
+# auto-started fake-llm — so a plain `kill` of the launcher.sh PID tears
 # the whole stack down.
 GUARDRAIL_PID=""
 TEARDOWN_REGISTERED=false
@@ -199,13 +199,13 @@ start_test_guardrail() {
   detect_engine
   BASE_URL="http://localhost:${TEST_PORT}"
   say ""
-  say "${c_bld}Setting up test environment via cli.sh --preset ${PRESET}${c_rst}"
+  say "${c_bld}Setting up test environment via launcher.sh --preset ${PRESET}${c_rst}"
   say "  port=${TEST_PORT}  name=${TEST_NAME}  log=${TEST_LOG}"
 
   # `--replace` so a leftover container from a previous run doesn't
   # error us out. Output goes to a log file because dialog/run output
   # is noisy and we want clean test output here.
-  "$SCRIPT_DIR/cli.sh" --preset "$PRESET" \
+  "$SCRIPT_DIR/launcher.sh" --preset "$PRESET" \
     --port "$TEST_PORT" --name "$TEST_NAME" --replace \
     > "$TEST_LOG" 2>&1 &
   GUARDRAIL_PID=$!
@@ -219,7 +219,7 @@ start_test_guardrail() {
       return 0
     fi
     if ! kill -0 "$GUARDRAIL_PID" 2>/dev/null; then
-      err "cli.sh exited before guardrail came up. Tail of $TEST_LOG:"
+      err "launcher.sh exited before guardrail came up. Tail of $TEST_LOG:"
       tail -30 "$TEST_LOG" >&2
       exit 1
     fi
@@ -242,7 +242,7 @@ stop_test_guardrail() {
   say "${c_dim}Stopping test guardrail...${c_rst}"
   if [[ -n "$GUARDRAIL_PID" ]] && kill -0 "$GUARDRAIL_PID" 2>/dev/null; then
     kill "$GUARDRAIL_PID" 2>/dev/null || true
-    # Give cli.sh a moment to run its EXIT trap (which stops fake-llm).
+    # Give launcher.sh a moment to run its EXIT trap (which stops fake-llm).
     wait "$GUARDRAIL_PID" 2>/dev/null || true
   fi
   # Belt-and-braces if the signal got lost.

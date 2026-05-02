@@ -30,7 +30,7 @@ dev = [
     "pytest-mock>=3.12",
     # Launcher (tools/launcher/) — Click for the flag-driven CLI,
     # Textual for the interactive menu (single-screen menuconfig-
-    # style UI, mirrors what scripts/menu.sh did with the bash
+    # style UI, mirrors what scripts/launcher.sh --ui did with the bash
     # `dialog` tool), rich for status/plan rendering (color, tables,
     # NO_COLOR support). Dev-only because the launcher lives outside
     # src/ and isn't shipped in the wheel (see

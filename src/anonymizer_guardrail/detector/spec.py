@@ -20,10 +20,11 @@ What the registry deliberately does NOT cover:
   * **Cross-cutting config** (vault, surrogate, http server, faker
     locale): still on the central `Config` in `config.py`. These
     aren't per-detector, so there's no spec to attach them to.
-  * **Bash launchers** (`cli.sh`, `menu.sh`, `_lib.sh`): bash can't
-    consume Python state. The launchers stay hand-wired. A separate
-    pass could generate a sourceable manifest from the registry, but
-    that's its own problem.
+  * **Bash wrapper** (`scripts/launcher.sh`): bash can't consume
+    Python state, so it stays hand-wired. The Python launcher
+    (`tools/launcher/`) consumes `LAUNCHER_METADATA` to build CLI
+    flags and menu rows automatically — that's where new detectors
+    get their UX wiring.
 """
 
 from __future__ import annotations
