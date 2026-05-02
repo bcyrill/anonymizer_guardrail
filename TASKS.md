@@ -830,24 +830,6 @@ or filing duplicate issues for already-tracked work.
 
 ---
 
-## Split `tests/test_pipeline.py` by feature
-
-**What:** `tests/test_pipeline.py` is 618 lines with tests covering
-anonymise, deanonymise, override resolution, fail-closed semantics,
-TaskGroup behaviour, and dedup. Splitting into a few focused files
-(`test_pipeline_anonymize.py`, `test_pipeline_overrides.py`,
-`test_pipeline_failure.py`, etc.) would let a contributor working on
-one area run a focused subset and produce shorter `pytest -v` output.
-
-**Why deferred:** ergonomics, not correctness — no bugs hide because
-of file size. Worth doing the next time the file gets a substantial
-addition.
-
-**Effort:** ~1 hr (tests pass through a `git mv` + import-fix flow,
-no logic changes).
-
----
-
 ## Move `litellm.config.example.yaml` to `examples/`
 
 **What:** the LiteLLM example config sits at the repo root
