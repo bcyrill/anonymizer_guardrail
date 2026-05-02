@@ -27,6 +27,37 @@ scripts/launcher.sh --preset regex-only      # slim + regex only — no LLM cred
 
 For LiteLLM wiring, see [docs/litellm-integration.md](docs/litellm-integration.md).
 
+## Deployment topology
+
+```
+            ┌─────────────────────────────────────────────────────────┐
+            │  Detection layer (parallel, request-side only)          │
+            │    regex / denylist          in-process, microseconds   │
+            │    privacy-filter-service    HTTP sidecar               │
+            │    gliner-pii-service        HTTP sidecar               │
+            │    LLM detector ──────→ LiteLLM (anonymize alias) *     │
+            └─────────────────▲───────────────────────────────────────┘
+                              │
+                              │ pre_call:  detect → replace with surrogates
+                              │ post_call: vault lookup → restore originals
+                              │
+   client ──→ LiteLLM ────────┴────→ anonymizer-guardrail
+                 │
+                 └──→ upstream LLM (OpenAI / Anthropic / local / fake-llm)
+
+   *  the `anonymize` alias must NOT have the guardrail attached,
+      otherwise every detection call would re-enter and recurse forever.
+```
+
+LiteLLM is the entry point and calls the guardrail twice per request:
+once on the way in (`pre_call` → anonymize), once on the way back
+(`post_call` → deanonymize via the in-memory vault). Detection runs
+only on the request side; the response side is a pure substring-replace
+from the vault keyed by `litellm_call_id`. See
+[docs/deployment.md](docs/deployment.md) for image / sidecar details
+and [docs/limitations.md](docs/limitations.md) for the single-replica
+implication of the in-memory vault.
+
 ## What it does
 
 Five detection layers, all optional, controlled by `DETECTOR_MODE`:

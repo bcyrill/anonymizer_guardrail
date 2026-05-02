@@ -907,30 +907,6 @@ already in the right files.
 
 ---
 
-## README.md deployment-topology diagram
-
-**What:** add a small ASCII diagram (or link one in
-`docs/deployment.md`) showing the request flow:
-
-```
-  client ─→ LiteLLM ─→ guardrail (slim) ─┬→ pf-service / pf-hf-service
-                                          ├→ gliner-pii-service
-                                          └→ LLM detector → LiteLLM (alias)
-                            ↓
-                       upstream LLM
-```
-
-**Why:** today a new reader can find the Quick Start (one
-`scripts/launcher.sh --preset uuid-debug` line) and the per-detector
-docs, but the *shape* of a deployment — what talks to what — takes
-three documents to assemble. A 10-line diagram in README.md
-compresses that comprehension cost.
-
-**Effort:** ~30 min including a sanity check that the diagram
-matches the launcher's actual topology.
-
----
-
 ## Cross-reference TASKS.md from limitations.md and operations.md
 
 **What:** several entries in `docs/limitations.md` document
