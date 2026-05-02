@@ -64,10 +64,18 @@ python services/gliner_pii/scripts/probe.py \
 
 # Side-by-side comparison: do creative labels add coverage on top of
 # the standard PII set, or duplicate it? `engagement_notes.txt` is a
-# synthetic red-team transcript shipped alongside the script.
+# synthetic red-team transcript shipped alongside the script —
+# IPs, hostnames, AWS keys, GitHub PATs, NTLM hashes, JWTs,
+# plaintext passwords, license plates, MAC addresses, etc.
+#
+# Note that `password`, `secret`, and `credential` deliberately
+# overlap; the coverage summary will tell you whether the model
+# treats them as synonyms (one match wins) or distinct (the same
+# span tagged under multiple labels — informative when picking the
+# canonical name for production).
 python services/gliner_pii/scripts/probe.py \
     --text-file services/gliner_pii/scripts/engagement_notes.txt \
-    --labels person,organization,internal_hostname,vehicle_registration,api_key
+    --labels person,organization,ip_address,internal_hostname,mac_address,password,secret,credential,api_key,hash,vehicle_registration
 
 # Lower the threshold to surface marginal matches when probing
 # whether an unusual label registers at all (default cutoff is tuned
