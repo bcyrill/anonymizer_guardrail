@@ -82,10 +82,19 @@ class ServiceSpec:
     are honoured by the readiness probe in services.py."""
 
     hf_cache_volume: str | None = None
-    """Named volume mounted at `/app/.cache/huggingface` inside the
-    container. None means the service doesn't need a persistent cache
-    (e.g. fake-llm). Different services use different volumes so a
-    `volume rm` of one doesn't wipe the other."""
+    """Named volume to mount inside the container for persistent model
+    weights. Mount path is `cache_mount_path` (default
+    `/app/.cache/huggingface`). None means the service doesn't need a
+    persistent cache (e.g. fake-llm). Different services use different
+    volumes so a `volume rm` of one doesn't wipe the other."""
+
+    cache_mount_path: str = "/app/.cache/huggingface"
+    """Where inside the container to mount `hf_cache_volume`. Default
+    is the standard HuggingFace cache path used by transformers-based
+    services (gliner-pii, fake-llm). Privacy-filter overrides to
+    `/app/.opf` because opf writes its checkpoint into `~/.opf/` and
+    bypasses HF_HOME — see services/privacy_filter/Containerfile for
+    the rationale. Ignored when hf_cache_volume is None."""
 
     guardrail_env_when_started: dict[str, str] = field(default_factory=dict)
     """Env vars the launcher sets on the GUARDRAIL container when this
@@ -170,6 +179,15 @@ LAUNCHER_METADATA: dict[str, LauncherSpec] = {
             # is genuinely broken.
             readiness_timeout_s=300,
             hf_cache_volume="anonymizer-hf-cache",
+            # opf writes its checkpoint into `~/.opf/privacy_filter`
+            # (= `/app/.opf/privacy_filter` for the app user) and
+            # ignores HF_HOME — so we mount the cache volume there
+            # rather than at the conventional HF cache path. Mounting
+            # at `/app/.cache/huggingface` and using a symlink
+            # doesn't work: pathlib's mkdir(parents=True, exist_ok=True)
+            # chokes on a dangling symlink in the parent chain when
+            # the volume is empty.
+            cache_mount_path="/app/.opf",
             guardrail_env_when_started={
                 "PRIVACY_FILTER_URL": "http://privacy-filter-service:8001",
             },
