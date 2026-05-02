@@ -79,10 +79,22 @@ _LABEL_MAP: dict[str, str] = {
 # pure whitespace; keep them separate when a non-whitespace separator
 # (slash, pipe, "and", etc.) signals a list. Addresses get the comma
 # exception because it's structurally part of the value.
-_DEFAULT_GAP_PATTERN = re.compile(r"\s+")
+#
+# Both rules also forbid `\n\n` (paragraph break) — a blank line is a
+# stronger separator than a same-type label call, so adjacent spans
+# bracketing a paragraph break stay distinct even when the model labels
+# them the same way. Mirrors the in-process detector's gap rules; see
+# anonymizer_guardrail.detector.privacy_filter for the longer rationale.
+_DEFAULT_GAP_PATTERN = re.compile(r"[^\S\n]*\n?[^\S\n]*")
 _GAP_PATTERNS: dict[str, re.Pattern[str]] = {
-    "ADDRESS": re.compile(r"[\s,]+"),
+    "ADDRESS": re.compile(r"(?:[^\S\n]|,)*\n?(?:[^\S\n]|,)*"),
 }
+
+# Paragraph break used by the split pass — see the in-process
+# detector for the long rationale. tl;dr: HF's aggregation step can
+# fuse a span across a `\n\n` when it tags both halves with the
+# same entity; we split it back apart here.
+_PARAGRAPH_BREAK = re.compile(r"\n{2,}")
 
 
 def _gap_pattern_for(entity_type: str) -> re.Pattern[str]:
@@ -162,9 +174,30 @@ def _to_matches(spans: list[dict[str, Any]], source_text: str) -> list[dict[str,
                     continue
         merged.append((start, end, etype, score))
 
-    # 3) emit
-    out: list[dict[str, Any]] = []
+    # 3) split — break any span that crosses a paragraph break. The HF
+    # pipeline's aggregation_strategy="first" can fuse a span across a
+    # `\n\n` when the model labels tokens on both sides identically;
+    # we apply the same paragraph-boundary rule the merge pass uses,
+    # just from the opposite direction. Score is preserved unchanged
+    # on each piece — splitting doesn't reduce confidence in any one
+    # half, just acknowledges they're unrelated entities.
+    split: list[tuple[int, int, str, float]] = []
     for start, end, etype, score in merged:
+        sub = source_text[start:end]
+        if "\n\n" not in sub:
+            split.append((start, end, etype, score))
+            continue
+        cursor = 0
+        for m in _PARAGRAPH_BREAK.finditer(sub):
+            if m.start() > cursor:
+                split.append((start + cursor, start + m.start(), etype, score))
+            cursor = m.end()
+        if cursor < len(sub):
+            split.append((start + cursor, end, etype, score))
+
+    # 4) emit
+    out: list[dict[str, Any]] = []
+    for start, end, etype, score in split:
         value = source_text[start:end].strip()
         # Hallucination / drift guard: the substring must actually be
         # in the source text. Slicing can fall outside it if the

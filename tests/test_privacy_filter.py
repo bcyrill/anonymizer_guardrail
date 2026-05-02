@@ -245,6 +245,91 @@ async def test_persons_with_comma_stay_distinct(mock_load: MagicMock) -> None:
     assert len(matches) == 2
 
 
+async def test_paragraph_break_blocks_merge(mock_load: MagicMock) -> None:
+    """A pure `\\n\\n` between two same-type spans is a paragraph break,
+    which is a stronger separator than the model's same-label call.
+    Don't merge — the spans are likely unrelated entities the model
+    just happened to tag identically (e.g. a real date at the end of
+    one paragraph and a "Resolution:" heading at the start of the next
+    that got misclassified as a date).
+
+    The gap text MUST be exactly the paragraph break with no other
+    characters — otherwise the all-whitespace requirement on the gap
+    pattern blocks the merge for the wrong reason and this test
+    would pass under the pre-fix `\\s+` pattern too."""
+    from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterDetector
+
+    text = "Date: 2026-04-17\n\nResolution: contact support."
+    # text[16:18] is exactly "\n\n" — gap is the paragraph break and
+    # nothing else, so the pattern is the only thing that decides
+    # whether to merge.
+    mock_load.return_value = [
+        {"entity_group": "private_date", "score": 0.99, "word": "2026-04-17",
+         "start": 6, "end": 16},
+        {"entity_group": "private_date", "score": 0.99, "word": "Resolution:",
+         "start": 18, "end": 29},
+    ]
+    detector = PrivacyFilterDetector()
+    matches = await detector.detect(text)
+    assert len(matches) == 2
+    assert {m.text for m in matches} == {"2026-04-17", "Resolution:"}
+
+
+async def test_paragraph_break_splits_one_span(mock_load: MagicMock) -> None:
+    """When the HF pipeline's aggregation produces ONE span that
+    already crosses a paragraph break (it groups adjacent same-entity
+    tokens regardless of whitespace in the source), the split pass
+    breaks it into the parts on either side. Same logical rule as the
+    merge pass's `\\n\\n` carve-out, applied from the opposite
+    direction — a paragraph boundary is a stronger separator than the
+    model's same-label call.
+
+    This is the realistic case in production: HF's
+    aggregation_strategy="first" emits one span like
+    "2026-04-17\\n\\nResolution:" because both halves got tagged
+    `private_date`, and the merge pass never sees two spans to keep
+    apart. Without this split pass the operator gets one DATE_OF_BIRTH
+    Match covering a date AND a misclassified header, which makes the
+    redaction nonsensical."""
+    from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterDetector
+
+    text = "Date: 2026-04-17\n\nResolution: contact support."
+    # The pipeline returned ONE span [6:29] covering
+    # "2026-04-17\n\nResolution:" — a real-world artifact of HF's
+    # aggregation collapsing adjacent same-entity tokens.
+    mock_load.return_value = [
+        {"entity_group": "private_date", "score": 0.99,
+         "word": "2026-04-17 Resolution:",
+         "start": 6, "end": 29},
+    ]
+    detector = PrivacyFilterDetector()
+    matches = await detector.detect(text)
+    assert len(matches) == 2
+    assert {m.text for m in matches} == {"2026-04-17", "Resolution:"}
+
+
+async def test_single_newline_still_merges(mock_load: MagicMock) -> None:
+    """A *single* newline between same-type spans is in-paragraph line
+    wrapping (a long name that broke across lines, etc.), not a
+    paragraph boundary. Still merge — the paragraph hasn't ended, so
+    the model is most likely splitting one entity rather than tagging
+    two."""
+    from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterDetector
+
+    text = "Hi, my name is Alice\nSmith there"
+    mock_load.return_value = [
+        {"entity_group": "private_person", "score": 0.99, "word": "Alice",
+         "start": 15, "end": 20},
+        {"entity_group": "private_person", "score": 0.97, "word": "Smith",
+         "start": 21, "end": 26},
+    ]
+    detector = PrivacyFilterDetector()
+    matches = await detector.detect(text)
+    assert len(matches) == 1
+    assert matches[0].text == "Alice\nSmith"
+    assert matches[0].entity_type == "PERSON"
+
+
 async def test_different_types_never_merge(mock_load: MagicMock) -> None:
     """A PERSON adjacent to an EMAIL_ADDRESS — even with a pure
     whitespace gap — must NOT merge. The merge rule is same-type only."""

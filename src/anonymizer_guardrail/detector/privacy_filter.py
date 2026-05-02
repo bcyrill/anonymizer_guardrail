@@ -111,10 +111,28 @@ _DEFAULT_MODEL = "openai/privacy-filter"
 # Addresses are the one exception: the comma is part of the address
 # itself ("123 Main St, Springfield" is one place), so the ADDRESS rule
 # also accepts whitespace-and-comma gaps.
-_DEFAULT_GAP_PATTERN = re.compile(r"\s+")
+#
+# Both rules forbid `\n\n` (paragraph break). A blank line is a stronger
+# separator than a same-type label call from the model — when a date at
+# the end of one paragraph sits next to a header word at the start of the
+# next that the model misclassified as a date, those should stay two
+# spans, not merge into one. `[^\S\n]` matches whitespace except newline;
+# `\n?` permits at most one newline inside the gap, which still covers
+# normal in-paragraph line wrapping (including `\r\n`).
+_DEFAULT_GAP_PATTERN = re.compile(r"[^\S\n]*\n?[^\S\n]*")
 _GAP_PATTERNS: dict[str, re.Pattern[str]] = {
-    "ADDRESS": re.compile(r"[\s,]+"),
+    "ADDRESS": re.compile(r"(?:[^\S\n]|,)*\n?(?:[^\S\n]|,)*"),
 }
+
+# Paragraph break — used by the split pass to break apart a single
+# span the HF pipeline already aggregated across a `\n\n`. The
+# aggregation_strategy="first" used in `_load_pipeline` groups
+# adjacent same-entity tokens regardless of intervening whitespace,
+# so a date at the end of one paragraph and a header word at the
+# start of the next that the model tagged identically can come back
+# as one span. Splitting it here applies the same logical rule the
+# merge pass enforces from the opposite direction.
+_PARAGRAPH_BREAK = re.compile(r"\n{2,}")
 
 
 def _gap_pattern_for(entity_type: str) -> re.Pattern[str]:
@@ -229,9 +247,32 @@ class PrivacyFilterDetector:
                         continue
             merged.append((start, end, etype))
 
-        # 3) emit
-        out: list[Match] = []
+        # 3) split — break any span that crosses a paragraph break.
+        # Mirror of the merge pass's `\n\n` carve-out: the merge pass
+        # refuses to combine two spans across a paragraph break (from
+        # below); this pass splits a single span the pipeline already
+        # combined across one (from above). HF's
+        # aggregation_strategy="first" produces the latter when the
+        # model assigns the same entity to tokens on either side of a
+        # blank line — the regex fix on the merge side never sees
+        # those because they arrive as a single span.
+        split: list[tuple[int, int, str]] = []
         for start, end, etype in merged:
+            sub = source_text[start:end]
+            if "\n\n" not in sub:
+                split.append((start, end, etype))
+                continue
+            cursor = 0
+            for m in _PARAGRAPH_BREAK.finditer(sub):
+                if m.start() > cursor:
+                    split.append((start + cursor, start + m.start(), etype))
+                cursor = m.end()
+            if cursor < len(sub):
+                split.append((start + cursor, end, etype))
+
+        # 4) emit
+        out: list[Match] = []
+        for start, end, etype in split:
             value = source_text[start:end].strip()
             # Hallucination / drift guard: the substring must actually
             # be in the source text. Slicing can fall outside it if the

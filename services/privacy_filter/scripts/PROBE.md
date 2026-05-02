@@ -112,8 +112,8 @@ red-team fixture:
 | Full-name persons (`Sarah Chen`, `Mike Hernandez`) | ✓ at 1.000 | ✓ at 0.998–0.999 |
 | Bare-first-name persons (`Mike;`) | ✓ at 0.557 (weak) | ✓ at 0.577 (weak) |
 | Bare FQDNs (`dc01.acmecorp.local`, `siem.acmecorp.local`) | ✓ as `URL` (~0.95) | ✗ (`url` needs a scheme) |
-| AWS access key + secret block (`.env`-style `KEY = VALUE`) | ✓ as `CREDENTIAL` at 0.968 (merged span) | ✗ |
-| JWT bearer token | ✓ as `CREDENTIAL` at 1.000 | ✗ |
+| AWS access key + secret block (`.env`-style `KEY = VALUE`) | ✓ as `CREDENTIAL` at 0.968 — span `[991:1079]` covers both `AKIA…` and the `AWS_SECRET_ACCESS_KEY = …` line cleanly; the next-paragraph heading `Spotted` splits out as its own (model-misclassified) `CREDENTIAL` at `[1081:1088]`, droppable by length filter | ✗ |
+| JWT bearer token | ✓ as `CREDENTIAL` at 1.000 — span `[2079:2145]` is the JWT alone; the trailing `SHA-256` heading splits out as its own `CREDENTIAL` at `[2147:2154]`, similarly droppable | ✗ |
 | GitHub PAT (`ghp_…` in parenthetical prose) | ✗ | ✓ as `api_key` at 1.000 |
 | MAC address (`04:7c:16:a2:f3:9b`) | ✗ (no label) | ✓ as `mac_address` at 1.000 |
 | IPv4 addresses | ✗ (no label) | partial — 2 of 5 unique IPs (`10.0.7.18`, `10.0.7.42` at 0.8–0.99); missed `10.0.5.10`, `10.0.7.55`, `10.0.12.4` |
@@ -131,14 +131,21 @@ red-team fixture:
    has no label for. On a pentest-style transcript, run **both**
    and compose — neither alone hits the majority of entities.
 
-2. **The `\n\n` over-merge bug surfaces here too.** The AWS-key
-   `CREDENTIAL` span at `[991:1088]` swallowed the next line *and*
-   a `Spotted` heading; the JWT span at `[2079:2154]` trailed
-   into the `SHA-256` heading on the following line. Same root
-   cause as the over-merge on `sample.txt` —
-   `services/privacy_filter/main.py:82`'s `_DEFAULT_GAP_PATTERN`
-   matches `\n\n`, so adjacent same-type spans get merged across
-   paragraph breaks.
+2. **The `\n\n` over-merge previously surfaced here too — now
+   fixed.** Pre-fix, the AWS-key `CREDENTIAL` span at `[991:1088]`
+   swallowed the next line *and* a `Spotted` heading; the JWT span
+   at `[2079:2154]` trailed into the `SHA-256` heading on the
+   following line. Post-fix, the AWS span is `[991:1079]` (88 chars,
+   credential bytes only) plus a separate `Spotted` `CREDENTIAL`
+   at `[1081:1088]`; the JWT is `[2079:2145]` (66 chars, JWT only)
+   plus a separate `SHA-256` `CREDENTIAL` at `[2147:2154]`. The
+   `CREDENTIAL` count rose from 2 → 4 because each over-merged
+   span split in two, but the *useful* matches (AWS block, JWT)
+   are now clean rather than corrupted. The misclassified halves
+   (`Spotted`, `SHA-256`) are length-droppable in production
+   post-filtering. See "Span-merge no longer over-extends across
+   `\n\n`" in the `sample.txt` findings below for the full
+   mechanism.
 
 3. **Plaintext passwords and NTLM hashes are a regex job.** Both
    detectors miss or weakly hit shape-stable secrets embedded in
@@ -169,20 +176,48 @@ right after a name). For real-world data with quirky formatting
 this is a recall risk; pairing privacy-filter with the regex
 detector covers the gap.
 
-**2. Span-merge over-extends across `\n\n` paragraph breaks.**
-Two cases on `sample.txt`:
+**2. Span-merge no longer over-extends across `\n\n` paragraph
+breaks (fixed).** Pre-fix, three over-merged spans on
+`sample.txt`:
 
-| Span | Captured text | What's wrong |
+| Span (pre-fix) | Captured text | What was wrong |
 |---|---|---|
 | `[164:191]` `DATE_OF_BIRTH` | `2026-04-17 09:42\n\nCustomer:` | "Customer:" header glued onto the date |
 | `[803:827]` `DATE_OF_BIRTH` | `2026-04-17.\n\nResolution:` | "Resolution:" heading glued onto the date |
+| `[300:367]` `ADDRESS` | `742\nEvergreen Terrace, Springfield, IL 62701, United States.\n\nIssue` | "Issue" header from the next paragraph silently absorbed into the address |
 
-Source: `services/privacy_filter/main.py:82` —
-`_DEFAULT_GAP_PATTERN = re.compile(r"\s+")` matches *any*
-whitespace including double newlines, so adjacent same-type spans
-get merged across paragraph breaks. Tightening that pattern (e.g.
-forbidding `\n\n`, or capping merged-gap length) would fix this
-without affecting normal in-paragraph merges.
+Two layers of defense, both in `services/privacy_filter/main.py`
+and `src/anonymizer_guardrail/detector/privacy_filter.py` (kept in
+lockstep — the in-process and remote detectors must produce
+identical output):
+
+- **Merge side** (`_DEFAULT_GAP_PATTERN`): refuses to combine two
+  adjacent same-type spans when the gap between them contains a
+  `\n\n`. Pattern tightened from `\s+` to
+  `[^\S\n]*\n?[^\S\n]*` — at most one newline allowed inside a
+  gap, with arbitrary non-newline whitespace on either side.
+  Single-newline merges (in-paragraph line wrapping, `\r\n`)
+  still work normally.
+- **Split side** (`_PARAGRAPH_BREAK`, new step 3 in `_to_matches`):
+  breaks any *single* span the pipeline already aggregated across
+  a `\n\n`. This is the case that bit `sample.txt` — HF's
+  `aggregation_strategy="first"` collapsed adjacent same-entity
+  tokens regardless of whitespace in the source, so the merge
+  regex never saw two spans to keep apart. The split pass mirrors
+  the merge rule from the opposite direction.
+
+Post-fix on `sample.txt`, the same three spans become six:
+`2026-04-17 09:42` + `Customer:` (separate DATE_OF_BIRTH spans),
+`2026-04-17.` + `Resolution:`, and `742\nEvergreen Terrace,
+Springfield, IL 62701, United States.` + `Issue`. The half-spans
+that are still model misclassifications (`Customer:`,
+`Resolution:`, `Issue`) are now isolated rather than corrupting a
+correctly-tagged neighbor — a downstream confidence filter or
+regex layer can drop them without taking a real entity along.
+
+Locked in by `tests/test_privacy_filter.py::test_paragraph_break_blocks_merge`,
+`test_paragraph_break_splits_one_span`, and
+`test_single_newline_still_merges`.
 
 **3. Credit cards don't fire as IDENTIFIER, even on the simplest
 input.**
