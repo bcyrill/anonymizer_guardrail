@@ -73,6 +73,25 @@ def _resolve_image(engine: Engine, service: ServiceSpec) -> tuple[str, str]:
     return service.image_tag_defaults[-1], "fallback"
 
 
+# Tag substrings that mark an image as CUDA-built. The image_builder's
+# cu130 flavours emit tags like `:cu130` and `:baked-cu130`; future
+# CUDA versions (cu140, etc.) get caught by the `cu1` prefix.
+# Operators with custom tag schemes who want GPU exposure on a tag
+# we don't recognise can override via `<NAME>_USE_GPU=1` (handled below).
+_GPU_TAG_MARKERS: tuple[str, ...] = (":cu1", "-cu1")
+
+
+def _image_uses_gpu(image: str) -> bool:
+    """True iff the resolved image tag looks like a CUDA build. The
+    launcher emits `--device nvidia.com/gpu=all` (podman) or
+    `--gpus all` (docker) when this returns True so the container can
+    see the GPU. Tag-substring detection over a separate spec field
+    because the LauncherSpec doesn't know which flavour the operator
+    picked at runtime — image_tag_envs returns whichever variant is
+    actually built on this host."""
+    return any(marker in image for marker in _GPU_TAG_MARKERS)
+
+
 def start_service(
     engine: Engine,
     name: str,
@@ -145,6 +164,22 @@ def start_service(
     # and the existing "container exists but isn't running → remove"
     # branch at the top of this function handles a leftover corpse on
     # the next launcher run.
+
+    # GPU exposure — when the resolved image tag suggests a CUDA build
+    # (`:cu130`, `:baked-cu130`, etc.), emit the engine-specific flag
+    # so the container can see the GPU. The host needs nvidia-container-
+    # toolkit installed; without it the run fails loud at start. CPU
+    # images skip this branch entirely.
+    if _image_uses_gpu(image):
+        if engine.name == "podman":
+            cmd.extend(["--device", "nvidia.com/gpu=all"])
+        else:  # docker
+            cmd.extend(["--gpus", "all"])
+        _console.print(
+            f"[yellow]Image {image!r} requests GPU access. Host needs "
+            f"nvidia-container-toolkit; failing here would have been "
+            f"a confusing 'cuda not available' at first request.[/yellow]",
+        )
 
     # HF cache volume — only for services that need persistent model
     # weights. Create on first run and warn that the first start will

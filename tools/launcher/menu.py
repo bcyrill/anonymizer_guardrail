@@ -569,7 +569,7 @@ class LauncherApp(App):
 
         if "privacy_filter" in active:
             items.append(Separator())
-            backend = cfg.backends.get("privacy_filter") or "in-process"
+            backend = cfg.backends.get("privacy_filter") or "service"
             items.append(_header("Privacy-filter", hint=backend))
             items.append(_row("privacy_filter_backend", "Backend", backend))
             if cfg.backends.get("privacy_filter") == "external":
@@ -687,11 +687,7 @@ class LauncherApp(App):
         if key == "flavour":
             self._pick(
                 "Image flavour",
-                [
-                    ("slim", "slim — no privacy-filter"),
-                    ("pf", "pf — privacy-filter (runtime download)"),
-                    ("pf-baked", "pf-baked — privacy-filter (model in image)"),
-                ],
+                [("slim", "slim (the only flavour — privacy-filter ships as a sidecar)")],
                 cfg.flavour,
                 self._set_flavour,
             )
@@ -740,18 +736,13 @@ class LauncherApp(App):
                 lambda v: self._set_env("DENYLIST_BACKEND", v),
             )
         elif key == "privacy_filter_backend":
-            allow_in_process = cfg.flavour in ("pf", "pf-baked")
-            choices: list[tuple[str, str]] = []
-            if allow_in_process:
-                choices.append(("", "in-process (model loaded in this container)"))
-            choices.extend([
-                ("service", "service (auto-start the inference container)"),
-                ("external", "external (operator-supplied URL)"),
-            ])
             self._pick(
                 "Privacy-filter backend",
-                choices,
-                cfg.backends.get("privacy_filter", ""),
+                [
+                    ("service", "service (auto-start the inference container)"),
+                    ("external", "external (operator-supplied URL)"),
+                ],
+                cfg.backends.get("privacy_filter", "service"),
                 lambda v: self._set_backend("privacy_filter", v),
             )
         elif key == "privacy_filter_url":
@@ -896,8 +887,8 @@ class LauncherApp(App):
 
     # ── Setter callbacks ──────────────────────────────────────────────────
     # Each setter applies a value to cfg + handles cross-cutting
-    # consequences (e.g. switching to slim auto-defaults privacy_filter
-    # backend to service since in-process can't load on slim).
+    # consequences (e.g. enabling privacy_filter auto-defaults its
+    # backend to service so the operator doesn't have to pick).
 
     def _set(self, attr: str, value: str) -> None:
         setattr(self.cfg, attr, value)
@@ -916,12 +907,9 @@ class LauncherApp(App):
 
     def _set_flavour(self, value: str) -> None:
         self.cfg.flavour = value
-        # Switching to slim with privacy_filter active and no backend
-        # → auto-default to service. The in-process backend isn't
-        # valid on slim; leaving it empty would just bounce off the
-        # launch validation.
-        if value == "slim" \
-                and "privacy_filter" in self.cfg.detector_names \
+        # Slim is the only flavour now; default privacy_filter to the
+        # service backend if it's active and the operator hasn't picked.
+        if "privacy_filter" in self.cfg.detector_names \
                 and not self.cfg.backends.get("privacy_filter"):
             self.cfg.backends["privacy_filter"] = "service"
 
@@ -943,9 +931,6 @@ class LauncherApp(App):
                 self.cfg.backends.pop(det, None)
                 continue
             if self.cfg.backends.get(det):
-                continue
-            if det == "privacy_filter" and self.cfg.flavour in ("pf", "pf-baked"):
-                # In-process is valid here; don't force a backend.
                 continue
             self.cfg.backends[det] = "service"
 

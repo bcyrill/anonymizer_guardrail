@@ -88,7 +88,7 @@ def _patch_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
 
 def _patch_pf_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
     """Same shim for the privacy_filter detector's fail_closed flag."""
-    from anonymizer_guardrail.detector import privacy_filter as pf_mod
+    from anonymizer_guardrail.detector import remote_privacy_filter as pf_mod
 
     monkeypatch.setattr(
         pf_mod, "CONFIG",

@@ -75,6 +75,12 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # OpenAI's privacy-filter repo by SHA so reproducible builds aren't at
 # the mercy of upstream master moving.
 ARG OPF_GIT_REF=f7f00ca7fb86
+# `TARGET_DEVICE` baked into PRIVACY_FILTER_DEVICE env so the runtime
+# default matches the wheel index. CPU images (default) keep
+# device=cpu; cu130 images pass --build-arg TARGET_DEVICE=cuda from
+# the image_builder's flavour config. Operators can still override at
+# run time via `-e PRIVACY_FILTER_DEVICE=…`.
+ARG TARGET_DEVICE=cpu
 
 # Two install steps so the torch wheel comes from the chosen index
 # (CPU vs CUDA). PyPI's default `torch` silently pulls in nvidia-cuda-*
@@ -124,7 +130,8 @@ RUN chown -R app:app /app
 ENV HOST=0.0.0.0 \
     PORT=8001 \
     LOG_LEVEL=info \
-    MODEL_NAME=openai/privacy-filter
+    MODEL_NAME=openai/privacy-filter \
+    PRIVACY_FILTER_DEVICE=$TARGET_DEVICE
 
 EXPOSE 8001
 

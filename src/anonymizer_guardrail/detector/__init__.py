@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from .regex import SPEC as _REGEX_SPEC
 from .denylist import SPEC as _DENYLIST_SPEC
-from .privacy_filter import SPEC as _PRIVACY_FILTER_SPEC
+from .remote_privacy_filter import SPEC as _PRIVACY_FILTER_SPEC
 from .remote_gliner_pii import SPEC as _GLINER_PII_SPEC
 from .llm import SPEC as _LLM_SPEC
 from .spec import DetectorSpec

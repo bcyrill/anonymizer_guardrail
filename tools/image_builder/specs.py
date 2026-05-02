@@ -69,7 +69,9 @@ def _resolve_default_tag(env_name: str, fallback: str) -> str:
 # import time but stay readable.
 def _build_catalog() -> tuple[Flavour, ...]:
     return (
-        # ── Guardrail (one Containerfile, two build-args) ──────────────
+        # ── Guardrail (one Containerfile, no build-args) ───────────────
+        # Slim is the only guardrail flavour. Privacy-filter and
+        # gliner-pii ship as standalone services.
         Flavour(
             name="slim",
             group=GROUP_GUARDRAIL,
@@ -77,28 +79,6 @@ def _build_catalog() -> tuple[Flavour, ...]:
             containerfile="Containerfile",
             context=".",
             default_tag=_resolve_default_tag("TAG_SLIM", "anonymizer-guardrail:latest"),
-        ),
-        Flavour(
-            name="pf",
-            group=GROUP_GUARDRAIL,
-            label="embed privacy-filter (runtime download)",
-            containerfile="Containerfile",
-            context=".",
-            build_args={"WITH_PRIVACY_FILTER": "true"},
-            default_tag=_resolve_default_tag("TAG_PF", "anonymizer-guardrail:privacy-filter"),
-        ),
-        Flavour(
-            name="pf-baked",
-            group=GROUP_GUARDRAIL,
-            label="embed privacy-filter + model (baked)",
-            containerfile="Containerfile",
-            context=".",
-            build_args={
-                "WITH_PRIVACY_FILTER": "true",
-                "BAKE_PRIVACY_FILTER_MODEL": "true",
-            },
-            default_tag=_resolve_default_tag("TAG_PF_BAKED", "anonymizer-guardrail:privacy-filter-baked"),
-            bakes_model=True,
         ),
         # ── Privacy-filter standalone service ───────────────────────────
         Flavour(
@@ -125,7 +105,10 @@ def _build_catalog() -> tuple[Flavour, ...]:
             label="cuda-130",
             containerfile="services/privacy_filter/Containerfile",
             context="services/privacy_filter",
-            build_args={"TORCH_INDEX_URL": "https://download.pytorch.org/whl/cu130"},
+            build_args={
+                "TORCH_INDEX_URL": "https://download.pytorch.org/whl/cu130",
+                "TARGET_DEVICE": "cuda",
+            },
             default_tag=_resolve_default_tag("TAG_PF_SERVICE_CU130", "privacy-filter-service:cu130"),
         ),
         Flavour(
@@ -137,6 +120,7 @@ def _build_catalog() -> tuple[Flavour, ...]:
             build_args={
                 "BAKE_MODEL": "true",
                 "TORCH_INDEX_URL": "https://download.pytorch.org/whl/cu130",
+                "TARGET_DEVICE": "cuda",
             },
             default_tag=_resolve_default_tag("TAG_PF_SERVICE_BAKED_CU130", "privacy-filter-service:baked-cu130"),
             bakes_model=True,

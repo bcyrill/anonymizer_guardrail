@@ -141,11 +141,12 @@ _PRESETS: dict[str, dict[str, object]] = {
         "_llm_backend": "service",
     },
     "pentest": {
-        "flavour": "pf",
+        "flavour": "slim",
         "detector_mode": "regex,privacy_filter,llm",
         "log_level": "debug",
         "use_faker": False,
         "_llm_backend": "service",
+        "_pf_backend": "service",
         "_env_overrides": {
             "REGEX_PATTERNS_PATH": "bundled:regex_pentest.yaml",
             "LLM_SYSTEM_PROMPT_PATH": "bundled:llm_pentest.md",
@@ -160,9 +161,11 @@ _PRESETS: dict[str, dict[str, object]] = {
 }
 
 
-def _apply_preset(cfg: LaunchConfig, preset: str) -> str | None:
-    """Apply a named preset to `cfg` in-place. Returns the preset's
-    LLM backend choice (or None) so the caller can wire auto-start."""
+def _apply_preset(cfg: LaunchConfig, preset: str) -> dict[str, str | None]:
+    """Apply a named preset to `cfg` in-place. Returns a dict of the
+    preset's backend choices (`llm`, `privacy_filter`, …) so the caller
+    can wire auto-start. Keys are detector names; values are backend
+    strings or None."""
     if preset not in _PRESETS:
         valid = ", ".join(_PRESETS)
         raise click.BadParameter(f"Unknown preset {preset!r}. Valid: {valid}")
@@ -172,7 +175,10 @@ def _apply_preset(cfg: LaunchConfig, preset: str) -> str | None:
             continue
         setattr(cfg, k, v)
     cfg.env_overrides.update(p.get("_env_overrides", {}))  # type: ignore[arg-type]
-    return p.get("_llm_backend")  # type: ignore[return-value]
+    return {
+        "llm": p.get("_llm_backend"),  # type: ignore[arg-type]
+        "privacy_filter": p.get("_pf_backend"),  # type: ignore[arg-type]
+    }
 
 
 # ── Section names ─────────────────────────────────────────────────────────
@@ -244,7 +250,7 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
 @grouped_option(
     "--type", "-t", "type_",
     type=str, default=None, group=_S_REQUIRED,
-    help="Image flavour: slim | pf | pf-baked.",
+    help="Image flavour: slim (the only flavour). Reserved for future expansion.",
 )
 @grouped_option(
     "--detector-mode", "-d",
@@ -324,12 +330,12 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
 @grouped_option(
     "--privacy-filter-backend", "pf_backend",
     type=str, default=None, group=_S_PF,
-    help="service (auto-start) | external (operator URL). On pf/pf-baked the default is in-process (no flag).",
+    help="service (auto-start the sidecar) | external (operator-managed URL). Default service.",
 )
 @grouped_option(
     "--privacy-filter-url", "pf_url",
     type=str, default=None, group=_S_PF,
-    help="PRIVACY_FILTER_URL — implies --privacy-filter-backend external.",
+    help="PRIVACY_FILTER_URL — pointing at an externally-managed privacy-filter-service. Implies --privacy-filter-backend external.",
 )
 @grouped_option(
     "--privacy-filter-fail-open", "pf_fail_open",
@@ -448,9 +454,9 @@ def cli(
     cfg = LaunchConfig()
 
     # Apply preset first so explicit flags can override.
-    preset_llm_backend: str | None = None
+    preset_backends: dict[str, str | None] = {}
     if preset:
-        preset_llm_backend = _apply_preset(cfg, preset)
+        preset_backends = _apply_preset(cfg, preset)
 
     if type_:
         cfg.flavour = type_
@@ -521,10 +527,16 @@ def cli(
         cfg.env_overrides["GLINER_PII_FAIL_CLOSED"] = "false"
 
     # ── Backend selection per detector ────────────────────────────────────
-    if llm_backend or preset_llm_backend:
-        cfg.backends["llm"] = llm_backend or preset_llm_backend or ""
-    if pf_backend:
-        cfg.backends["privacy_filter"] = pf_backend
+    if llm_backend or preset_backends.get("llm"):
+        cfg.backends["llm"] = llm_backend or preset_backends.get("llm") or ""
+    # privacy_filter is remote-only. Default to "service" (auto-start
+    # the sidecar) unless the operator explicitly picked "external" —
+    # matches gliner_pii's UX.
+    pf_resolved = pf_backend or preset_backends.get("privacy_filter")
+    if pf_resolved:
+        cfg.backends["privacy_filter"] = pf_resolved
+    elif "privacy_filter" in cfg.detector_names:
+        cfg.backends["privacy_filter"] = "service"
     if gliner_backend:
         cfg.backends["gliner_pii"] = gliner_backend
 
@@ -536,15 +548,6 @@ def cli(
             "(use 'service' to auto-start fake-llm or 'external' with "
             "--llm-api-base for a real LLM)."
         )
-    if "privacy_filter" in detectors and cfg.flavour == "slim":
-        if not cfg.backends.get("privacy_filter"):
-            raise click.BadParameter(
-                "DETECTOR_MODE includes 'privacy_filter' on --type slim, "
-                "but --privacy-filter-backend isn't set. The slim image "
-                "doesn't ship torch + the model, so the in-process "
-                "detector can't load. Pass --privacy-filter-backend "
-                "service (or external with --privacy-filter-url)."
-            )
     if "gliner_pii" in detectors and not cfg.backends.get("gliner_pii"):
         raise click.BadParameter(
             "DETECTOR_MODE includes 'gliner_pii' but "

@@ -18,10 +18,9 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 import httpx
 import pytest
 
-from anonymizer_guardrail.detector import privacy_filter as pf_mod
-from anonymizer_guardrail.detector import remote_privacy_filter as rpf_mod
-from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterConfig
+from anonymizer_guardrail.detector import remote_privacy_filter as pf_mod
 from anonymizer_guardrail.detector.remote_privacy_filter import (
+    PrivacyFilterConfig,
     PrivacyFilterUnavailableError,
     RemotePrivacyFilterDetector,
 )
@@ -29,9 +28,7 @@ from anonymizer_guardrail.detector.remote_privacy_filter import (
 
 def _fake_config(**overrides: Any) -> PrivacyFilterConfig:
     """Build a PrivacyFilterConfig with a small test-friendly baseline
-    plus per-test overrides. Field names lost the `privacy_filter_`
-    prefix when PrivacyFilterConfig moved into the detector module —
-    overrides use `url`, `timeout_s`, etc."""
+    plus per-test overrides."""
     base = PrivacyFilterConfig(
         url="http://privacy-filter-service:8001",
         timeout_s=5,
@@ -39,10 +36,13 @@ def _fake_config(**overrides: Any) -> PrivacyFilterConfig:
     return base.model_copy(update=overrides) if overrides else base
 
 
-def _ok_response(matches: list[dict[str, Any]]) -> MagicMock:
+def _ok_response(spans: list[dict[str, Any]]) -> MagicMock:
+    """Build a fake 200 OK with the wire format the service emits —
+    `{"spans": [{label, start, end, text}, ...]}`. Label translation
+    and merge/split run client-side in `_to_matches`."""
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
-    resp.json.return_value = {"matches": matches}
+    resp.json.return_value = {"spans": spans}
     resp.text = ""
     return resp
 
@@ -99,10 +99,10 @@ async def test_parses_matches_from_service_response(
 ) -> None:
     text = "Email alice@example.com about the meeting with Alice"
     mock_post.return_value = _ok_response([
-        {"text": "alice@example.com", "entity_type": "EMAIL_ADDRESS",
-         "start": 6, "end": 23},
-        {"text": "Alice", "entity_type": "PERSON",
-         "start": 47, "end": 52},
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+        {"label": "private_person", "start": 47, "end": 52,
+         "text": "Alice"},
     ])
 
     matches = await detector.detect(text)
@@ -113,21 +113,22 @@ async def test_parses_matches_from_service_response(
     assert posted_url.endswith("/detect")
     assert mock_post.call_args.kwargs["json"] == {"text": text}
 
-    # Both matches preserved with the canonical entity types.
+    # Raw `private_*` labels translate to canonical entity types
+    # client-side via `_to_matches`.
     by_type = {m.entity_type: m.text for m in matches}
     assert by_type["EMAIL_ADDRESS"] == "alice@example.com"
     assert by_type["PERSON"] == "Alice"
 
 
-async def test_unknown_entity_type_normalized_to_other(
+async def test_unknown_label_normalized_to_other(
     detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
 ) -> None:
     """A future service version emitting a label the guardrail doesn't
-    know must fall through to OTHER (via Match.__post_init__) — not
-    crash, not propagate the unknown type into the surrogate generator."""
+    know must fall through to OTHER — not crash, not propagate the
+    unknown type into the surrogate generator."""
     text = "Surprising token: abc123"
     mock_post.return_value = _ok_response([
-        {"text": "abc123", "entity_type": "WIDGET", "start": 18, "end": 24},
+        {"label": "made_up_widget", "start": 18, "end": 24, "text": "abc123"},
     ])
 
     matches = await detector.detect(text)
@@ -141,20 +142,21 @@ async def test_hallucination_guard_drops_text_not_in_input(
 ) -> None:
     """A buggy / hostile service must not be able to inject arbitrary
     surrogates into the pipeline by claiming a match for a string that
-    isn't in the input."""
+    isn't in the input. The guard runs inside `_to_matches`."""
     mock_post.return_value = _ok_response([
-        {"text": "alice@example.com", "entity_type": "EMAIL_ADDRESS",
-         "start": 0, "end": 17},
-        # This one isn't in the source — must be dropped.
-        {"text": "evil@attacker.com", "entity_type": "EMAIL_ADDRESS",
-         "start": 0, "end": 0},
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+        # Bad offsets + the .text fallback string isn't in source —
+        # `_to_matches` drops it silently.
+        {"label": "private_email", "start": -1, "end": -1,
+         "text": "evil@attacker.com"},
     ])
 
     matches = await detector.detect("Email alice@example.com please.")
     assert [m.text for m in matches] == ["alice@example.com"]
 
 
-async def test_empty_matches_field_yields_no_matches(
+async def test_empty_spans_field_yields_no_matches(
     detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
 ) -> None:
     mock_post.return_value = _ok_response([])
@@ -239,14 +241,14 @@ async def test_non_json_body_raises_unavailable(
 async def test_malformed_response_shape_raises_unavailable(
     detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
 ) -> None:
-    """`matches` field present but the wrong type — schema violation,
+    """`spans` field present but the wrong type — schema violation,
     raise so PRIVACY_FILTER_FAIL_CLOSED applies."""
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
-    resp.json.return_value = {"matches": "not a list"}
+    resp.json.return_value = {"spans": "not a list"}
     resp.text = ""
     mock_post.return_value = resp
-    with pytest.raises(PrivacyFilterUnavailableError, match="matches"):
+    with pytest.raises(PrivacyFilterUnavailableError, match="spans"):
         await detector.detect("hello")
 
 
@@ -270,9 +272,11 @@ async def test_per_entry_malformed_entries_drop_silently(
     """Per-entry failures invalidate ONE entity; the rest of the response
     is still good. Different from whole-response failures, which raise."""
     mock_post.return_value = _ok_response([
-        "not a dict",                               # bad entry → drop
-        {"text": "alice@example.com", "entity_type": "EMAIL_ADDRESS"},
-        {"entity_type": "PERSON"},                  # missing text → drop
+        "not a dict",                                  # bad entry → drop
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+        {"label": "private_person", "start": -1, "end": -1,
+         "text": "ghost"},                             # text not in source → drop
     ])
     matches = await detector.detect("Email alice@example.com please")
     assert [m.text for m in matches] == ["alice@example.com"]
@@ -281,16 +285,13 @@ async def test_per_entry_malformed_entries_drop_silently(
 # ── Pipeline factory dispatch ───────────────────────────────────────────────
 
 
-def test_factory_picks_remote_when_url_set(
+def test_factory_returns_remote_when_url_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The privacy_filter factory reads CONFIG.url at every
-    instantiation, so flipping it flips which detector backs
-    DETECTOR_MODE=privacy_filter on the next pipeline build."""
-    from anonymizer_guardrail.detector.privacy_filter import (
-        PrivacyFilterDetector,
-        _privacy_filter_factory,
-    )
+    """The privacy_filter factory always returns the remote detector
+    (the in-process variant has been removed). It reads CONFIG.url at
+    instantiation; the URL must point at a running privacy-filter-service."""
+    from anonymizer_guardrail.detector.remote_privacy_filter import _privacy_filter_factory
 
     monkeypatch.setattr(
         pf_mod, "CONFIG",
@@ -299,21 +300,3 @@ def test_factory_picks_remote_when_url_set(
 
     det = _privacy_filter_factory()
     assert isinstance(det, RemotePrivacyFilterDetector)
-
-    # Now flip the URL off and confirm the factory dispatches to the
-    # in-process class. PrivacyFilterDetector's __init__ does heavy
-    # work (loads torch + the model), so we mock it out — the test is
-    # about *which class the factory picks*, not about constructing it.
-    monkeypatch.setattr(
-        pf_mod, "CONFIG", pf_mod.CONFIG.model_copy(update={"url": ""}),
-    )
-    constructed: list[str] = []
-
-    def fake_init(self, *_args, **_kwargs):
-        constructed.append("PrivacyFilterDetector")
-        self.name = "privacy_filter"
-
-    monkeypatch.setattr(PrivacyFilterDetector, "__init__", fake_init)
-    det = _privacy_filter_factory()
-    assert isinstance(det, PrivacyFilterDetector)
-    assert constructed == ["PrivacyFilterDetector"]

@@ -11,18 +11,21 @@ guardrail image.
 API:
 
   POST /detect      body: {"text": "..."}
-                    response: {"matches": [
-                        {"text": str, "entity_type": str,
-                         "start": int, "end": int},
+                    response: {"spans": [
+                        {"label": str, "start": int, "end": int,
+                         "text": str},
                         ...
                     ]}
 
   GET  /health      readiness probe; returns ok once the model is loaded.
 
-Span extract/merge/split post-processing mirrors
-`anonymizer_guardrail.detector.privacy_filter.PrivacyFilterDetector._to_matches`
-exactly — operators must be able to swap between the in-process and
-remote variants with zero observable output drift.
+The wire format is opf's raw DetectedSpan shape — `label` is the
+model's BIO-decoded class (`private_person`, `private_email`, …),
+NOT a canonical guardrail entity type. Label translation, merge,
+split, and per-label gap-cap post-processing all run client-side
+in the guardrail's `RemotePrivacyFilterDetector`. This service is
+deliberately a thin opf wrapper, mirroring gliner-pii-service's
+shape: model wrapper here, canonicalisation in the detector.
 
 Configuration:
   MODEL_NAME                    Default "openai/privacy-filter" → opf
@@ -52,7 +55,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -70,86 +72,18 @@ log = logging.getLogger("privacy-filter-service")
 DEFAULT_MODEL = os.environ.get("MODEL_NAME", "openai/privacy-filter")
 
 
-# ── Label map and merging rules ────────────────────────────────────────────
-# Mirrors anonymizer_guardrail.detector.privacy_filter so output is
-# semantically identical to the in-process detector. Any label not in the
-# map falls through to OTHER on the client side via Match.__post_init__.
-_LABEL_MAP: dict[str, str] = {
-    "private_person":  "PERSON",
-    "private_email":   "EMAIL_ADDRESS",
-    "private_phone":   "PHONE",
-    "private_url":     "URL",
-    "private_address": "ADDRESS",
-    # The model treats any date as PII; we map to DATE_OF_BIRTH because
-    # that's the only date-shaped entity type the guardrail has. Operators
-    # wanting to distinguish arbitrary dates should post-filter.
-    "private_date":    "DATE_OF_BIRTH",
-    # `account_number` is a catch-all for IBAN / CC / SSN-shaped strings.
-    # The model doesn't tell us which, so we use IDENTIFIER and let the
-    # client's regex layer claim the more specific shapes first.
-    "account_number":  "IDENTIFIER",
-    "secret":          "CREDENTIAL",
-}
-
-# Per-label merge rules — mirrors the in-process detector. See
-# anonymizer_guardrail.detector.privacy_filter for the longer
-# rationale. tl;dr: each label gets its own max-gap length and
-# allowed connector set; `\n\n` blocks merging unconditionally.
-_MAX_GAP_BY_LABEL: dict[str, int] = {
-    "PERSON": 3,
-    "ADDRESS": 3,
-    "DATE_OF_BIRTH": 3,
-    "URL": 2,
-    "PHONE": 2,
-    "CREDENTIAL": 2,
-    "IDENTIFIER": 1,
-    "EMAIL_ADDRESS": 0,   # never merge — emails don't fragment with whitespace
-}
-_DEFAULT_MAX_GAP = 1
-
-_DEFAULT_CONNECTORS: frozenset[str] = frozenset(" \t\n\r")
-_CONNECTORS_BY_LABEL: dict[str, frozenset[str]] = {
-    "ADDRESS": _DEFAULT_CONNECTORS | frozenset(","),
-}
-
-
-def _gap_is_mergeable(
-    source_text: str,
-    left_end: int,
-    right_start: int,
-    label: str,
-) -> bool:
-    """Mirrors the in-process detector's predicate; see
-    anonymizer_guardrail.detector.privacy_filter for the rule order."""
-    if right_start < left_end:
-        return False
-    gap = source_text[left_end:right_start]
-    if not gap:
-        return True
-    if "\n\n" in gap:
-        return False
-    max_gap = _MAX_GAP_BY_LABEL.get(label, _DEFAULT_MAX_GAP)
-    if len(gap) > max_gap:
-        return False
-    connectors = _CONNECTORS_BY_LABEL.get(label, _DEFAULT_CONNECTORS)
-    return all(ch in connectors for ch in gap)
-
-
-# Paragraph break used by the split pass — see the in-process
-# detector for the rationale. Defense in depth against any decoder
-# that fuses a span across a `\n\n`.
-_PARAGRAPH_BREAK = re.compile(r"\n{2,}")
-
-
 # ── Model loading ──────────────────────────────────────────────────────────
 def _load_model(model_name: str) -> Any:
     """Construct the opf-backed PII model.
 
-    Mirrors the in-process detector's loader; see
-    `anonymizer_guardrail.detector.privacy_filter` for the rationale
-    on `device="cpu"` (opf's own default is `"cuda"`) and on the
-    sentinel translation that makes `model_name="openai/privacy-filter"`
-    map to opf's auto-download path.
+    `device` defaults to "cpu" — opf's own constructor default is
+    "cuda", which would silently select GPU on a CPU-only host and
+    fail at first request. cu130 image builds set
+    `PRIVACY_FILTER_DEVICE=cuda` to flip back.
+
+    `model_name="openai/privacy-filter"` (the default) maps to
+    `model=None` for opf's auto-download path; anything else is a
+    filesystem path to a checkpoint directory.
     """
     from opf._api import OPF  # heavy import; defer to startup
 
@@ -161,101 +95,6 @@ def _load_model(model_name: str) -> Any:
         model.set_viterbi_decoder(calibration_path=calibration)
         log.info("Loaded Viterbi calibration from %s", calibration)
     return model
-
-
-# ── Span post-processing ───────────────────────────────────────────────────
-def _to_matches(spans: Any, source_text: str) -> list[dict[str, Any]]:
-    """Four passes — extract, merge, split, emit — matching the in-process
-    PrivacyFilterDetector exactly. Keeping behaviour identical means a
-    deployment can swap between in-process and remote without observable
-    output drift.
-
-    `spans` is the iterable of opf DetectedSpan-shaped objects from
-    `RedactionResult.detected_spans` — each carrying
-    `.label / .start / .end / .text`.
-    """
-    # 1) extract: turn opf DetectedSpans into (start, end, type) tuples.
-    extracted: list[tuple[int, int, str]] = []
-    for span in spans:
-        label = getattr(span, "label", "") or ""
-        if not label:
-            continue
-        entity_type = _LABEL_MAP.get(str(label), "OTHER")
-        start = getattr(span, "start", None)
-        end = getattr(span, "end", None)
-        if (
-            not isinstance(start, int)
-            or not isinstance(end, int)
-            or start < 0
-            or end > len(source_text)
-            or start >= end
-        ):
-            # Decoder didn't give us usable offsets — fall back to the
-            # span's own .text with no merging. We can't compute gaps
-            # without positions, so this candidate stands alone.
-            fallback = str(getattr(span, "text", "") or "").strip()
-            if fallback and fallback in source_text:
-                pos = source_text.find(fallback)
-                extracted.append((pos, pos + len(fallback), entity_type))
-            continue
-        extracted.append((start, end, entity_type))
-
-    # opf normally returns spans in left-to-right order, but be
-    # defensive against re-orders — the merge pass below assumes
-    # increasing start.
-    extracted.sort(key=lambda s: (s[0], s[1]))
-
-    # 2) merge: same type, gap mergeable by the label's rule.
-    merged: list[tuple[int, int, str]] = []
-    for start, end, etype in extracted:
-        if merged:
-            prev_start, prev_end, prev_etype = merged[-1]
-            if prev_etype == etype and _gap_is_mergeable(
-                source_text, prev_end, start, etype,
-            ):
-                merged[-1] = (prev_start, end, etype)
-                continue
-        merged.append((start, end, etype))
-
-    # 3) split — break any span that crosses a paragraph break. Mirror
-    # of the merge pass's `\n\n` carve-out: the merge pass refuses to
-    # combine two spans across a paragraph break (from below); this
-    # pass splits a single span the decoder already combined across
-    # one (from above). Defense in depth — opf's Viterbi doesn't
-    # produce these on our fixtures, but production traffic is
-    # broader than fixtures.
-    split: list[tuple[int, int, str]] = []
-    for start, end, etype in merged:
-        sub = source_text[start:end]
-        if "\n\n" not in sub:
-            split.append((start, end, etype))
-            continue
-        cursor = 0
-        for m in _PARAGRAPH_BREAK.finditer(sub):
-            if m.start() > cursor:
-                split.append((start + cursor, start + m.start(), etype))
-            cursor = m.end()
-        if cursor < len(sub):
-            split.append((start + cursor, end, etype))
-
-    # 4) emit
-    out: list[dict[str, Any]] = []
-    for start, end, etype in split:
-        value = source_text[start:end].strip()
-        # Hallucination / drift guard: the substring must actually be
-        # in the source text. Slicing can fall outside it if the
-        # tokenizer's offsets ever drift.
-        if not value or value not in source_text:
-            continue
-        out.append(
-            {
-                "text": value,
-                "entity_type": etype,
-                "start": start,
-                "end": end,
-            }
-        )
-    return out
 
 
 # ── App lifecycle ──────────────────────────────────────────────────────────
@@ -292,19 +131,26 @@ app = FastAPI(title="privacy-filter-service", version="0.1.0", lifespan=lifespan
 
 
 # ── Request / response schemas ─────────────────────────────────────────────
+# The wire format is opf's raw DetectedSpan shape — `label` is the
+# model's BIO-decoded class (e.g. `private_person`), NOT a canonical
+# guardrail entity type. Label translation and merge/split/gap-cap
+# post-processing run client-side in
+# anonymizer_guardrail.detector._pf_postprocess._to_matches. This
+# matches gliner-pii-service's wire contract: the service is a thin
+# model wrapper, the client owns canonicalisation.
 class DetectRequest(BaseModel):
     text: str = Field(..., description="Free-text input to scan for PII.")
 
 
-class DetectMatch(BaseModel):
-    text: str
-    entity_type: str
+class DetectedSpan(BaseModel):
+    label: str
     start: int
     end: int
+    text: str
 
 
 class DetectResponse(BaseModel):
-    matches: list[DetectMatch]
+    spans: list[DetectedSpan]
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -323,7 +169,7 @@ async def health() -> dict[str, Any]:
 async def detect(req: DetectRequest) -> DetectResponse:
     text = req.text
     if not text or not text.strip():
-        return DetectResponse(matches=[])
+        return DetectResponse(spans=[])
 
     model = _state["model"]
     if model is None:
@@ -334,7 +180,19 @@ async def detect(req: DetectRequest) -> DetectResponse:
         raise RuntimeError("privacy-filter model is not loaded")
 
     # Inference is CPU/GPU-bound and synchronous; offload so the loop
-    # stays responsive. Same pattern the in-process detector uses.
+    # stays responsive.
     result = await asyncio.to_thread(model.redact, text)
-    matches_dicts = _to_matches(result.detected_spans, text)
-    return DetectResponse(matches=[DetectMatch(**m) for m in matches_dicts])
+    # Emit opf's raw DetectedSpans verbatim — no label translation or
+    # span-merging on this side. The guardrail's
+    # `RemotePrivacyFilterDetector` runs `_to_matches` to produce
+    # canonical Match objects from this list.
+    spans = [
+        DetectedSpan(
+            label=s.label,
+            start=s.start,
+            end=s.end,
+            text=s.text,
+        )
+        for s in result.detected_spans
+    ]
+    return DetectResponse(spans=spans)

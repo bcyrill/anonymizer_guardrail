@@ -191,6 +191,19 @@ LAUNCHER_METADATA: dict[str, LauncherSpec] = {
             guardrail_env_when_started={
                 "PRIVACY_FILTER_URL": "http://privacy-filter-service:8001",
             },
+            # Forward operator-side env vars onto the SERVICE container
+            # so a single shell-side variable configures both ends of
+            # the privacy-filter wiring. PRIVACY_FILTER_DEVICE flips
+            # opf's CPU/CUDA selection inside the container — useful
+            # for ad-hoc GPU experiments on the cu130 image without
+            # rebuilding. PRIVACY_FILTER_CALIBRATION points at a
+            # Viterbi calibration JSON inside the container (operator
+            # mounts the JSON via -v if needed; default unset → opf's
+            # stock decoder).
+            service_env_passthroughs={
+                "PRIVACY_FILTER_DEVICE": "PRIVACY_FILTER_DEVICE",
+                "PRIVACY_FILTER_CALIBRATION": "PRIVACY_FILTER_CALIBRATION",
+            },
         ),
     ),
     "gliner_pii": LauncherSpec(

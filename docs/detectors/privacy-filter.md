@@ -1,116 +1,111 @@
 # Privacy-filter detector
 
-Local NER backed by
+PII NER backed by
 [openai/privacy-filter](https://huggingface.co/openai/privacy-filter)
-(Apache 2.0). Encoder-only token classifier, ~1.5 B params (50 M active
-via MoE). Detects 8 PII categories: people, emails, phones, URLs,
-addresses, dates, account numbers, secrets. Coverage is a strict
-subset of what the LLM prompt picks up (no orgs, hostnames, IP/MAC,
-etc.) so it's a *complement* to — not a replacement for — the LLM
+(Apache 2.0). Encoder-only token classifier, ~1.5 B params (50 M
+active via MoE). Detects 8 PII categories: people, emails, phones,
+URLs, addresses, dates, account numbers, secrets. Coverage is a
+strict subset of what the LLM prompt picks up (no orgs, hostnames,
+IP/MAC, etc.) — a *complement* to, not a replacement for, the LLM
 detector.
 
-Two implementations back the `privacy_filter` detector — same name in
-`DETECTOR_MODE`, same canonical entity types, same span semantics on
-the wire. Operators pick which one runs by the topology they want, not
-by changing the detector list.
+The detector is HTTP-only: the guardrail talks to a standalone
+[`privacy-filter-service`](../../services/privacy_filter/) sidecar
+over HTTP. The slim guardrail image carries no ML deps — torch,
+[`opf`](https://github.com/openai/privacy-filter) (OpenAI's own
+inference wrapper for this model), and the model weights all live
+in the sidecar.
 
-## Configuration
+Mirrors gliner-pii's architectural split: thin model wrapper in the
+service container, label canonicalisation + merge / split / per-label
+gap caps in the guardrail-side
+[`RemotePrivacyFilterDetector`](../../src/anonymizer_guardrail/detector/remote_privacy_filter.py).
+
+## Configuration (guardrail-side)
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PRIVACY_FILTER_URL` | *(empty)* | When set, the detector talks HTTP to a standalone privacy-filter-service instead of loading the model in-process; the slim image then covers `privacy_filter`. See [Remote](#remote-privacy_filter_url-set) below. |
-| `PRIVACY_FILTER_TIMEOUT_S` | `30` | Per-call timeout (seconds) on the remote privacy-filter HTTP requests. |
-| `PRIVACY_FILTER_FAIL_CLOSED` | `true` | Block requests when the privacy_filter detector errors. Independent flag — operators can fail closed on one detector and open on another. Applies to both the in-process and remote variants. |
-| `PRIVACY_FILTER_MAX_CONCURRENCY` | `10` | Semaphore on in-flight `privacy_filter` calls (in-process AND remote). Independent of `LLM_MAX_CONCURRENCY`. Surfaced as `pf_in_flight`/`pf_max_concurrency` on `/health`. |
-| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop `huggingface_hub` (called by opf during model download) from pinging HuggingFace Hub on every start. The `pf-baked` image flavour sets it automatically as deployment-intent documentation, but post-opf-migration this is largely cosmetic — opf's `target.exists()` check in `ensure_default_checkpoint` short-circuits before `huggingface_hub` is even imported when the model is on disk, so the offline flag is a no-op for warm-start traffic. `scripts/launcher.sh --hf-offline` / the menu still offer it once the cache volume is populated. |
+| `PRIVACY_FILTER_URL` | *(empty)* | HTTP URL of the privacy-filter-service. The launcher's `--privacy-filter-backend service` auto-start sets this to `http://privacy-filter-service:8001`; otherwise the operator sets it to wherever they're running the sidecar. Required when `DETECTOR_MODE` includes `privacy_filter` — the detector errors at construction if unset. |
+| `PRIVACY_FILTER_TIMEOUT_S` | `30` | Per-call HTTP timeout (seconds). |
+| `PRIVACY_FILTER_FAIL_CLOSED` | `true` | Block requests when the privacy_filter detector errors. Independent flag — operators can fail closed on one detector and open on another. |
+| `PRIVACY_FILTER_MAX_CONCURRENCY` | `10` | Semaphore on in-flight `privacy_filter` calls. Independent of `LLM_MAX_CONCURRENCY`. Surfaced as `pf_in_flight` / `pf_max_concurrency` on `/health`. |
 
-## In-process (default)
+## Configuration (service-side)
 
-Loads the `openai/privacy-filter` model into the guardrail's own
-process. Pulls in `torch`, [`opf`](https://github.com/openai/privacy-filter)
-(OpenAI's own inference wrapper for this model — replaces the older
-`transformers.pipeline` integration; see "Decoder" below), and the
-full set of model weights, so this option only works on the `pf` /
-`pf-baked` image flavours — slim doesn't ship the dependencies. See
-[deployment → Container images](../deployment.md#container-images) for
-the size impact. Microsecond glue overhead per call; shares the
-guardrail's CPU/memory budget.
+These knobs apply to the standalone privacy-filter-service container.
+The launcher forwards them from the operator's shell environment to
+the sidecar (see `service_env_passthroughs` in
+[`tools/launcher/spec_extras.py`](../../tools/launcher/spec_extras.py)),
+so a single shell-side `export` configures both ends.
 
-Pick this when:
+| Variable | Default | Notes |
+|---|---|---|
+| `PRIVACY_FILTER_DEVICE` | `cpu` (cpu image) / `cuda` (cu130 image) | Inference device. opf's own constructor default is `"cuda"`; the Containerfile bakes a different default per image flavour via the `TARGET_DEVICE` build-arg, so the cpu image doesn't silently try to load CUDA on a GPU-less host. Operators can override at run time (e.g. for GPU experiments on the cpu image with a manual `-e PRIVACY_FILTER_DEVICE=cuda` plus the GPU device flag). |
+| `PRIVACY_FILTER_CALIBRATION` | *(unset)* | Optional path **inside the container** to a Viterbi operating-points JSON. Empty / missing → opf's stock decoder. Tune-and-mount is the workflow: produce a JSON locally (see `services/privacy_filter/scripts/spike_opf.py` for the shape), bind-mount it into the service, and set this var. |
+| `MODEL_NAME` | `openai/privacy-filter` | The default sentinel maps to opf's auto-download path (`~/.opf/privacy_filter`); anything else is treated as a filesystem path to a local checkpoint directory. |
+| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop `huggingface_hub` (used by opf during the model download) from pinging the Hub on every container start. The baked image flavours set this automatically as deployment-intent documentation; runtime-download flavours leave it unset on first run so the download succeeds. |
 
-- Single-replica deployment.
-- You don't already have a privacy-filter service running.
-- Latency is more important than image size or independent scaling.
+## Image flavours
 
-Optional dependency for direct-pip installs:
-`pip install "anonymizer-guardrail[privacy-filter]"`. The container
-side ships it via `--build-arg WITH_PRIVACY_FILTER=true`.
+Build via `scripts/image_builder.sh -f <flavour>`. The launcher's
+`--privacy-filter-backend service` path uses whichever `pf-service-*`
+image is installed locally, preferring the baked variant when
+present (avoids the cold-start model fetch).
 
-## Remote (`PRIVACY_FILTER_URL` set)
+| Flavour | Notes |
+|---|---|
+| `pf-service` | CPU torch, runtime model download on first request (~3 GB pulled into `/app/.opf` — mount a named volume there for persistence). |
+| `pf-service-baked` | CPU torch, model weights baked in. Self-contained for air-gapped runs. |
+| `pf-service-cu130` | CUDA-13.0 torch wheels, runtime download. `PRIVACY_FILTER_DEVICE` defaults to `cuda` in this image. Host needs nvidia-container-toolkit. |
+| `pf-service-baked-cu130` | CUDA-13.0 + baked weights. |
 
-Off-loads inference to a standalone container running
-`services/privacy_filter/main.py` — a thin FastAPI wrapper around
-the same opf decoder plus identical merge / split / per-label gap
-post-processing.
-The guardrail's `RemotePrivacyFilterDetector` posts each request's
-text to `${PRIVACY_FILTER_URL}/detect` and parses the returned span
-list. Output is byte-equivalent to the in-process detector for the
-same input.
-
-Pick this when:
-
-- You want the slim guardrail image (no torch in the API container)
-  but still need privacy-filter coverage.
-- Multiple guardrail replicas should share one inference service
-  (single model copy in memory; one place to attach a GPU).
-- Model updates need to ship without rebuilding the guardrail image.
-
-Build the service image via `scripts/image_builder.sh -f pf-service`
-(runtime download) or `pf-service-baked` (model in image). See
-[`services/privacy_filter/README.md`](../../services/privacy_filter/README.md)
-for the API contract, env vars, and standalone build/run commands.
+When the auto-started service is a `cu*` flavour, the launcher
+emits the engine-specific GPU flag (`--device nvidia.com/gpu=all`
+on podman, `--gpus all` on docker) automatically. Operators
+running CUDA images outside the launcher need the same flag on
+their `podman run` invocation. The host requires
+[nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
+installed.
 
 ## Selecting the backend
 
-For interactive / single-host development, the launcher exposes the
-choice as `--privacy-filter-backend`:
+The launcher exposes the choice as `--privacy-filter-backend`:
 
-| Value      | What happens                                                   |
-|------------|----------------------------------------------------------------|
-| *(unset)*  | In-process. Requires `--type pf` or `--type pf-baked`.         |
-| `service`  | Auto-start a `privacy-filter-service` container on the shared network and point the guardrail at it. Mirrors how `--llm-backend service` auto-starts fake-llm. |
+| Value | What happens |
+|---|---|
+| `service` *(default)* | Auto-start a `privacy-filter-service` container on the shared network and point the guardrail at it. Same UX as `--llm-backend service`. |
 | `external` | Use the URL given by `--privacy-filter-url` / `PRIVACY_FILTER_URL`. Nothing is auto-started. Use this for production deployments where the service is managed separately (Kubernetes, docker-compose, etc.). |
 
-The auto-start path mounts the same `anonymizer-hf-cache` volume the
-guardrail's `pf` flavour uses, so an operator who already pulled the
-model via the in-process path doesn't pay the download again on
-switching to remote.
+The auto-start path mounts an `anonymizer-hf-cache` volume at
+`/app/.opf` inside the container, so the model download survives
+container recreation. opf writes its checkpoint there directly
+(it ignores `HF_HOME` for its own checkpoint location).
 
 ## Decoder
 
-Both the in-process detector and the standalone service load the
-model via OpenAI's [`opf`](https://github.com/openai/privacy-filter)
-package — specifically `OPF.redact()` with `decode_mode="viterbi"`.
-This replaces the earlier `transformers.pipeline(
-"token-classification", aggregation_strategy="first")` integration.
-The Viterbi path is the decoder OpenAI actually trained the model
-with; the migration brought materially tighter span boundaries (no
-trailing punctuation absorbed), zero `\n\n` over-merges, and higher
-recall on emails / API keys / plaintext passwords. See
-[`services/privacy_filter/scripts/PROBE.md`](../../services/privacy_filter/scripts/PROBE.md#after-the-opf-migration)
-"After the opf migration" for the empirical before/after.
+The service loads the model via OpenAI's
+[`opf`](https://github.com/openai/privacy-filter) package — specifically
+`OPF.redact()` with `decode_mode="viterbi"`. The Viterbi path is the
+decoder OpenAI actually trained the model with; tighter span
+boundaries (no trailing punctuation absorbed), zero `\n\n`
+over-merges, and high recall on emails / API keys / plaintext
+passwords compared to the older transformers integration. See
+[`services/privacy_filter/scripts/PROBE.md`](../../services/privacy_filter/scripts/PROBE.md)
+for the empirical span tables.
 
-Two operator-facing knobs:
+The post-processing pipeline on the guardrail side (per-label merge
+gap caps, paragraph-break split pass) is kept as defense in depth —
+it doesn't fire on the fixtures under opf's stock decoder, but
+production traffic is broader than fixtures and the runtime cost is
+negligible.
 
-| Variable | Default | Notes |
-|---|---|---|
-| `PRIVACY_FILTER_DEVICE` | `cpu` | `cpu` or `cuda`. Overrides opf's own constructor default of `cuda` so the cpu image doesn't silently try to load CUDA on a GPU-less host. cu130 image builds set this to `cuda` to flip back. |
-| `PRIVACY_FILTER_CALIBRATION` | *(unset)* | Optional path to a Viterbi operating-points JSON. If unset or the file doesn't exist, opf's stock decoder is used — the spike confirmed it produces clean spans on every fixture we measured. Reserved for future corpora that need precision/recall tuning. JSON shape and bias semantics are documented in `services/privacy_filter/scripts/spike_opf.py`. |
-
-The post-processing pipeline (per-label merge gap caps, paragraph-
-break split pass) is kept as defense in depth — it doesn't fire on
-the fixtures we have under opf, but production traffic is broader
-than fixtures and the runtime cost is negligible.
+Tuning: `PRIVACY_FILTER_CALIBRATION` points the service at an opf
+operating-points JSON to bias the BIOES Viterbi transitions. Six
+biases (`transition_bias_*`); see
+[`services/privacy_filter/scripts/spike_opf.py`](../../services/privacy_filter/scripts/spike_opf.py)
+for the JSON shape and three pre-built profiles (`default`,
+`anti-merge`, `privacy-parser`) you can compare empirically against
+your own corpus.
 
 ## Failure handling
 
@@ -118,13 +113,12 @@ than fixtures and the runtime cost is negligible.
 `LLM_FAIL_CLOSED` and `GLINER_PII_FAIL_CLOSED` — operators can fail
 closed on one detector and open on another. When the privacy-filter
 detector raises `PrivacyFilterUnavailableError` (service unreachable,
-timeout, non-200, unparseable 200 OK body or wrong-shape payload, or
-any unexpected exception under fail-closed), the guardrail returns
-`BLOCKED`. With fail-open, the error is logged and the request
-proceeds with coverage from the remaining detectors. A 200 OK with
-garbage in it counts as unavailable — soft-failing those would let
-unredacted text through under fail-closed. Per-entry malformed
-entries inside an otherwise-valid `{"matches": [...]}` payload still
-drop silently. The flag applies to both the in-process and remote
-variants — a torch crash inside the in-process detector triggers the
-same fail-closed path as a connection error to the remote service.
+timeout, non-200, unparseable 200 OK body or wrong-shape payload),
+the guardrail returns `BLOCKED`. With fail-open, the error is logged
+and the request proceeds with coverage from the remaining detectors.
+A 200 OK with garbage in it counts as unavailable — soft-failing
+those would let unredacted text through under fail-closed.
+Per-entry malformed entries inside an otherwise-valid
+`{"spans": [...]}` payload drop silently inside the post-processing
+layer's hallucination guard (the substring must actually be in the
+input).
