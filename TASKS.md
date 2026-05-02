@@ -607,6 +607,131 @@ per-text cache when `input_mode="merged"`.
 
 ---
 
+## Pre-warm detector cache from deanonymize-derived matches
+
+**Priority:** low.
+
+**What:** during the existing `pipeline.deanonymize` step, build
+synthetic `Match` objects from the vault entries that contributed
+substring replacements and use them to pre-warm the detector
+cache, keyed by the *deanonymized* output text. Turn N's
+assistant message — which today always misses cache when it
+appears inside turn N+1's request — would be a hit instead.
+
+**Why:** the detector cache today gives hits on every prior user
+message and the system prompt, but the most recent assistant
+message always misses on first sight (it was never put through
+detection — only deanonymize). Steady-state cost is roughly two
+detection calls per round-trip: one for the new user message,
+one for the new assistant message. Pre-warming closes the
+assistant half of that, dropping steady-state to one new call
+per round-trip.
+
+**Why deferred (low priority):** the assistant-side miss is
+*one constant call per turn*, not a multiplier on conversation
+length. The cache already wins on the dominant cost — replayed
+history. Operators with a measurable hit-rate gap (visible via
+`<prefix>_cache_misses` on `/health`) get a clear signal to
+prioritise this; absent that signal, the win is small.
+
+**The key insight that makes this cheap:** we don't need to run
+detection on the response side. The vault already holds every
+`(surrogate, original)` pair the request side detected. After
+deanonymize substitutes them back into the response text, we
+already know which substrings of that text were entities. That
+substantially changes the cost / failure-mode picture relative
+to "run detection on responses" (see
+`docs/design-decisions.md` → *Response side runs deanonymize
+only*).
+
+**Vault change required.** Today's vault stores
+`surrogate → original` (strings only). Pre-warming with
+`tuple[Match, ...]` needs the entity type, which `Match`
+carries. Extend the vault entry shape to
+`surrogate → (original, entity_type)`; recover the type at
+deanonymize time. Small change, isolated to `vault.py` and the
+two pipeline call sites.
+
+**Architectural shape — two alternatives, decide at
+implementation time:**
+
+1. **New pipeline-level cache.** A separate cache, distinct
+   from the per-detector caches, keyed `text → tuple[Match, ...]`
+   that holds the deduped match set. `_detect_one(text)` checks
+   this cache first; on hit, skips ALL detectors and returns the
+   cached set directly. The deanonymize step is a natural
+   producer for this cache; per-detector caches stay focused on
+   their own detector's output. **Cleanest, but adds a new
+   cache type.**
+2. **Pre-warm each per-detector cache** with the deduped match
+   set. Doesn't add a cache type; reuses the existing
+   `DetectorResultCache`. Downside: per-detector hit/miss stats
+   become misleading (every detector "found" everything). The
+   cached match set may also be missing entities the *real*
+   detector would have found if run on the deanonymized text
+   directly — the deduped set reflects what *all detectors
+   combined* found on the original surrogate-anonymized text, not
+   what each detector independently would find on the
+   deanonymized form.
+
+Option 1 is more honest about what the data actually is. Option
+2 is smaller. Pick at implementation time.
+
+**Concrete trigger:**
+
+- A workload's `<prefix>_cache_misses` counter on `/health`
+  shows the assistant-message miss is a measurable share of
+  detection cost — typically chatty workloads with many turns
+  per conversation.
+- An operator instruments hit-rate over a representative window
+  and measures that the constant-per-turn miss is meaningful
+  next to their detection-call budget.
+
+**Sketch:**
+
+1. Extend `Vault` entry shape to store entity_type alongside
+   each original. `pipeline.anonymize` already has both; pass
+   them through.
+2. Add a hook on `pipeline.deanonymize` that, after the
+   substring-replace pass, builds `tuple[Match, ...]` from the
+   vault entries and records `(deanonymized_text, matches)`
+   pairs.
+3. Implement Option 1 OR Option 2 above. For Option 1: define
+   a new `PipelineResultCache` (Protocol mirroring
+   `DetectorResultCache`), instantiate one on `Pipeline`,
+   consult it at the top of `_detect_one`, store entries from
+   the deanonymize hook. For Option 2: write into each active
+   detector's `_cache` directly, building the per-detector key
+   from the configured-default override values (since the
+   response side doesn't carry per-call overrides).
+4. Stats: surface hit/miss/size on `/health` under a new
+   `pipeline_cache_*` prefix (Option 1) or fold into existing
+   `<prefix>_cache_*` keys (Option 2).
+5. Tests: turn-N response → turn-N+1 request hits cache;
+   pre-warming respects per-call override boundaries (Option 2);
+   evicted entries fall back to detection cleanly.
+
+**Non-goals:**
+
+- **Don't add response-side detection.** This entry is the
+  cheap path that avoids it. Running detection on responses
+  remains a separate, explicit design call (see design-decisions.md).
+- **Don't try to re-derive entity types from surrogate
+  structure.** Vault carries the type; the heuristic
+  ("`[EMAIL_ADDRESS_…]` looks like an email" /
+  "Faker output shaped like an IP") is fragile and unnecessary
+  given the vault change is small.
+- **Don't pre-warm with stale per-call overrides.** If turn N's
+  request was made with `llm_prompt="strict"`, the cached
+  matches are "what strict-prompt LLM + regex + others found."
+  Turn N+1 might use the default prompt — pre-warming the
+  default-prompt cache slot with strict-prompt-derived matches
+  would be wrong. Either include the request-side overrides in
+  the cache key (Option 1 makes this natural) or only pre-warm
+  the slot matching turn N's overrides.
+
+---
+
 ## Pin Viterbi calibration JSON for privacy-filter
 
 **What:** ship a default `services/privacy_filter/calibration.json`
