@@ -4,7 +4,7 @@ Targets `remote_privacy_filter._to_matches` directly — the function
 runs client-side inside `RemotePrivacyFilterDetector._parse_matches`,
 turning opf's raw DetectedSpan-shaped wire payload into canonical
 Match objects. HTTP-client tests for the detector itself live in
-`test_remote_privacy_filter.py`. This file covers the pure
+`test_detector_privacy_filter.py`. This file covers the pure
 post-processing: extract / merge / split / emit, label mapping,
 hallucination guard, per-label gap caps, paragraph-break rules.
 """

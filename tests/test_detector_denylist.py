@@ -530,7 +530,8 @@ def test_invalid_backend_value_crashes_at_import(monkeypatch) -> None:
         monkeypatch.undo()
         importlib.import_module("anonymizer_guardrail.detector.denylist")
         # Restore the parent-package attribute (see test_module_import in
-        # test_privacy_filter.py for the same restoration rationale).
+        # test_detector_privacy_filter_postprocess.py for the same
+        # restoration rationale).
         anonymizer_guardrail.detector.denylist = original_pkg_attr
 
 

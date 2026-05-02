@@ -14,7 +14,7 @@ This contract is duplicated in three places:
   * `src/anonymizer_guardrail/detector/remote_privacy_filter.py`
                                                     (parser side)
 
-The other test files (test_remote_privacy_filter.py) cover the
+The other test files (test_detector_privacy_filter.py) cover the
 parser side. This file pins the *contract itself*: we define the
 canonical wire schema as a tiny pydantic model in the test, then
 

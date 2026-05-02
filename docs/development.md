@@ -329,9 +329,9 @@ detector in their override list without bumping a constant.
 
 Two files:
 
-**`tests/test_my_detector.py`** — unit tests for the detector class.
-Mock external deps (httpx, model, files). Copy the shape of
-`tests/test_remote_gliner_pii.py`. Patch config via:
+**`tests/test_detector_my_detector.py`** — unit tests for the detector
+class. Mock external deps (httpx, model, files). Copy the shape of
+`tests/test_detector_gliner_pii.py`. Patch config via:
 
 ```python
 from dataclasses import replace

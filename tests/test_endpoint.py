@@ -97,22 +97,34 @@ def test_request_with_entities_returns_intervened_and_redacts(
     deanonymization."""
     call_id = "intervene-test"
     original = "Mail alice@example.com from 10.20.30.40"
-    r = client.post(
-        "/beta/litellm_basic_guardrail_api",
-        json={
-            "texts": [original],
-            "input_type": "request",
-            "litellm_call_id": call_id,
-        },
-    )
-    body = r.json()
-    assert body["action"] == "GUARDRAIL_INTERVENED"
-    assert body["texts"] is not None and len(body["texts"]) == 1
-    modified = body["texts"][0]
-    assert "alice@example.com" not in modified
-    assert "10.20.30.40" not in modified
-    # Vault must hold the reverse mapping for the post-call.
-    assert main_mod._pipeline.vault.size() >= 1
+    pre_size = main_mod._pipeline.vault.size()
+    try:
+        r = client.post(
+            "/beta/litellm_basic_guardrail_api",
+            json={
+                "texts": [original],
+                "input_type": "request",
+                "litellm_call_id": call_id,
+            },
+        )
+        body = r.json()
+        assert body["action"] == "GUARDRAIL_INTERVENED"
+        assert body["texts"] is not None and len(body["texts"]) == 1
+        modified = body["texts"][0]
+        assert "alice@example.com" not in modified
+        assert "10.20.30.40" not in modified
+        # Vault must hold the reverse mapping for the post-call —
+        # exactly one new entry, not "at least one" (the pre-snapshot
+        # rules out cross-test pollution from a previous test that
+        # forgot to clean up).
+        assert main_mod._pipeline.vault.size() == pre_size + 1
+    finally:
+        # Pop our entry so the vault is clean for the next test, even
+        # under failure. `main._pipeline._vault` is a process-wide
+        # singleton; without this, every endpoint test that uses
+        # `client` inherits this entry.
+        import asyncio
+        asyncio.run(main_mod._pipeline.vault.pop(call_id))
 
 
 def test_round_trip_request_then_response(client: TestClient) -> None:
@@ -148,8 +160,11 @@ def test_round_trip_request_then_response(client: TestClient) -> None:
     assert post["action"] == "GUARDRAIL_INTERVENED"
     assert "bob@acmecorp.com" in post["texts"][0]
     # Vault entry must have been popped — otherwise mappings linger past
-    # their useful lifetime.
-    assert call_id not in main_mod._pipeline.vault._store  # type: ignore[attr-defined]
+    # their useful lifetime. A second pop for the same call_id should
+    # return `{}` regardless of backend (Protocol-level contract from
+    # `tests/test_vault.py::test_pop_after_pop_is_idempotent`).
+    import asyncio
+    assert asyncio.run(main_mod._pipeline.vault.pop(call_id)) == {}
 
 
 def test_response_with_unknown_call_id_returns_none(client: TestClient) -> None:
@@ -226,6 +241,45 @@ def test_llm_unavailable_returns_blocked_with_specific_reason(
     body = r.json()
     assert body["action"] == "BLOCKED"
     assert "unreachable" in (body["blocked_reason"] or "").lower()
+
+
+def test_vault_unavailable_returns_blocked_with_vault_specific_reason(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`RedisVaultError` from the vault layer (Redis unreachable, auth
+    error, etc.) must surface as action=BLOCKED with a *vault-specific*
+    operator-facing reason — not the generic "Guardrail internal error"
+    fallthrough. The pipeline raises `RedisVaultError` from
+    `_vault.put()` / `_vault.pop()`; main.py has a dedicated
+    `except RedisVaultError` clause that emits a "Vault backend
+    unavailable" reason. Pin the end-to-end shape so a future refactor
+    that swallows the typed error into the generic `except Exception`
+    path doesn't silently regress operator UX."""
+    from anonymizer_guardrail.vault_redis import RedisVaultError
+
+    monkeypatch.setattr(
+        main_mod,
+        "_pipeline",
+        _ExplodingPipeline(lambda: RedisVaultError("simulated Redis outage")),
+    )
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["alice"],
+            "input_type": "request",
+            "litellm_call_id": "fail-vault",
+        },
+    )
+    body = r.json()
+    assert body["action"] == "BLOCKED"
+    reason = (body["blocked_reason"] or "").lower()
+    # Operator-facing reason should name the vault, not generic
+    # "internal error". Don't pin the exact wording — that would be
+    # over-strict — but require the vault-specific signal.
+    assert "vault" in reason
+    # And must NOT route through the generic fallthrough whose reason
+    # includes the Python type name.
+    assert "RedisVaultError" not in (body["blocked_reason"] or "")
 
 
 def test_unexpected_exception_returns_blocked_with_internal_error(

@@ -100,22 +100,23 @@ async def test_pentest_yaml_relabels_brazilian_docs_as_national_id(
     (verbatim from DontFeedTheAI). They were relabelled NATIONAL_ID so
     the surrogate generator picks Faker's locale-aware ssn() for them.
     Pin that down."""
+    # Use monkeypatch for BOTH attributes — the previous version did a
+    # raw `_COMPILED_PATTERNS = _load_patterns()` and tried to restore
+    # in a `finally` block. The hand-rolled restore worked accidentally
+    # (the production CONFIG and `_fake_config(patterns_path="")` both
+    # resolve to the same bundled default) but was vulnerable to any
+    # divergence. Letting monkeypatch own the restore is bullet-proof.
     monkeypatch.setattr(
         regex_mod, "CONFIG", _fake_config(patterns_path="bundled:regex_pentest.yaml")
     )
-    regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
+    monkeypatch.setattr(
+        regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns()
+    )
     detector = regex_mod.RegexDetector()
-    try:
-        matches = await detector.detect("CPF 123.456.789-01 here")
-        assert any(m.entity_type == "NATIONAL_ID" for m in matches), (
-            f"expected NATIONAL_ID, got {[(m.entity_type, m.text) for m in matches]}"
-        )
-    finally:
-        # Restore the default-bundled patterns so other tests stay isolated.
-        monkeypatch.setattr(
-            regex_mod, "CONFIG", _fake_config(patterns_path="")
-        )
-        regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
+    matches = await detector.detect("CPF 123.456.789-01 here")
+    assert any(m.entity_type == "NATIONAL_ID" for m in matches), (
+        f"expected NATIONAL_ID, got {[(m.entity_type, m.text) for m in matches]}"
+    )
 
 
 def test_override_path_replaces_patterns(
@@ -178,17 +179,13 @@ def test_pentest_yaml_extends_default_yaml() -> None:
     assert "extends: regex_default.yaml" in text
 
 
-def test_missing_override_path_raises() -> None:
+def test_missing_override_path_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """Typo in REGEX_PATTERNS_PATH crashes loud, not silent fall-back."""
-    cfg = _fake_config(patterns_path="/no/such/file.yaml")
-    # Patch via the module attribute the loader reads.
-    orig = regex_mod.CONFIG
-    regex_mod.CONFIG = cfg  # type: ignore[assignment]
-    try:
-        with pytest.raises(RuntimeError, match="could not be read"):
-            regex_mod._load_patterns()
-    finally:
-        regex_mod.CONFIG = orig  # type: ignore[assignment]
+    monkeypatch.setattr(
+        regex_mod, "CONFIG", _fake_config(patterns_path="/no/such/file.yaml")
+    )
+    with pytest.raises(RuntimeError, match="could not be read"):
+        regex_mod._load_patterns()
 
 
 def test_invalid_regex_fails_at_load(
@@ -275,8 +272,14 @@ async def test_capture_group_narrows_match_to_value(
     monkeypatch.setattr(
         regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
-    # Force the module-level _COMPILED_PATTERNS to refresh against the new config.
-    regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
+    # Force the module-level _COMPILED_PATTERNS to refresh against the
+    # new config. Use monkeypatch.setattr (NOT raw assignment) so the
+    # original is restored on test teardown — `RegexDetector.__init__`
+    # snapshots this module-global, so a leak here breaks every later
+    # test that constructs a detector or pipeline.
+    monkeypatch.setattr(
+        regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns()
+    )
     detector = regex_mod.RegexDetector()
 
     matches = await detector.detect("login: alice password: hunter2!")
@@ -301,7 +304,12 @@ async def test_no_capture_group_preserves_full_match(
     monkeypatch.setattr(
         regex_mod, "CONFIG", _fake_config(patterns_path=str(custom))
     )
-    regex_mod._COMPILED_PATTERNS = regex_mod._load_patterns()
+    # See sibling test above for why this uses monkeypatch.setattr —
+    # raw assignment leaks across tests and breaks anyone who later
+    # constructs a Pipeline / RegexDetector.
+    monkeypatch.setattr(
+        regex_mod, "_COMPILED_PATTERNS", regex_mod._load_patterns()
+    )
     detector = regex_mod.RegexDetector()
 
     matches = await detector.detect("token is XYZ12345 today")
