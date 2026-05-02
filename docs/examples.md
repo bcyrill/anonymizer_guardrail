@@ -10,14 +10,20 @@ whichever `DETECTOR_MODE` matches the example you want to try:
 scripts/launcher.sh -t slim -d regex --no-faker
 
 # Add the privacy-filter NER for the address / name examples.
-scripts/launcher.sh -t pf -d regex,privacy_filter
+# The launcher auto-starts the privacy-filter-service sidecar with
+# `--privacy-filter-backend service` (the default).
+scripts/launcher.sh -t slim -d regex,privacy_filter
 
 # Full stack, requires LLM_API_BASE / LLM_API_KEY for the LLM examples.
-scripts/launcher.sh -t pf -d regex,privacy_filter,llm \
+scripts/launcher.sh -t slim -d regex,privacy_filter,llm \
   --llm-backend external \
   --llm-api-base http://litellm:4000/v1 \
   --llm-api-key sk-litellm-master \
   --llm-model anonymize
+
+# To use the experimental HF variant of privacy-filter (~7x faster on
+# CPU, see services/privacy_filter_hf/COMPARE.md) add:
+#   --privacy-filter-variant hf
 ```
 
 The `--no-faker` flag in the first line makes surrogates opaque

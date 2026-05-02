@@ -407,11 +407,25 @@ on more diverse corpora, replace the opf-only service as the
 production default — keep both packages published while the
 transition lands, then deprecate the opf-only path.
 
-**Status:** experimental. Wired into `image_builder` (one CPU
-flavour, `pf-hf-service`), published from CI as a separate ghcr
-package via `publish-pf-hf-service-image.yml`. Not wired into the
-launcher's auto-start path — operators run it manually with
-`podman run -p 8003:8003 …` and point `PRIVACY_FILTER_URL` at it.
+**Status:** infrastructure for the promotion is in place; the
+actual default-switch and deprecation are gated on Phase 2
+(wider-corpus validation). Both variants are published, buildable,
+and operator-selectable; the only thing standing between
+"experimental" and "default" is signal.
+
+| Step | Status | Where |
+|---|---|---|
+| CPU image flavour | ✅ done | `pf-hf-service` |
+| CUDA image flavour | ✅ done | `pf-hf-service-cu130` |
+| CI workflow | ✅ done | `.github/workflows/publish-pf-hf-service-image.yml` (CPU + CUDA matrix) |
+| release.sh axis | ✅ done | `+pf-hf-service` tag prompt |
+| Launcher CLI flag | ✅ done | `--privacy-filter-variant opf\|hf` |
+| Launcher menu prompt | ✅ done | Variant row under Privacy-filter section |
+| LauncherSpec wiring | ✅ done | `LauncherSpec.service_variants["hf"]` resolves to the hf ServiceSpec |
+| Documentation (variants section) | ✅ done | `docs/detectors/privacy-filter.md` "Variants" + `docs/deployment.md` HF service section |
+| **Wider corpus validation (Phase 2)** | ⏳ blocking | not started |
+| Default-switch + migration note | ⏳ pending Phase 2 | will switch CLI default from `opf` to `hf` and add migration paragraph |
+| opf-only deprecation timer | ⏳ pending Phase 2 | CHANGELOG entry committing to N-release deprecation window |
 
 **Why deferred:** the speed/quality numbers come from two bundled
 fixtures plus a one-line probe. Production corpora will surface
@@ -419,24 +433,21 @@ edge cases (long inputs, rare unicode, code blocks, tokeniser
 quirks) where the two variants might diverge. Promoting to default
 without that signal is premature.
 
-**Trigger:** any of these is sufficient to start the promotion.
+**Trigger:** any of these is sufficient to flip the default and
+start the deprecation timer.
 
   * A real corpus shows the hf+opf variant matches the opf-only
     variant span-for-span on >99% of inputs.
   * Operators report the opf-only variant's CPU latency as a
     real production blocker.
-  * A `pf-hf-service-cu130` flavour gets added and tested on GPU,
-    showing it doesn't *regress* against the opf-only CUDA path.
 
-**Sketch + effort** (when triggered, ~1-2 person-days total):
+**Remaining phases** (now ~1 person-day total since the
+infrastructure landed):
 
 | Phase | Effort | What |
 |---|---|---|
-| 1. Build a `pf-hf-service-cu130` flavour | ~1-2 hrs | Add to `tools/image_builder/specs.py`, parameterise the Containerfile on `TORCH_INDEX_URL` (already set up) and `TARGET_DEVICE` (mirror the opf-only's pattern). Add the cu130 entry to the matrix in `publish-pf-hf-service-image.yml`. |
 | 2. Run a wider corpus comparison | ~2-3 hrs | Probe both variants on a real customer-data corpus (or the `engagement_notes.txt` fixture extended). Diff span-for-span. Fix any divergence at the BIOES→span layer in `services/privacy_filter_hf/main.py`. |
-| 3. Promote in the launcher | ~2 hrs | Add `pf-hf-service` as a service option in `tools/launcher/spec_extras.py` (parallel to the existing `pf-service` block). Add a CLI flag / menu prompt to pick between the two variants when starting the auto-managed sidecar. |
-| 4. Rewrite docs | ~2 hrs | Switch `docs/detectors/privacy-filter.md` to point at the hf+opf variant by default; demote the opf-only path to "alternate / reference implementation". Update `docs/deployment.md`'s deployment matrix similarly. |
-| 5. Add a migration note | ~30 min | Stick a one-paragraph migration guide at the top of `docs/detectors/privacy-filter.md` so existing `PRIVACY_FILTER_URL` consumers know the wire format hasn't changed and the swap is just an image-tag edit. |
+| 5. Switch the default + add migration note | ~1 hr | Flip `--privacy-filter-variant`'s default from `opf` to `hf`. Add a one-paragraph migration guide at the top of `docs/detectors/privacy-filter.md` so existing `PRIVACY_FILTER_URL` consumers know the wire format hasn't changed and the swap is just an image-tag edit. Update README.md / examples.md to recommend the HF variant. |
 | 6. Deprecate opf-only on a timer | ~30 min | Add a CHANGELOG entry committing to keep the opf-only image published for N releases (3?) before retiring it. Don't actually delete the workflow until that period elapses. |
 
 **Non-goals:**
