@@ -131,19 +131,27 @@ def start_service(
         )
 
     cmd: list[str] = [
-        engine.name, "run", "-d", "--rm",
+        engine.name, "run", "-d",
         "--name", service.container_name,
         "--network", SHARED_NETWORK,
         "-p", f"{service.port}:{service.port}",
         "-e", f"LOG_LEVEL={log_level}",
     ]
+    # Deliberately NO `--rm`: when a service crashes during startup
+    # we want the corpse to stick around so `_wait_for_health` can
+    # capture its exit logs (and the operator can `<engine> inspect`
+    # it for further forensics). Cleanup happens via `cleanup_service`
+    # below — atexit force-removes the container on graceful shutdown,
+    # and the existing "container exists but isn't running → remove"
+    # branch at the top of this function handles a leftover corpse on
+    # the next launcher run.
 
     # HF cache volume — only for services that need persistent model
     # weights. Create on first run and warn that the first start will
     # be slow (model download).
     if service.hf_cache_volume:
         just_created = engine.ensure_volume(service.hf_cache_volume)
-        cmd.extend(["-v", f"{service.hf_cache_volume}:/app/.cache/huggingface"])
+        cmd.extend(["-v", f"{service.hf_cache_volume}:{service.cache_mount_path}"])
         if just_created and kind != "baked":
             _console.print(
                 f"[yellow]First run: model will be fetched from HuggingFace "
@@ -208,6 +216,20 @@ def _wait_for_health(engine: Engine, service: ServiceSpec) -> None:
                 f"{service.container_name}[/red]",
             )
             raise SystemExit(1)
+
+        # Detect a dead container BEFORE polling /health. If the
+        # container exited (crashed during startup, OOM-killed,
+        # uvicorn import error, etc.) the /health probe will just
+        # quietly fail forever and the operator sees nothing useful
+        # — until pre-fix the loop would print "still loading" until
+        # the timeout fires, leaving the operator to chase a
+        # non-existent network issue. Catching the exit state up
+        # front lets us surface the actual error from the container's
+        # own log tail.
+        if not engine.container_running(service.container_name):
+            _print_dead_container_diagnostics(engine, service)
+            raise SystemExit(1)
+
         ok, body = engine.exec_health_probe(
             service.container_name,
             service.port,
@@ -220,13 +242,53 @@ def _wait_for_health(engine: Engine, service: ServiceSpec) -> None:
         # still alive during a multi-minute model fetch.
         if now - last_progress >= 20:
             elapsed = int(now - started_at)
-            _console.print(f"  […dim]still loading (elapsed: {elapsed}s)[/dim]")
+            _console.print(f"  [dim]still loading (elapsed: {elapsed}s)[/dim]")
             last_progress = now
         time.sleep(1)
 
 
+def _print_dead_container_diagnostics(engine: Engine, service: ServiceSpec) -> None:
+    """Capture and emit the dead container's last log lines so the
+    operator sees WHY it exited rather than chasing a generic
+    'didn't become ready' timeout. The container is left in place
+    (we run without `--rm`) so further forensics like
+    `<engine> inspect <name>` are still possible; the next launcher
+    run's name-collision handling reaps it on cleanup."""
+    _console.print(
+        f"[red]{service.container_name} exited before becoming ready. "
+        f"Last log lines:[/red]",
+    )
+    import subprocess
+    result = subprocess.run(
+        [engine.name, "logs", "--tail", "30", service.container_name],
+        capture_output=True, text=True, check=False,
+    )
+    # Some engines print logs to stderr, others to stdout — capture both.
+    output = (result.stdout or "") + (result.stderr or "")
+    if output.strip():
+        for line in output.splitlines():
+            _console.print(f"  [dim]{line}[/dim]")
+    else:
+        _console.print(
+            f"  [dim](no logs captured — {engine.name} logs returned empty)[/dim]",
+        )
+    _console.print(
+        f"[yellow]Container left in place for inspection. "
+        f"Run `{engine.name} rm -f {service.container_name}` when done, "
+        f"or re-run the launcher to retry (it will reap the corpse "
+        f"automatically).[/yellow]",
+    )
+
+
 def cleanup_service(engine: Engine, name: str) -> None:
-    """Stop the service container if WE started it. No-op otherwise."""
+    """Stop and remove the service container if WE started it. No-op
+    otherwise.
+
+    Removal is necessary because we run without `--rm` (so dead
+    containers stay around for diagnostics). On graceful shutdown
+    we want to leave a clean slate; on hard kill, the next launcher
+    run's name-collision handling reaps the corpse.
+    """
     if name not in _STARTED_SERVICES:
         return
     spec = LAUNCHER_METADATA.get(name)
@@ -236,6 +298,7 @@ def cleanup_service(engine: Engine, name: str) -> None:
         f"\nStopping auto-started {spec.service.container_name}…",
     )
     engine.stop_container(spec.service.container_name)
+    engine.remove_container(spec.service.container_name)
 
 
 def register_atexit_cleanup(engine: Engine, names: Iterable[str]) -> None:
