@@ -96,7 +96,100 @@ What to look for:
   high scores within its trained vocabulary; gliner-pii's scores
   spread more, with the bottom end being weakly-anchored mentions
   (see [gliner-pii PROBE.md → Empirical findings](../../gliner_pii/scripts/PROBE.md#empirical-findings)).
-- **Type granularity.** Privacy-filter collapses IBAN, credit
-  card, and SSN under one `IDENTIFIER` umbrella. If you need them
-  separately tagged, the regex detector (or gliner-pii's specific
-  labels) will give you finer types.
+- **Type granularity.** Privacy-filter advertises IBAN, credit
+  card, and SSN as one `IDENTIFIER` umbrella, but the empirical
+  findings below show the umbrella is leaky — IBAN fires, credit
+  card doesn't. For finer types, lean on the regex detector
+  (or gliner-pii's specific labels).
+
+## Empirical findings
+
+Numbers below come from running the example commands above against
+`sample.txt` and a couple of small isolation probes. Patterns that
+hold beyond the exact fixture:
+
+**1. Layout matters more than content for emails.** The same
+email fires or misses depending on what's around it:
+
+| Input shape | `EMAIL_ADDRESS` result |
+|---|---|
+| `Contact Jane Doe at jane.doe@example.com or call …` (clean prose, single line) | hit at 1.000 |
+| `…reachable at\njane.doe@example.com or +1 …` (line-broken prose in `sample.txt`) | **missed entirely** |
+| `Bob Roberts\n(bob.roberts@firstnationalbank.com, …)` (parenthetical after a name) | **absorbed into the `Bob Roberts` PERSON span** |
+
+So the model can detect emails — it just loses them when the
+prose layout breaks the local context (line breaks, parentheses
+right after a name). For real-world data with quirky formatting
+this is a recall risk; pairing privacy-filter with the regex
+detector covers the gap.
+
+**2. Span-merge over-extends across `\n\n` paragraph breaks.**
+Two cases on `sample.txt`:
+
+| Span | Captured text | What's wrong |
+|---|---|---|
+| `[164:191]` `DATE_OF_BIRTH` | `2026-04-17 09:42\n\nCustomer:` | "Customer:" header glued onto the date |
+| `[803:827]` `DATE_OF_BIRTH` | `2026-04-17.\n\nResolution:` | "Resolution:" heading glued onto the date |
+
+Source: `services/privacy_filter/main.py:82` —
+`_DEFAULT_GAP_PATTERN = re.compile(r"\s+")` matches *any*
+whitespace including double newlines, so adjacent same-type spans
+get merged across paragraph breaks. Tightening that pattern (e.g.
+forbidding `\n\n`, or capping merged-gap length) would fix this
+without affecting normal in-paragraph merges.
+
+**3. Credit cards don't fire as IDENTIFIER, even on the simplest
+input.**
+
+| Input | `IDENTIFIER` result |
+|---|---|
+| `IBAN DE89 3704 0044 0532 0130 00 …` (in `sample.txt`) | hit at 1.000 |
+| `SSN 123-45-6789 was verified …` (in `sample.txt`) | hit at 0.895 (with `SSN ` prefix absorbed) |
+| `Card on file: 4111-1111-1111-1111 (Visa).` (clean isolated probe) | **no matches** |
+| `4111-1111-1111-1111` inside `sample.txt` | no matches |
+
+The model card pitches `account_number` as a catch-all for
+IBAN/CC/SSN-shaped strings, but in practice it skews heavily
+toward IBAN. **Regex is the right tool for credit cards** (Luhn
+check + 13-19 digit shape with optional separators) — see
+`docs/detectors/regex.md` and the bundled `regex_pentest.yaml`
+pattern set.
+
+**4. Span boundaries pull in trailing punctuation.** Common
+token-classification artifact, mostly cosmetic for redaction
+purposes. Examples from `sample.txt`:
+
+- `1987-03-22),` (DATE includes paren + comma)
+- `+1 415-555-0181.` (PHONE includes period)
+- `Marcus Chen,` (PERSON includes comma)
+- `https://...8e5a2f1c.` (URL includes period)
+- `SSN 123-45-6789` (IDENTIFIER includes the leading "SSN ")
+
+For redaction this is tolerable — the surrogate replaces the noisy
+span; the punctuation reappears where it belongs in the rendered
+output. For downstream consumers that care about exact entity
+strings (audit logs, dashboards), strip trailing `[.,;)]+` after
+reading from the matches array.
+
+**5. `CREDENTIAL` only fires on actual secret-shaped strings.**
+The fixture's mentions of "temporary credentials", "password",
+and "API token" produced zero `CREDENTIAL` matches. Expected: the
+`secret` label maps to credential-shaped tokens (API keys, hashes,
+auth strings), not to the abstract nouns. If you need to detect
+the *concept* of credentials being discussed in prose, that's an
+LLM-detector job, not privacy-filter's.
+
+**Three buckets emerged for privacy-filter:**
+
+| Class | What works |
+|---|---|
+| **Prose-anchored entities in clean prose** (PERSON, EMAIL_ADDRESS, PHONE, ADDRESS, URL, DATE_OF_BIRTH) | Privacy-filter, default config |
+| **IBAN-shaped IDENTIFIERs in prose** | Privacy-filter |
+| **Credit cards, SSNs you want tagged separately, anything embedded in tabular / parenthetical / line-broken layout** | **Regex.** Privacy-filter is layout-sensitive and CC-shy regardless of input simplicity. |
+
+**Practical takeaway:** privacy-filter is excellent on prose-style
+inputs (support tickets, ticketing notes, conversational
+transcripts) for the standard PII set, but loses recall when the
+text layout fragments local context. Layer the regex detector on
+top — that's what `_to_matches` and the merge logic in the
+in-process detector are designed to compose with.
