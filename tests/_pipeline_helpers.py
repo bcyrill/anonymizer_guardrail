@@ -14,47 +14,59 @@ from __future__ import annotations
 import pytest
 
 
-# ── fail_closed flag patches ────────────────────────────────────────────
+# ── Generic config-patching ─────────────────────────────────────────────
+
+
+def _patch_detector_config(
+    monkeypatch: pytest.MonkeyPatch,
+    module,
+    **updates,
+) -> None:
+    """Patch `module.CONFIG` with arbitrary field overrides. The pipeline
+    reads `spec.config.<field>` live, so the patch takes effect on the
+    next `Pipeline()` instance.
+
+    The named shims below (`_patch_fail_closed`,
+    `_patch_pf_fail_closed`, `_patch_gliner_pii_fail_closed`) are
+    one-liners over this generic helper — kept because they convey
+    intent at call sites better than a raw module reference does. New
+    patches that aren't `fail_closed` should call this helper directly:
+
+        _patch_detector_config(monkeypatch, llm_mod, input_mode="merged")
+    """
+    monkeypatch.setattr(
+        module, "CONFIG",
+        module.CONFIG.model_copy(update=updates),
+    )
+
+
+# ── fail_closed flag shims (intent-revealing wrappers) ──────────────────
 
 
 def _patch_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    """Flip the LLM detector's fail_closed flag for one test by patching
-    `llm_mod.CONFIG`. The pipeline reads `spec.config.fail_closed` live,
-    so the patch takes effect immediately."""
+    """Flip the LLM detector's fail_closed flag for one test."""
     from anonymizer_guardrail.detector import llm as llm_mod
-
-    monkeypatch.setattr(
-        llm_mod, "CONFIG",
-        llm_mod.CONFIG.model_copy(update={"fail_closed": value}),
-    )
+    _patch_detector_config(monkeypatch, llm_mod, fail_closed=value)
 
 
 def _patch_pf_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    """Same shim for the privacy_filter detector's fail_closed flag."""
+    """Flip the privacy_filter detector's fail_closed flag for one test."""
     from anonymizer_guardrail.detector import remote_privacy_filter as pf_mod
-
-    monkeypatch.setattr(
-        pf_mod, "CONFIG",
-        pf_mod.CONFIG.model_copy(update={"fail_closed": value}),
-    )
+    _patch_detector_config(monkeypatch, pf_mod, fail_closed=value)
 
 
-def _patch_gliner_pii_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    """Same shim for the gliner_pii detector's fail_closed flag."""
+def _patch_gliner_pii_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, value: bool,
+) -> None:
+    """Flip the gliner_pii detector's fail_closed flag for one test."""
     from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
-
-    monkeypatch.setattr(
-        gp_mod, "CONFIG",
-        gp_mod.CONFIG.model_copy(update={"fail_closed": value}),
-    )
+    _patch_detector_config(monkeypatch, gp_mod, fail_closed=value)
 
 
 def _patch_detector_mode(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     """Swap pipeline_mod.config for one with `detector_mode` overridden.
-    Uses Pydantic's `model_copy(update=...)` — the central Config moved
-    from a dataclass to BaseSettings during the pydantic-settings
-    migration, so this is now the canonical way to override one field
-    while keeping every other field at its environment-derived value."""
+    Distinct from the per-detector helpers above because DETECTOR_MODE
+    lives on the central Config, not on a per-detector CONFIG."""
     from anonymizer_guardrail import pipeline as pipeline_mod
 
     monkeypatch.setattr(
@@ -73,14 +85,14 @@ def _patch_detector_mode(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
 # outright — the cache only matters for the stats lookup.
 
 
-def _llm_detector_that_raises(exc_factory):
-    """A bare LLMDetector instance whose detect() raises whatever
-    exc_factory returns."""
+def _detector_stub_that_raises(detector_cls, name: str, exc_factory):
+    """Build a bare detector instance whose `detect()` raises whatever
+    `exc_factory` returns. Generic factory; the per-detector shims
+    below pin the class + name for readable call sites."""
     from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
-    from anonymizer_guardrail.detector.llm import LLMDetector
 
-    bad = LLMDetector.__new__(LLMDetector)
-    bad.name = "llm"
+    bad = detector_cls.__new__(detector_cls)
+    bad.name = name
     bad._cache = InMemoryDetectionCache(0)
 
     async def boom(*_args, **_kwargs):
@@ -88,41 +100,31 @@ def _llm_detector_that_raises(exc_factory):
 
     bad.detect = boom  # type: ignore[method-assign]
     return bad
+
+
+def _llm_detector_that_raises(exc_factory):
+    """Bare LLMDetector whose detect() raises `exc_factory()`."""
+    from anonymizer_guardrail.detector.llm import LLMDetector
+    return _detector_stub_that_raises(LLMDetector, "llm", exc_factory)
 
 
 def _pf_detector_that_raises(exc_factory):
-    """A bare RemotePrivacyFilterDetector instance whose detect() raises
-    whatever exc_factory returns."""
-    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+    """Bare RemotePrivacyFilterDetector whose detect() raises
+    `exc_factory()`."""
     from anonymizer_guardrail.detector.remote_privacy_filter import (
         RemotePrivacyFilterDetector,
     )
-
-    bad = RemotePrivacyFilterDetector.__new__(RemotePrivacyFilterDetector)
-    bad.name = "privacy_filter"
-    bad._cache = InMemoryDetectionCache(0)
-
-    async def boom(*_args, **_kwargs):
-        raise exc_factory()
-
-    bad.detect = boom  # type: ignore[method-assign]
-    return bad
+    return _detector_stub_that_raises(
+        RemotePrivacyFilterDetector, "privacy_filter", exc_factory,
+    )
 
 
 def _gliner_detector_that_raises(exc_factory):
-    """A bare RemoteGlinerPIIDetector instance whose detect() raises
-    whatever exc_factory returns."""
-    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
+    """Bare RemoteGlinerPIIDetector whose detect() raises
+    `exc_factory()`."""
     from anonymizer_guardrail.detector.remote_gliner_pii import (
         RemoteGlinerPIIDetector,
     )
-
-    bad = RemoteGlinerPIIDetector.__new__(RemoteGlinerPIIDetector)
-    bad.name = "gliner_pii"
-    bad._cache = InMemoryDetectionCache(0)
-
-    async def boom(*_args, **_kwargs):
-        raise exc_factory()
-
-    bad.detect = boom  # type: ignore[method-assign]
-    return bad
+    return _detector_stub_that_raises(
+        RemoteGlinerPIIDetector, "gliner_pii", exc_factory,
+    )

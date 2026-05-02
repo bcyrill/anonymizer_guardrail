@@ -479,6 +479,63 @@ def test_gliner_cache_plus_merge_emits_warning(
 # ── Multi-detector merge mode ───────────────────────────────────────────
 
 
+async def test_mixed_merge_size_fallback_only_demotes_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the merged blob exceeds *only* the LLM's `max_chars` cap,
+    the LLM falls back to per_text dispatch BUT gliner and PF (which
+    have no `max_chars`) stay in merged mode. Pins the per-detector
+    granularity of `_apply_merge_size_fallback`: a fallback for one
+    detector mustn't cascade to the others.
+
+    Today only LLM declares `max_chars`; PF and gliner rely on the
+    remote service's own size policy. So a tight LLM cap should
+    demote LLM only, leaving PF/gliner unaffected."""
+    # Tight LLM cap; PF/gliner have no max_chars so they're never
+    # affected by the size check.
+    _patch_llm_config(
+        monkeypatch, fail_closed=False, input_mode="merged", max_chars=20,
+    )
+    _patch_pf_config(monkeypatch, fail_closed=False, input_mode="merged")
+    _patch_gliner_config(monkeypatch, fail_closed=False, input_mode="merged")
+
+    llm_seen: list[str] = []
+    pf_seen: list[str] = []
+    gliner_seen: list[str] = []
+
+    async def llm_detect(text, *_args, **_kwargs):
+        llm_seen.append(text)
+        return []
+
+    async def pf_detect(text, *_args, **_kwargs):
+        pf_seen.append(text)
+        return []
+
+    async def gliner_detect(text, *_args, **_kwargs):
+        gliner_seen.append(text)
+        return []
+
+    p = Pipeline()
+    p._detectors = [
+        _stub_llm_detector(llm_detect),
+        _stub_pf_detector(pf_detect),
+        _stub_gliner_detector(gliner_detect),
+    ]
+
+    # Two texts that together (with sentinel) blow past LLM's 20-char
+    # cap but are well within whatever PF/gliner can handle.
+    await p.anonymize(
+        ["aaaaaaaaaa", "bbbbbbbbbb"], call_id="mixed-demotion-test",
+    )
+
+    # LLM was demoted to per_text → one call per text.
+    assert llm_seen == ["aaaaaaaaaa", "bbbbbbbbbb"]
+    # PF + gliner stayed merged → one call each, with the joined blob.
+    expected_blob = _MERGE_SENTINEL.join(["aaaaaaaaaa", "bbbbbbbbbb"])
+    assert pf_seen == [expected_blob]
+    assert gliner_seen == [expected_blob]
+
+
 async def test_all_three_detectors_in_merge_mode_each_get_one_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
