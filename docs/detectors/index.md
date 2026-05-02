@@ -122,3 +122,7 @@ pattern.
   LLM prompt) supports per-request *named* alternatives — operators
   pre-declare allowed names; callers reference them by name. See
   [per-request overrides → Named alternatives](../per-request-overrides.md#named-alternatives).
+  GLiNER-PII has a different override shape — a free-form
+  `gliner_labels` list (and a `gliner_threshold` float) per request,
+  not pre-declared names. See
+  [gliner-pii → Per-request overrides](gliner-pii.md#per-request-overrides).

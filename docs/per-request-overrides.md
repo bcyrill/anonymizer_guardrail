@@ -98,6 +98,15 @@ bucket. Default-config traffic still buckets to the original key shape
 — no migration cost. The surrogate cache itself remains bounded by
 `SURROGATE_CACHE_MAX_SIZE`.
 
+The per-detector result cache has a separate, simpler interaction:
+when a detector is configured with `<DETECTOR>_INPUT_MODE=merged`
+(startup config — not a per-request override), its result cache is
+bypassed entirely because every merged blob is unique by
+construction. See
+[operations → Merged-input mode](operations.md#merged-input-mode)
+for the trade-off and the cache + merge mutual-exclusivity warning
+operators get at boot when both are configured non-trivially.
+
 ## Named alternatives
 
 `regex_patterns`, `llm_prompt`, and `denylist` deliberately accept
