@@ -1,0 +1,28 @@
+[Synthetic customer-service ticket for probe.py exploration. All
+names, contacts, accounts, addresses, and dates are fabricated.]
+
+Ticket #SVC-2026-04-117 — opened 2026-04-17 09:42
+
+Customer: Jane Doe (date of birth 1987-03-22), reachable at
+jane.doe@example.com or +1 415-555-0181. Mailing address: 742
+Evergreen Terrace, Springfield, IL 62701, United States.
+
+Issue summary: Jane reported a failed payment on her primary
+account. The card on file (Visa ending in 4242, full number
+4111-1111-1111-1111 entered during a follow-up call) was declined
+by the issuer. Recovery contact at the bank: Bob Roberts
+(bob.roberts@firstnationalbank.com, +1 212-555-0107), who
+confirmed the IBAN DE89 3704 0044 0532 0130 00 is still linked to
+the household. SSN 123-45-6789 was verified during the identity
+check on 2026-04-17.
+
+Resolution: Reset the password on the customer portal — temporary
+credentials sent to Jane via secure email. New URL for the reset
+flow: https://support.acmebank.com/reset/8e5a2f1c. Followed up by
+phone on 2026-04-18; customer confirmed access restored, then
+chose a new password and rotated the API token tied to her
+business profile.
+
+Closed by: Marcus Chen, agent ID 88421. Team-lead handoff notes
+live at https://internal.acmebank.com/tickets/SVC-2026-04-117 for
+reviewers; please do not forward outside the support org.

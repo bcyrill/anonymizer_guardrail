@@ -37,27 +37,34 @@ the practical contrasts when running this one:
 
 ## Examples
 
+`sample.txt` is a synthetic customer-service ticket shipped
+alongside the script — covers every entry in the model's label map
+(person, email, phone, URL, address, date of birth, IBAN / credit
+card / SSN as `IDENTIFIER`, password reference as `CREDENTIAL`).
+Use it as a smoke fixture or as scaffolding for your own.
+
 ```bash
 # Single inline text:
 python services/privacy_filter/scripts/probe.py \
     --text "Alice Smith (alice@acme.com) lives at 123 Main St."
 
-# File input:
+# Bundled fixture covering every trained label:
 python services/privacy_filter/scripts/probe.py \
-    --text-file sample.txt
+    --text-file services/privacy_filter/scripts/sample.txt
 
-# Read from stdin:
-cat sample.txt | python services/privacy_filter/scripts/probe.py \
-    --text-file -
+# Read from stdin (your own file or piped output):
+cat services/privacy_filter/scripts/sample.txt | \
+    python services/privacy_filter/scripts/probe.py --text-file -
 
 # Non-default URL (CI runner, remote host, …):
 python services/privacy_filter/scripts/probe.py \
     --url http://privacy.internal:8001 \
-    --text-file sample.txt
+    --text-file services/privacy_filter/scripts/sample.txt
 
-# Raw JSON for scripting:
+# Raw JSON for scripting — e.g. only high-confidence matches:
 python services/privacy_filter/scripts/probe.py \
-    --text "..." --json | jq '.matches[] | select(.score > 0.9)'
+    --text-file services/privacy_filter/scripts/sample.txt \
+    --json | jq '.matches[] | select(.score > 0.9)'
 ```
 
 ## Comparing detectors on the same fixture
