@@ -616,11 +616,10 @@ class Pipeline:
         # a sentinel-bearing match.
         merged_matches: list[list[Match]] = []
         for det, task in zip(merged_dets, merged_tasks):
-            kept = [
-                m for m in task.result() if _MERGE_SENTINEL_MARKER not in m.text
-            ]
+            results = task.result()
+            kept = [m for m in results if _MERGE_SENTINEL_MARKER not in m.text]
             if log.isEnabledFor(logging.DEBUG):
-                dropped = len(task.result()) - len(kept)
+                dropped = len(results) - len(kept)
                 if dropped:
                     log.debug(
                         "merged dispatch: dropped %d sentinel-spanning matches "
