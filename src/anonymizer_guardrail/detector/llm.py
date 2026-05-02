@@ -24,6 +24,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ..bundled_resource import read_bundled_default, resolve_spec
 from ..registry import parse_named_path_registry
 from .base import Match
+from .cache import DetectorResultCache, InMemoryDetectionCache
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.llm")
@@ -63,6 +64,13 @@ class LLMConfig(BaseSettings):
     # Failure mode when the LLM detector errors out. true (default) →
     # block; false → fall back to coverage from the other detectors.
     fail_closed: bool = True
+    # LRU cap for the per-detector result cache. 0 disables caching
+    # (default). When enabled, caching skips the LLM call for inputs
+    # we've seen before within the cache lifetime — useful for
+    # multi-turn conversations where each turn replays the full history
+    # in `texts`. See detector/cache.py for the trade-offs (notably
+    # that it freezes the first-seen result for a given input).
+    cache_max_size: int = 0
 
     @field_validator("api_base", mode="after")
     @classmethod
@@ -248,6 +256,19 @@ class LLMDetector:
         self.model = model or CONFIG.model
         self.timeout_s = timeout_s or CONFIG.timeout_s
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
+        # Per-detector result cache. Disabled (max_size=0) by default;
+        # operators opt in via LLM_CACHE_MAX_SIZE. The cap is fixed at
+        # construction — Pipeline rebuild (which tests do via
+        # `monkeypatch.setattr(llm_mod, "CONFIG", ...)`) gives a fresh
+        # cache for free, no special teardown needed.
+        #
+        # Annotated as the Protocol so a future swap to a different
+        # backend (e.g. Redis when horizontal scaling lands) is a
+        # one-line factory change here, with no edits to the rest of
+        # the detector code. See detector/cache.py for the seam.
+        self._cache: DetectorResultCache = InMemoryDetectionCache(
+            CONFIG.cache_max_size
+        )
 
     async def detect(
         self,
@@ -257,33 +278,68 @@ class LLMDetector:
         model: str | None = None,
         prompt_name: str | None = None,
     ) -> list[Match]:
+        """Public entry point. Resolves the cache key from the text plus
+        the overrides that affect output, then delegates to `_do_detect`
+        through the cache.
+
+        `api_key` is intentionally NOT in the cache key: same model +
+        prompt + text → same detection result regardless of which key
+        authenticated the call. Including it would fragment the cache
+        across users (e.g. forwarded keys) for no correctness benefit.
+        """
         if not text or not text.strip():
             return []
 
+        # Resolve overrides to their effective concrete values so the
+        # cache key is canonical: a None-override and a no-override
+        # carrying the matching default share one cache slot. Same
+        # pattern as SurrogateGenerator.for_match.
+        effective_model = (model or self.model).strip() or self.model
+        effective_prompt_name = prompt_name if prompt_name else "default"
+
+        cache_key = (text, effective_model, effective_prompt_name)
+        return await self._cache.get_or_compute(
+            cache_key,
+            lambda: self._do_detect(
+                text,
+                api_key=api_key,
+                effective_model=effective_model,
+                effective_prompt_name=effective_prompt_name,
+            ),
+        )
+
+    async def _do_detect(
+        self,
+        text: str,
+        *,
+        api_key: str | None,
+        effective_model: str,
+        effective_prompt_name: str,
+    ) -> list[Match]:
+        """The actual HTTP call. Split out from `detect` so the cache
+        wrapper is the only thing the public entry point does. Receives
+        already-resolved override values to keep cache-key construction
+        and HTTP-call construction reading from the same source of truth.
+        """
         # Per-call override (e.g. forwarded user key from LiteLLM) takes
         # precedence; otherwise use the configured key. Empty string after
         # strip is treated as "no key" so we don't send an empty Bearer.
         effective_key = (api_key if api_key is not None else self.api_key) or ""
         effective_key = effective_key.strip()
 
-        # `model` lets callers (per-request override path) swap the
-        # detection model without rebuilding the LLMDetector. Falls
-        # back to whatever was configured at startup.
-        effective_model = (model or self.model).strip() or self.model
-
         # `prompt_name` selects a NAMED alternative system prompt from
-        # LLM_SYSTEM_PROMPT_REGISTRY. None / "default" → the
-        # configured default prompt. Unknown name → log a warning and
-        # fall back to the default (don't block the request over a
-        # typo in the override).
+        # LLM_SYSTEM_PROMPT_REGISTRY. "default" → the configured default
+        # prompt. Unknown name → log a warning and fall back to the
+        # default (don't block the request over a typo in the override).
         effective_prompt = _SYSTEM_PROMPT
-        if prompt_name and prompt_name != "default":
-            named = _SYSTEM_PROMPT_REGISTRY.get(prompt_name)
+        if effective_prompt_name != "default":
+            named = _SYSTEM_PROMPT_REGISTRY.get(effective_prompt_name)
             if named is None:
                 log.warning(
                     "Override llm_prompt=%r isn't in LLM_SYSTEM_PROMPT_REGISTRY "
                     "(known: %s); falling back to the default prompt.",
-                    prompt_name, sorted(_SYSTEM_PROMPT_REGISTRY) or "<empty>",
+                    effective_prompt_name,
+                    sorted(_SYSTEM_PROMPT_REGISTRY) or "<empty>",
                 )
             else:
                 effective_prompt = named
@@ -363,6 +419,12 @@ class LLMDetector:
 
         return _parse_entities(content, text)
 
+    def cache_stats(self) -> dict[str, int]:
+        """Cache stats snapshot for Pipeline.stats() / the /health probe.
+        Always defined (even when caching is disabled) so the spec's
+        has_cache=True flag is the single switch the pipeline reads."""
+        return self._cache.stats()
+
     async def aclose(self) -> None:
         """Close the shared httpx client. Called from Pipeline.aclose() at
         FastAPI shutdown so the connection pool drains cleanly."""
@@ -392,6 +454,10 @@ SPEC = DetectorSpec(
         "Anonymization LLM is unreachable; request blocked to prevent "
         "unredacted data from reaching the upstream model."
     ),
+    # Result caching — operator-controlled via LLM_CACHE_MAX_SIZE
+    # (0 = disabled, the default). Surfaces cache_size/cache_max/
+    # cache_hits/cache_misses on /health under the `llm_` prefix.
+    has_cache=True,
 )
 
 

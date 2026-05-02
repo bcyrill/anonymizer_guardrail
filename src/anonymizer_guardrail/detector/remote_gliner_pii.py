@@ -47,6 +47,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .base import Detector, Match
+from .cache import DetectorResultCache, InMemoryDetectionCache
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.gliner_pii.remote")
@@ -83,6 +84,11 @@ class GlinerPIIConfig(BaseSettings):
     # Max number of concurrent gliner-pii calls. Same rationale as
     # privacy_filter.CONFIG.max_concurrency.
     max_concurrency: int = 10
+    # LRU cap for the per-detector result cache. 0 disables caching
+    # (default). When enabled, repeat calls with the same
+    # (text, labels, threshold) skip the remote gliner round-trip.
+    # See detector/cache.py for the trade-offs.
+    cache_max_size: int = 0
 
     @field_validator("url", mode="after")
     @classmethod
@@ -214,6 +220,11 @@ class RemoteGlinerPIIDetector:
             threshold if threshold is not None else _parse_threshold(CONFIG.threshold)
         )
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
+        # Per-detector result cache. Disabled (max_size=0) by default;
+        # operators opt in via GLINER_PII_CACHE_MAX_SIZE.
+        self._cache: DetectorResultCache = InMemoryDetectionCache(
+            CONFIG.cache_max_size
+        )
         log.info(
             "GLiNER-PII detector wired to remote service at %s "
             "(timeout=%ds, labels=%s, threshold=%s).",
@@ -247,6 +258,38 @@ class RemoteGlinerPIIDetector:
             threshold if threshold is not None else self.threshold
         )
 
+        # Cache key: text + the resolved overrides that actually change
+        # gliner's output. labels is a list (mutable, unhashable);
+        # convert to a tuple for the key. Don't sort — order is
+        # preserved through to the wire body, so a caller passing
+        # labels in different orders is making materially different
+        # calls as far as the cache contract is concerned. None means
+        # "use server defaults" and gets its own slot, distinct from
+        # "explicit empty list" (which the validator above reduces to
+        # None anyway, but the cache layer doesn't have to know that).
+        cache_key = (
+            text,
+            tuple(effective_labels) if effective_labels is not None else None,
+            effective_threshold,
+        )
+        return await self._cache.get_or_compute(
+            cache_key,
+            lambda: self._do_detect(
+                text,
+                effective_labels=effective_labels,
+                effective_threshold=effective_threshold,
+            ),
+        )
+
+    async def _do_detect(
+        self,
+        text: str,
+        *,
+        effective_labels: list[str] | None,
+        effective_threshold: float | None,
+    ) -> list[Match]:
+        """The actual HTTP call. Split out from `detect` so the cache
+        wrapper is the only thing the public entry point does."""
         endpoint = f"{self.url}/detect"
         # Build the request body with only the fields the operator
         # actually configured. Omitting `labels` / `threshold` lets the
@@ -302,6 +345,10 @@ class RemoteGlinerPIIDetector:
             ) from exc
 
         return _parse_matches(payload, text, endpoint)
+
+    def cache_stats(self) -> dict[str, int]:
+        """Cache stats snapshot for Pipeline.stats() / the /health probe."""
+        return self._cache.stats()
 
     async def aclose(self) -> None:
         """Drain the httpx connection pool. Wired to Pipeline.aclose
@@ -414,6 +461,10 @@ SPEC = DetectorSpec(
         "blocked to prevent unredacted data from reaching the "
         "upstream model."
     ),
+    # Result caching — operator-controlled via
+    # GLINER_PII_CACHE_MAX_SIZE (0 = disabled, the default).
+    # Surfaces gliner_pii_cache_size/max/hits/misses on /health.
+    has_cache=True,
 )
 
 

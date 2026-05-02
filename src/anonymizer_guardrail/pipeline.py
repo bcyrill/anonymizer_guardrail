@@ -30,6 +30,7 @@ from .config import config
 from .detector import (
     REGISTERED_SPECS,
     SPECS_BY_NAME,
+    SPECS_WITH_CACHE,
     SPECS_WITH_SEMAPHORE,
     TYPED_UNAVAILABLE_ERRORS,
 )
@@ -187,6 +188,28 @@ class Pipeline:
         for spec in SPECS_WITH_SEMAPHORE:
             out[f"{spec.stats_prefix}_in_flight"] = self._inflight_counters[spec.name]
             out[f"{spec.stats_prefix}_max_concurrency"] = spec.config.max_concurrency
+        # Per-detector cache snapshot. Mirrors the SPECS_WITH_SEMAPHORE
+        # loop above: emit a fixed set of keys for every spec that opted
+        # into has_cache, regardless of whether the detector is
+        # currently active under DETECTOR_MODE. Inactive detectors
+        # report the configured cap with zero size/hits/misses — that
+        # keeps /health key sets stable so dashboards can pin to them.
+        active_by_name = {d.name: d for d in self._detectors}
+        for spec in SPECS_WITH_CACHE:
+            det = active_by_name.get(spec.name)
+            if det is not None:
+                cs = det.cache_stats()
+            else:
+                cs = {
+                    "size": 0,
+                    "max": int(spec.config.cache_max_size),
+                    "hits": 0,
+                    "misses": 0,
+                }
+            out[f"{spec.stats_prefix}_cache_size"]   = cs["size"]
+            out[f"{spec.stats_prefix}_cache_max"]    = cs["max"]
+            out[f"{spec.stats_prefix}_cache_hits"]   = cs["hits"]
+            out[f"{spec.stats_prefix}_cache_misses"] = cs["misses"]
         return out
 
     @property

@@ -98,7 +98,10 @@ infra) that's unwarranted until horizontal scaling is actually needed.
    different replicas, only the *vault* needs to be shared — the
    surrogate is built into the request, not re-derived on the response
    side. So per-replica surrogate cache is fine; document it.
-6. Document the limitation that's now solved + the new env vars.
+6. The **detector result cache** is a separable concern with its own
+   triggers (multi-replica, restart persistence, cross-replica hit
+   rate) — see *Redis-backed detector result cache* below.
+7. Document the limitation that's now solved + the new env vars.
 
 **Concrete trigger:** the day someone adds a second replica.
 
@@ -107,6 +110,121 @@ infra) that's unwarranted until horizontal scaling is actually needed.
 - Don't generalize to "any KV store" — one production-quality backend
   (Redis) covers the use case. Cassandra/DynamoDB/etc. can be added
   per-need.
+
+---
+
+## Redis-backed detector result cache
+
+**What:** add a `RedisDetectionCache` implementation alongside the
+existing `InMemoryDetectionCache`, selectable per detector via
+`<DETECTOR>_CACHE_BACKEND=memory|redis`. Backed by one shared Redis
+instance with per-detector key namespaces.
+
+**Why:** the in-memory cache (`detector/cache.py`) is process-local
+and lost on restart. Three independent triggers want a shared /
+durable cache:
+
+- **Multi-replica.** A request routed to replica B can't reuse work
+  done on replica A, so cache hit rate degrades inversely with the
+  number of replicas. Distinct from the *Multi-replica support
+  (Redis-backed Vault)* task above — that one is about correctness
+  (lost mappings ⇒ unredacted responses), this one is about
+  efficiency (cold caches per replica).
+- **Restart persistence.** Multi-turn conversations live for
+  minutes-to-hours; a deploy mid-conversation drops every cached
+  detection result and the next replayed history pays full LLM cost
+  again.
+- **Memory pressure.** Operators caching aggressively (large
+  conversation counts × long histories) can move the cache off the
+  Python heap onto a separate process / host.
+
+**Why deferred:** none of those triggers fires for a single-replica
+deployment with caching disabled (the current default). Redis
+introduces real complexity — a network dependency, serialization,
+connection pooling, and a "Redis is down" failure mode that the
+detector layer has to decide how to handle. Premature until the
+cache is actually enabled in production *and* one of the triggers
+above is real.
+
+**The seam is already there.** `cache.py` defines a
+`runtime_checkable` Protocol `DetectorResultCache` that
+`InMemoryDetectionCache` satisfies; `LLMDetector._cache` is
+annotated as the Protocol. Adding a new backend is a new file plus
+a factory selector — no edits to detector code.
+
+**Concrete trigger:** any of:
+
+- Horizontal scaling (>1 replica).
+- A deployment where conversations routinely outlive process
+  restarts and the lost cache is operator pain.
+- Measured memory pressure (cache size pinned to the cap with high
+  hit rate, but operators can't grow the cap further on the host).
+
+**Sketch:**
+
+1. Add a cross-cutting `CACHE_REDIS_URL` env var on the central
+   `Config`. *One* Redis URL — operators don't want N Redis
+   instances to deploy and monitor just because we have N
+   detectors.
+2. Add `<DETECTOR>_CACHE_BACKEND=memory|redis` to each cache-using
+   detector's `*Config`. Default `memory` — Redis is opt-in even
+   when `CACHE_REDIS_URL` is set.
+3. New file `detector/redis_cache.py` with `RedisDetectionCache`
+   implementing `DetectorResultCache`. Use `redis-py`'s asyncio
+   client (`redis.asyncio.Redis`) — the detector layer is already
+   async.
+4. Per-detector key namespace: `cache:<spec.name>:<blake2b(key)>`
+   where `key` is the same hashable tuple the in-memory backend
+   uses today. Hash the tuple before storing — Redis keys are
+   strings, and `repr(tuple)` is fragile. Reuse `SURROGATE_SALT`
+   or introduce a separate `CACHE_SALT` so cache keys don't leak
+   originals to anyone with Redis read access.
+5. Value serialization: msgpack or JSON over the `tuple[Match, ...]`.
+   Match is a frozen dataclass with two strings — round-trip is
+   trivial regardless of choice. JSON is debuggable from
+   `redis-cli`; msgpack is smaller. Pick one; document.
+6. Eviction: per-detector TTL via `<DETECTOR>_CACHE_TTL_S` (Redis
+   `EXPIRE`). Redis doesn't do LRU per-namespace natively, so TTL
+   is the per-detector knob; the `maxmemory` policy on the Redis
+   instance itself bounds the global footprint. *No* `*_CACHE_MAX_SIZE`
+   for the Redis backend — that's a memory-backend concept; document
+   the asymmetry.
+7. Failure handling: if Redis is unreachable, the cache becomes a
+   passthrough (`get_or_compute` calls through to the detector,
+   nothing is cached). Same shape as `InMemoryDetectionCache`'s
+   disabled state. Log a warning at most every N seconds so a flap
+   doesn't spam logs. Do *not* fail-closed — a degraded cache is
+   not the same as a degraded detector.
+8. Stats: `<prefix>_cache_size` reports `DBSIZE` filtered to the
+   namespace (or `SCAN MATCH cache:llm:* COUNT N` periodically;
+   exact size is OK to be approximate). Hit/miss counters stay
+   process-local — they're per-instance traffic, not cluster-wide.
+9. Tests via `fakeredis[asyncio]` so CI doesn't need a real Redis,
+   plus a small integration test gated by an env var that runs
+   against a real Redis when one's available.
+10. Document the operator surface: `CACHE_REDIS_URL`, the per-detector
+    `*_CACHE_BACKEND` and `*_CACHE_TTL_S`, the namespace scheme, and
+    the "Redis down → passthrough" failure mode.
+
+**Non-goals:**
+
+- **Don't replace the in-memory backend.** Single-replica
+  deployments shouldn't grow a Redis dependency for a feature that
+  works without one. Both backends ship; the env var selects.
+- **Don't share key construction with the in-memory backend.** The
+  in-memory cache uses Python tuples directly as dict keys; the
+  Redis backend hashes them to strings. The detectors hand a
+  hashable to `get_or_compute` either way — the backend decides
+  what to do with it.
+- **Don't move the surrogate cache to Redis as part of this task.**
+  That's covered in *Multi-replica support* with a different set of
+  trade-offs (correctness vs. efficiency). Keep the scopes
+  separate.
+- **Don't add per-detector Redis URLs.** If operators want to
+  shard, they can put a different DB number per detector
+  (`redis://host/0` for LLM, `redis://host/1` for gliner) via
+  Redis's existing logical-DB feature without us inventing config
+  shape for it.
 
 ---
 
@@ -246,91 +364,246 @@ log aggregator. Premature otherwise.
 
 ---
 
-## LLM batching for small fragments
+## Per-detector merged-input mode
 
-**What:** pack multiple short input texts from a single request into
-one LLM detection call instead of N parallel calls. The model is
-asked to return a list-of-lists (one entity list per input), and the
-pipeline maps the result back to per-text matches.
+**What:** a per-detector knob (`<DETECTOR>_INPUT_MODE=per_text|merged`)
+that controls whether the detector receives `req.texts` as N separate
+calls (the current behaviour) or as a single concatenated blob with
+sentinel separators. Detectors in `merged` mode trade the per-text
+result cache for one round-trip per request and stronger context.
 
-**Why:** today each text in `req.texts` produces its own
-`_detect_one` task (see `Pipeline.anonymize` in `pipeline.py`), each
-of which fans out to its own LLM call (`LLMDetector.detect` in
-`detector/llm.py`). For a request with 10
-short texts, that's 10 LLM round-trips, each carrying the full system
-prompt. The system prompt currently ~600 tokens (see
-`prompts/llm_default.md`); 10 short inputs of ~50 tokens each means
-we send ~6500 system-prompt tokens for ~500 user tokens — a 13×
-overhead. Batching one round-trip with the system prompt sent once
-plus a `[input1, input2, …]` user message would cut both token cost
-and total wall-clock latency (one TTFT + a longer generation, vs.
-ten TTFTs serialized through a concurrency cap of 10).
+**Status:** the detector result cache landed (see
+`detector/cache.py` + `LLM_CACHE_MAX_SIZE`), which addresses the
+*repeat-history* dimension of multi-turn cost. This task addresses
+the *fan-out per request* dimension, which the cache does not help
+with: a fresh first turn with N small `texts` still pays N LLM
+round-trips. The two optimizations are complementary but mutually
+exclusive *per detector*: a detector running in merged mode sees a
+unique blob each call, so caching is meaningless and the knob
+disables the cache for that detector's calls.
 
-**Why deferred:** non-trivial. Tradeoffs:
+**Why:** two distinct wins.
 
+1. **Token / latency amortization.** Each text in `req.texts`
+   produces its own `_detect_one` task in `Pipeline.anonymize`, each
+   of which fans out to its own LLM call. For a request with 10
+   short texts, that's 10 round-trips, each carrying the ~600-token
+   system prompt — ~6500 system-prompt tokens for ~500 user tokens
+   (13× overhead). One round-trip with the prompt sent once cuts
+   tokens and wall-clock latency (one TTFT + longer generation vs.
+   ten TTFTs serialized through a concurrency cap of 10).
+
+2. **Context quality** *(the new piece — wasn't in the original
+   "LLM batching" framing).* Context-aware detectors (LLM, gliner,
+   privacy_filter) classify better when they can see the surrounding
+   text. A bare username in one text might be ambiguous in
+   isolation but obviously a CREDENTIAL when a sibling text is
+   "password reset request for…". Per-text fan-out hides that
+   correlation; merged input restores it. Regex and denylist don't
+   care — they're shape-based — so the knob is per-detector by design.
+
+**Why deferred:** non-trivial, and the trade-offs intersect with
+the cache work in ways worth thinking through before committing:
+
+- **Cache vs. merge are mutually exclusive.** A merged blob is
+  unique per request, so `InMemoryDetectionCache` would 100% miss.
+  Operators choose one mode per detector, not both. The knob
+  documentation needs to make this explicit.
 - **Failure mode worsens.** Today one LLM call failing only loses
-  detection for one text; under `fail_closed=False` the others still
-  get coverage. Batched, a single bad response loses coverage for
-  the whole batch — and a *partially* malformed response (model
-  returns 9 of 10 expected lists) is messy to handle.
-- **Hallucination accounting gets harder.** The hallucination guard
-  in `_parse_entities` (`detector/llm.py`) checks each matched
-  substring against the source text. With multiple sources
-  in flight, the model could return a real entity from text 3 but
-  attribute it to text 1's list. The guard would still drop it (it
-  isn't in text 1), so we lose a real entity — net worse than
-  before.
-- **Heterogeneous batch sizes.** A request with one 50k-char text
-  and nine 50-char texts shouldn't batch — the long one alone is
-  near `LLM_MAX_CHARS`. Need a sizing heuristic.
-- The other detectors (regex, denylist, privacy_filter, gliner_pii)
-  don't benefit from this — only the LLM path. So the optimization
-  is detector-specific and adds only-the-LLM-batches branching to
-  the pipeline.
-
-**Why deferred (continued):** the wins are real but proportional to
-"many small texts per request," and our current traffic shape (mostly
-single-message LiteLLM hooks with a few texts each) doesn't yet
-spend much on system-prompt overhead. Worth measuring before
-implementing.
+  detection for one text; under `fail_closed=False` the others
+  still get coverage. Merged, a single bad response loses coverage
+  for the whole request.
+- **Hallucination guard needs care.** The existing guard in
+  `_parse_entities` (`detector/llm.py`) checks `text in source_text`.
+  With merged source, a hallucinated entity from text 2 could pass
+  the check via text 1 if it happens to appear there. Mitigation:
+  use a sentinel separator that's unlikely to appear in any
+  detected entity, and (optionally) per-segment hallucination
+  scoping if the response carries which-segment metadata.
+- **Cross-boundary entities.** A detector seeing the merged blob
+  might find an entity that *spans* a join (e.g. "Alice" at the end
+  of text 1, "Smith" at the start of text 2 → "Alice Smith" as
+  PERSON). The replacer pattern won't match anything in either
+  real text — cosmetic but confusing in logs. Sentinel choice
+  matters.
+- **Heterogeneous sizes.** A request with one 50k-char text and
+  nine 50-char texts shouldn't merge — the merged blob blows past
+  `LLM_MAX_CHARS`. Need a sizing heuristic (mode falls back to
+  per-text when the merged blob would exceed the cap).
 
 **Concrete trigger:** a deployment shows a meaningful share of LLM
-detection cost / latency tied to small-fragment fan-out, OR a request
-shape with lots of small texts shows up (e.g. tool-call arguments,
-chat history with many short turns).
+detection cost / latency tied to small-fragment fan-out, OR
+operators report context-quality regressions (entities the LLM
+catches in a contiguous prompt but misses when it's split into
+`req.texts` entries).
 
 **Sketch:**
 
-1. Move LLM detection out of the per-text fan-out at the *LLM
-   detector layer*. The pipeline still calls one detector per text;
-   the detector itself buffers and packs.
-2. Or simpler: introduce a `Pipeline._detect_batch` path that runs
-   the non-LLM detectors per-text (as today) and the LLM detector
-   once for the whole batch.
-3. Update the system prompt to describe the input format change
-   (`{"texts": ["...", "..."]}`) and the response format
-   (`{"entities_per_text": [[…], […]]}` or similar).
-4. Sizing heuristic: only batch texts whose combined length is below
-   some fraction of `LLM_MAX_CHARS` (e.g. 50%). Texts above the cut
-   go alone.
-5. Hallucination guard: per-text-list, check each entity against its
-   own source-text — preserves the existing protection.
-6. Failure handling under `fail_closed=False`: a malformed batched
-   response degrades the *whole batch* to `[]` for the LLM detector
-   (other detectors still cover). Document this as a tradeoff.
-7. Add a benchmark in `docs/benchmark.md` showing the
-   tokens-per-request and p95 latency improvement on a realistic
-   small-fragment workload.
+1. Add `cache_max_size` already in place in each slow detector's
+   `*Config`. Add a sibling `input_mode: Literal["per_text","merged"]`
+   field, default `"per_text"`. Validate the per-detector
+   "cache + merge are mutually exclusive" combination at boot
+   (warn-and-prefer-merged if both are configured non-trivially,
+   or fail loud — pick one and document it).
+2. Move the per-text fan-out from `Pipeline._detect_one` into a
+   per-detector dispatch: detectors in `per_text` mode run inside
+   the existing TaskGroup; detectors in `merged` mode run once per
+   request against the merged blob, and their matches join the
+   per-text matches at dedup.
+3. Sentinel separator: a token unlikely to occur in entities
+   (`\n\n--- BREAK ---\n\n` or similar). Document it; reserve it as
+   "do not emit as part of an entity" in the LLM prompt.
+4. Sizing fallback: if the merged blob exceeds `LLM_MAX_CHARS`,
+   degrade to `per_text` for that one request (with a debug log)
+   rather than raising — the optimization is opportunistic.
+5. Hallucination guard: still run `text in source_text` against the
+   merged blob. Consider a stricter guard once the prompt is
+   updated to return per-segment metadata.
+6. Cache integration: when `input_mode="merged"`, skip the cache
+   path entirely (the cache is bypassed regardless of
+   `cache_max_size`). Document this in the operator-facing knob.
+7. Bench: add a `docs/benchmark.md` section comparing per-text vs.
+   merged mode on (a) a many-small-texts request (token
+   amortization) and (b) a context-sensitive detection corpus
+   (quality).
 
 **Non-goals:**
 
-- Don't batch across requests. Cross-request batching needs a
-  request-coalescing window (extra latency for the first request in
-  the window) and undermines per-request `Overrides` (different
-  requests may pick different prompts / models). Out of scope.
-- Don't batch the regex / denylist / privacy_filter detectors. They
-  don't benefit from amortizing a system prompt because they don't
-  have one.
+- **Don't batch across requests.** Cross-request batching needs a
+  coalescing window (extra latency for the first request in the
+  window) and undermines per-request `Overrides`. Out of scope.
+- **Don't merge for regex / denylist.** They're shape-based and
+  microsecond-fast per call; merging adds boundary-spanning false
+  positives without the LLM's amortization upside.
+- **Don't try to make the per-text cache and merge mode coexist
+  per detector.** A merged blob is unique per request by
+  construction; the per-text-keyed `InMemoryDetectionCache` 100%
+  misses against it. A *different* cache shape (prefix-keyed,
+  exploiting that turn N+1 extends turn N's blob) recovers most
+  of the benefit while keeping merge mode — see
+  *Prefix-based cache for merge mode* below. Don't try to bolt
+  the per-text cache onto merge-mode output; build the prefix
+  cache when the optimization is actually wanted.
+
+---
+
+## Prefix-based cache for merge mode
+
+**What:** a sibling cache type, `PrefixDetectionCache` (or similar),
+indexed by message-boundary prefixes of the merged blob rather than
+exact text. On a request, find the longest cached prefix of the
+current blob, reuse those matches, run detection only on the
+remaining suffix (with a leading-context window for context-aware
+detectors), and merge results.
+
+**Why:** in *Per-detector merged-input mode*, each turn's merged
+blob is unique by construction, so the existing per-text
+`InMemoryDetectionCache` 100% misses. But turn N+1's blob is
+byte-identical to turn N's blob up to the message boundary, plus
+new content appended:
+
+```
+turn N:   [sys] SEP [u1] SEP [a1] ... SEP [u_N]
+turn N+1: [sys] SEP [u1] SEP [a1] ... SEP [u_N] SEP [a_N] SEP [u_{N+1}]
+```
+
+A prefix-keyed cache lets turn N+1 reuse turn N's detection work
+on the shared prefix and run the LLM/gliner/PF call only on the
+new suffix (plus a small leading-context window so the
+context-aware detector still sees what the new content is
+*about*).
+
+**Why deferred:** complementary to merge mode but substantially
+more complex than either the existing per-text cache or vanilla
+merge mode. Worth building only if (a) merge mode ships and (b)
+operators report that the per-turn fan-out cost in long
+conversations is still the bottleneck. The simpler "merge mode
+without cache" path may already be fast enough — measure first.
+
+**The seam doesn't fit the existing Protocol.** `DetectorResultCache`
+today is `key → matches`. Prefix caching is
+`find_longest_prefix(blob) → (matched_prefix, matches)` — a
+different operation backed by a different storage shape (trie or
+boundary-checkpoint list). Adding it as a third backend behind the
+same Protocol would distort the Protocol; better to introduce it
+as a sibling cache type that detectors hold *instead of* the
+per-text cache when `input_mode="merged"`.
+
+**Concrete trigger:** any of:
+
+- Merge mode is shipping in production and operators report
+  per-turn LLM/gliner/PF latency that scales linearly with
+  conversation length.
+- Token-cost monitoring shows the merged-mode amortization win
+  is partially eaten by repeated detection over the same prior
+  turns.
+- A long-conversation use case (>20 turns) becomes a primary
+  workload.
+
+**Sketch:**
+
+1. Define a sibling Protocol or extended interface alongside
+   `DetectorResultCache`. Most natural shape:
+   `lookup_prefix(blob, boundaries) -> (matched_prefix_len,
+   matches)` and `store(prefix, matches)`. The `boundaries`
+   argument is the list of message-boundary character offsets so
+   the cache only checkpoints at semantically meaningful cuts —
+   never mid-message.
+2. Storage: an LRU-bounded list of `(prefix_hash, prefix_length,
+   matches)` keyed by hash of the prefix string. Lookup walks
+   candidate prefixes from longest to shortest, hashing each, and
+   short-circuits on the first hit. For typical conversations
+   (<50 turns) the list is small enough that linear-scan is fine.
+   A trie is overkill at this scale.
+3. Detector integration: when `input_mode="merged"` AND a prefix
+   cache is configured, the detector consults the prefix cache
+   before its merged-blob call. On hit, the detect call covers
+   only `blob[prefix_len - K : ]` where K is a leading-context
+   window (configurable, ~1-2 messages worth). On miss, detect
+   the full blob.
+4. Result merge: the cache returns matches from the prefix scan
+   (matches A), the live detect call returns matches from the
+   suffix scan (matches B). Pipeline's existing dedup-by-value
+   handles the union; entities found in both regions collapse
+   naturally. Drop matches whose text appears *only* inside the
+   leading-context portion of B — they'd double-count against A.
+5. Eviction: per-conversation hint not available (the guardrail
+   is stateless across calls beyond `call_id`, which is per-call
+   not per-conversation). Default to LRU on prefix-hash with a
+   cap; document the limitation.
+6. Sentinel safety: the message-boundary token used for merging
+   is the cut point. Detectors must NOT classify the sentinel
+   itself as anything; pin it as a reserved string in the
+   detection prompt and add a regex post-filter that drops any
+   match overlapping the sentinel literal.
+7. Stats: `<prefix>_prefix_cache_size`, `<prefix>_prefix_cache_hits`,
+   `<prefix>_prefix_cache_misses`, plus a histogram-shaped
+   counter for "fraction of blob covered by cache hit on a hit"
+   so operators can see whether the cache is meaningfully
+   shrinking detection work or just providing nominal hits.
+8. Tests: prefix hit / no hit, prefix hit with leading-context
+   window, boundary-spanning entity not double-counted, sentinel
+   not classified.
+
+**Non-goals:**
+
+- **Don't generalise to arbitrary substring caching.** Only
+  *prefixes* exploit the multi-turn append-only invariant. Caching
+  arbitrary substrings would chase diminishing returns with
+  exploding storage and lookup cost.
+- **Don't track per-conversation identity.** The guardrail
+  doesn't know which `call_id`s belong to the same conversation
+  (LiteLLM doesn't pass that through). Prefix matching is
+  global-keyed-by-content; that's enough.
+- **Don't share the storage with `InMemoryDetectionCache`.** The
+  two have different access patterns (point lookup vs. longest-
+  prefix walk), different eviction semantics, and different
+  staleness trade-offs. One detector picks one cache type per
+  `input_mode`, not both.
+- **Don't reimplement the LLM detector's batching.** This
+  optimization sits on top of merge mode; it doesn't replace or
+  duplicate the *Per-detector merged-input mode* task's prompt /
+  response-format work.
 
 ---
 

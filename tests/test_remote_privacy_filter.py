@@ -300,3 +300,111 @@ def test_factory_returns_remote_when_url_set(
 
     det = _privacy_filter_factory()
     assert isinstance(det, RemotePrivacyFilterDetector)
+
+
+# ── Result caching ──────────────────────────────────────────────────────────
+# PRIVACY_FILTER_CACHE_MAX_SIZE > 0 enables a per-detector LRU keyed
+# on `(text,)` — PF has no per-call overrides today, so input text
+# is the only thing that varies.
+
+
+def _cached_pf_detector(monkeypatch: pytest.MonkeyPatch, max_size: int) -> RemotePrivacyFilterDetector:
+    monkeypatch.setattr(pf_mod, "CONFIG", _fake_config(cache_max_size=max_size))
+    return RemotePrivacyFilterDetector(
+        url="http://privacy-filter-service:8001", timeout_s=5,
+    )
+
+
+async def test_pf_cache_disabled_by_default_every_call_hits_http(
+    detector: RemotePrivacyFilterDetector, mock_post: AsyncMock,
+) -> None:
+    """Default cache_max_size=0 must keep the pre-caching behaviour:
+    repeat detect() calls always reach the mocked HTTP layer."""
+    mock_post.return_value = _ok_response([
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+    ])
+
+    await detector.detect("Email alice@example.com please")
+    await detector.detect("Email alice@example.com please")
+
+    assert mock_post.call_count == 2
+    assert detector._cache.enabled is False
+
+
+async def test_pf_cache_hit_skips_http_call(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """With caching on, identical inputs reach HTTP once; subsequent
+    calls return the cached matches without hitting the wire."""
+    detector = _cached_pf_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+    ])
+
+    r1 = await detector.detect("Email alice@example.com please")
+    r2 = await detector.detect("Email alice@example.com please")
+    r3 = await detector.detect("Email alice@example.com please")
+
+    assert mock_post.call_count == 1
+    assert [m.text for m in r1] == ["alice@example.com"]
+    assert [m.text for m in r2] == ["alice@example.com"]
+    assert [m.text for m in r3] == ["alice@example.com"]
+    s = detector.cache_stats()
+    assert s["hits"] == 2
+    assert s["misses"] == 1
+    assert s["size"] == 1
+
+
+async def test_pf_cache_keys_separate_per_text(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Different inputs must take different cache slots; otherwise
+    two unrelated requests would collapse into one fake result."""
+    detector = _cached_pf_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("first input")
+    await detector.detect("second input")
+    await detector.detect("first input")  # hit
+    await detector.detect("second input")  # hit
+
+    assert mock_post.call_count == 2
+    assert detector.cache_stats()["size"] == 2
+
+
+async def test_pf_cache_eviction_recomputes(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Cap=1 → inserting a second key evicts the first; coming back
+    to the original input pays for the round-trip again."""
+    detector = _cached_pf_detector(monkeypatch, max_size=1)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("text A")  # miss
+    await detector.detect("text B")  # miss, evicts A
+    await detector.detect("text A")  # miss again
+
+    assert mock_post.call_count == 3
+    s = detector.cache_stats()
+    assert s["misses"] == 3
+    assert s["hits"] == 0
+
+
+async def test_pf_cache_hit_returns_independent_list(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Mutating a list returned on a cache hit must not poison
+    subsequent hits — the cache stores an immutable tuple internally."""
+    detector = _cached_pf_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([
+        {"label": "private_email", "start": 6, "end": 23,
+         "text": "alice@example.com"},
+    ])
+
+    r1 = await detector.detect("Email alice@example.com please")
+    r1.clear()  # poison attempt
+
+    r2 = await detector.detect("Email alice@example.com please")
+    assert [m.text for m in r2] == ["alice@example.com"]

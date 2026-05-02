@@ -430,3 +430,134 @@ async def test_per_entry_malformed_entries_drop_silently(
     ])
     matches = await detector.detect("Email alice@example.com please")
     assert [m.text for m in matches] == ["alice@example.com"]
+
+
+# ── Result caching ──────────────────────────────────────────────────────────
+# GLINER_PII_CACHE_MAX_SIZE > 0 enables a per-detector LRU keyed on
+# (text, labels_tuple, threshold). Per-call labels/threshold overrides
+# get their own cache slots.
+
+
+def _cached_gliner_detector(
+    monkeypatch: pytest.MonkeyPatch, max_size: int
+) -> RemoteGlinerPIIDetector:
+    monkeypatch.setattr(gp_mod, "CONFIG", _fake_config(cache_max_size=max_size))
+    return RemoteGlinerPIIDetector(
+        url="http://gliner-pii-service:8002", timeout_s=5,
+    )
+
+
+async def test_gliner_cache_disabled_by_default_every_call_hits_http(
+    detector: RemoteGlinerPIIDetector, mock_post: AsyncMock,
+) -> None:
+    mock_post.return_value = _ok_response([
+        {"text": "alice@example.com", "entity_type": "email"},
+    ])
+
+    await detector.detect("Email alice@example.com please")
+    await detector.detect("Email alice@example.com please")
+
+    assert mock_post.call_count == 2
+    assert detector._cache.enabled is False
+
+
+async def test_gliner_cache_hit_skips_http_call(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    detector = _cached_gliner_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([
+        {"text": "alice@example.com", "entity_type": "email"},
+    ])
+
+    r1 = await detector.detect("Email alice@example.com please")
+    r2 = await detector.detect("Email alice@example.com please")
+
+    assert mock_post.call_count == 1
+    assert [m.text for m in r1] == ["alice@example.com"]
+    assert [m.text for m in r2] == ["alice@example.com"]
+    s = detector.cache_stats()
+    assert s["hits"] == 1
+    assert s["misses"] == 1
+
+
+async def test_gliner_cache_keys_separate_per_labels_override(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Different per-call `labels` overrides must take different
+    cache slots — a request asking for a stricter label set should
+    not receive matches computed against the broader default."""
+    detector = _cached_gliner_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", labels=["person"])
+    await detector.detect("hello", labels=["person", "email"])  # different slot
+    await detector.detect("hello", labels=["person"])           # hits the first slot
+
+    assert mock_post.call_count == 2
+    assert detector.cache_stats()["size"] == 2
+
+
+async def test_gliner_cache_keys_separate_per_threshold_override(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    detector = _cached_gliner_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", threshold=0.5)
+    await detector.detect("hello", threshold=0.7)  # different slot
+    await detector.detect("hello", threshold=0.5)  # hit
+
+    assert mock_post.call_count == 2
+    assert detector.cache_stats()["size"] == 2
+
+
+async def test_gliner_cache_label_order_is_significant(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """Label order is preserved through to the wire request, so the
+    cache treats different orderings as different calls. Locks down
+    the "don't sort" decision in the cache-key construction."""
+    detector = _cached_gliner_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", labels=["person", "email"])
+    await detector.detect("hello", labels=["email", "person"])
+
+    assert mock_post.call_count == 2
+    assert detector.cache_stats()["size"] == 2
+
+
+async def test_gliner_cache_default_and_explicit_default_share_slot(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    """`labels=None` resolves to the configured default; a caller
+    passing the same effective list explicitly should share the
+    cache slot rather than fragment it."""
+    monkeypatch.setattr(
+        gp_mod, "CONFIG",
+        _fake_config(cache_max_size=10, labels="person,email"),
+    )
+    detector = RemoteGlinerPIIDetector(
+        url="http://gliner-pii-service:8002", timeout_s=5,
+    )
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", labels=None)
+    await detector.detect("hello", labels=["person", "email"])
+
+    assert mock_post.call_count == 1
+    assert detector.cache_stats()["size"] == 1
+
+
+async def test_gliner_cache_eviction_recomputes(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock,
+) -> None:
+    detector = _cached_gliner_detector(monkeypatch, max_size=1)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("text A")
+    await detector.detect("text B")  # evicts A
+    await detector.detect("text A")  # miss again
+
+    assert mock_post.call_count == 3
+    assert detector.cache_stats()["misses"] == 3

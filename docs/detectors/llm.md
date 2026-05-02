@@ -25,6 +25,7 @@ config pattern.
 | `LLM_FAIL_CLOSED` | `true` | Block requests if the LLM detector errors. Independent from the other detectors' fail-mode flags. |
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty → bundled `llm_default.md`)* | Override the bundled detection prompt. Accepts `bundled:NAME` or a filesystem path. See [Customising the prompt](#customising-the-detection-prompt) below. |
 | `LLM_SYSTEM_PROMPT_REGISTRY` | *(empty)* | Comma-separated `name=path` list of NAMED alternative prompts callers can opt into per-request via `llm_prompt`. See [per-request overrides → Named alternatives](../per-request-overrides.md#named-alternatives). |
+| `LLM_CACHE_MAX_SIZE` | `0` | LRU cap on the LLM detector's result cache. `0` disables caching (default). When enabled, repeat calls with the same `(text, llm_model, llm_prompt)` skip the LLM round-trip. See [operations → Detector result caching](../operations.md#detector-result-caching) for the trade-offs. |
 
 ## Per-request overrides
 

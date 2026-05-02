@@ -440,3 +440,162 @@ async def test_no_key_anywhere_omits_authorization_header(
     await detector.detect("hello")
 
     assert "Authorization" not in mock_post.call_args.kwargs["headers"]
+
+
+# ── Result caching ──────────────────────────────────────────────────────
+# LLM_CACHE_MAX_SIZE > 0 enables a per-detector LRU keyed on
+# (text, effective_model, effective_prompt_name). api_key is
+# deliberately NOT in the key — same input + prompt + model → same
+# detection regardless of which user authenticated the call.
+
+
+def _cached_detector(monkeypatch: pytest.MonkeyPatch, max_size: int) -> LLMDetector:
+    monkeypatch.setattr(
+        llm_mod, "CONFIG", _fake_config(cache_max_size=max_size)
+    )
+    return LLMDetector(
+        api_base="http://test", api_key="", model="test", timeout_s=5
+    )
+
+
+async def test_cache_disabled_by_default_every_call_hits_http(
+    detector: LLMDetector, mock_post: AsyncMock
+) -> None:
+    """Default cache_max_size=0 must keep behaviour identical to pre-caching:
+    repeat detect() calls always reach the mocked HTTP layer."""
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    await detector.detect("hello alice")
+    await detector.detect("hello alice")
+    await detector.detect("hello alice")
+
+    assert mock_post.call_count == 3
+    assert detector._cache.enabled is False
+    assert detector.cache_stats()["hits"] == 0
+
+
+async def test_cache_hit_skips_http_call(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """With caching on, identical inputs reach HTTP once; subsequent
+    calls return the cached matches without hitting the wire."""
+    detector = _cached_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    r1 = await detector.detect("hello alice")
+    r2 = await detector.detect("hello alice")
+    r3 = await detector.detect("hello alice")
+
+    assert mock_post.call_count == 1
+    assert [m.text for m in r1] == ["alice"]
+    assert [m.text for m in r2] == ["alice"]
+    assert [m.text for m in r3] == ["alice"]
+    s = detector.cache_stats()
+    assert s["hits"] == 2
+    assert s["misses"] == 1
+    assert s["size"] == 1
+
+
+async def test_cache_hit_returns_independent_list(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """Mutating the list returned on a cache hit must not poison subsequent
+    hits — the cache stores an immutable tuple and copies on return."""
+    detector = _cached_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    r1 = await detector.detect("hello alice")
+    r1.clear()  # poison attempt
+
+    r2 = await detector.detect("hello alice")
+    assert [m.text for m in r2] == ["alice"]
+
+
+async def test_cache_keys_separate_per_model_override(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """Different `model` overrides must take different cache slots —
+    a request that asked for a stricter detection model should not
+    receive matches computed under the default."""
+    detector = _cached_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    await detector.detect("hello alice")                         # default model
+    await detector.detect("hello alice", model="other-model")    # different slot
+    await detector.detect("hello alice", model="other-model")    # hits the second slot
+
+    assert mock_post.call_count == 2
+    assert detector.cache_stats()["size"] == 2
+
+
+async def test_cache_keys_separate_per_prompt_override(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock, tmp_path
+) -> None:
+    """Different `prompt_name` overrides → different cache slots,
+    same as model overrides."""
+    # Stub the registry so a known prompt_name resolves successfully.
+    monkeypatch.setattr(
+        llm_mod, "_SYSTEM_PROMPT_REGISTRY", {"strict": "STRICT PROMPT BODY"}
+    )
+    detector = _cached_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([{"text": "alice", "type": "PERSON"}])
+
+    await detector.detect("hello alice")                              # default prompt
+    await detector.detect("hello alice", prompt_name="strict")        # different slot
+    await detector.detect("hello alice", prompt_name="strict")        # hits second slot
+
+    assert mock_post.call_count == 2
+    assert detector.cache_stats()["size"] == 2
+
+
+async def test_cache_default_and_explicit_default_share_slot(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """`prompt_name=None` and `prompt_name="default"` must hit the same
+    cache slot — both resolve to the configured default prompt, so a
+    caller that explicitly opts into the default shouldn't pay an
+    extra LLM call."""
+    detector = _cached_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", prompt_name=None)
+    await detector.detect("hello", prompt_name="default")
+
+    assert mock_post.call_count == 1
+    assert detector.cache_stats()["size"] == 1
+
+
+async def test_cache_ignores_api_key_in_key(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """Same input + same prompt + same model → same detection regardless
+    of which API key authenticated the call. Forwarded user keys must
+    share cache entries; otherwise the cache fragments uselessly per
+    user without any correctness benefit."""
+    detector = _cached_detector(monkeypatch, max_size=10)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("hello", api_key="user-1-key")
+    await detector.detect("hello", api_key="user-2-key")
+
+    assert mock_post.call_count == 1
+    assert detector.cache_stats()["hits"] == 1
+
+
+async def test_cache_eviction_recomputes(
+    monkeypatch: pytest.MonkeyPatch, mock_post: AsyncMock
+) -> None:
+    """Cap=1 → inserting a second key evicts the first; coming back to
+    the original input pays for the LLM call again."""
+    detector = _cached_detector(monkeypatch, max_size=1)
+    mock_post.return_value = _ok_response([])
+
+    await detector.detect("text A")  # miss
+    await detector.detect("text B")  # miss, evicts A
+    await detector.detect("text A")  # miss again (evicted)
+
+    assert mock_post.call_count == 3
+    s = detector.cache_stats()
+    assert s["misses"] == 3
+    assert s["hits"] == 0
+    assert s["size"] == 1

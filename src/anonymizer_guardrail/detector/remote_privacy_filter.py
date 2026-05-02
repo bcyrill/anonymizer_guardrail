@@ -39,6 +39,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .base import Detector, Match
+from .cache import DetectorResultCache, InMemoryDetectionCache
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.privacy_filter")
@@ -69,6 +70,12 @@ class PrivacyFilterConfig(BaseSettings):
     # LLM_MAX_CONCURRENCY: a saturated PF queue shouldn't reduce LLM
     # headroom or vice versa.
     max_concurrency: int = 10
+    # LRU cap for the per-detector result cache. 0 disables caching
+    # (default). When enabled, repeat calls with the same input text
+    # skip the remote PF round-trip. The PF detector has no per-call
+    # overrides today, so the cache key is just (text,). See
+    # detector/cache.py for the trade-offs.
+    cache_max_size: int = 0
 
     @field_validator("url", mode="after")
     @classmethod
@@ -320,15 +327,33 @@ class RemotePrivacyFilterDetector:
             )
         self.timeout_s = timeout_s or CONFIG.timeout_s
         self._client = httpx.AsyncClient(timeout=self.timeout_s)
+        # Per-detector result cache. Disabled (max_size=0) by default;
+        # operators opt in via PRIVACY_FILTER_CACHE_MAX_SIZE. The cap
+        # is fixed at construction; a Pipeline rebuild gives a fresh
+        # cache without special teardown.
+        self._cache: DetectorResultCache = InMemoryDetectionCache(
+            CONFIG.cache_max_size
+        )
         log.info(
             "Privacy-filter detector wired to remote service at %s "
             "(timeout=%ds).", self.url, self.timeout_s,
         )
 
     async def detect(self, text: str) -> list[Match]:
+        """Public entry point. The PF detector has no per-call
+        overrides today, so the cache key is just `(text,)`. Single-
+        element tuple keeps the shape consistent with the other
+        cache-using detectors and makes future overrides easy to add."""
         if not text or not text.strip():
             return []
+        cache_key = (text,)
+        return await self._cache.get_or_compute(
+            cache_key, lambda: self._do_detect(text)
+        )
 
+    async def _do_detect(self, text: str) -> list[Match]:
+        """The actual HTTP call. Split out from `detect` so the cache
+        wrapper is the only thing the public entry point does."""
         endpoint = f"{self.url}/detect"
         # Availability errors (transport-layer + non-200) raise so the
         # pipeline's PRIVACY_FILTER_FAIL_CLOSED policy decides whether
@@ -373,6 +398,10 @@ class RemotePrivacyFilterDetector:
             ) from exc
 
         return _parse_matches(body, text, endpoint)
+
+    def cache_stats(self) -> dict[str, int]:
+        """Cache stats snapshot for Pipeline.stats() / the /health probe."""
+        return self._cache.stats()
 
     async def aclose(self) -> None:
         """Drain the httpx connection pool. Wired to Pipeline.aclose
@@ -483,6 +512,10 @@ SPEC = DetectorSpec(
         "blocked to prevent unredacted data from reaching the "
         "upstream model."
     ),
+    # Result caching — operator-controlled via
+    # PRIVACY_FILTER_CACHE_MAX_SIZE (0 = disabled, the default).
+    # Surfaces pf_cache_size/max/hits/misses on /health.
+    has_cache=True,
 )
 
 

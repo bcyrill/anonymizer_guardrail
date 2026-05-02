@@ -108,13 +108,18 @@ def _patch_gliner_pii_fail_closed(monkeypatch: pytest.MonkeyPatch, value: bool) 
 
 def _gliner_detector_that_raises(exc_factory):
     """A bare RemoteGlinerPIIDetector instance whose detect() raises
-    whatever exc_factory returns. Bypasses the real httpx wiring."""
+    whatever exc_factory returns. Bypasses the real httpx wiring.
+
+    Attaches a disabled cache so Pipeline.stats() (which iterates
+    SPECS_WITH_CACHE) doesn't trip on the missing attribute."""
+    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
     from anonymizer_guardrail.detector.remote_gliner_pii import (
         RemoteGlinerPIIDetector,
     )
 
     bad = RemoteGlinerPIIDetector.__new__(RemoteGlinerPIIDetector)
     bad.name = "gliner_pii"
+    bad._cache = InMemoryDetectionCache(0)
 
     async def boom(*_args, **_kwargs):
         raise exc_factory()
@@ -125,13 +130,18 @@ def _gliner_detector_that_raises(exc_factory):
 
 def _pf_detector_that_raises(exc_factory):
     """A bare RemotePrivacyFilterDetector instance whose detect() raises
-    whatever exc_factory returns. Bypasses the real httpx wiring."""
+    whatever exc_factory returns. Bypasses the real httpx wiring.
+
+    Attaches a disabled cache so Pipeline.stats() (which iterates
+    SPECS_WITH_CACHE) doesn't trip on the missing attribute."""
+    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
     from anonymizer_guardrail.detector.remote_privacy_filter import (
         RemotePrivacyFilterDetector,
     )
 
     bad = RemotePrivacyFilterDetector.__new__(RemotePrivacyFilterDetector)
     bad.name = "privacy_filter"
+    bad._cache = InMemoryDetectionCache(0)
 
     async def boom(*_args, **_kwargs):
         raise exc_factory()
@@ -142,11 +152,19 @@ def _pf_detector_that_raises(exc_factory):
 
 def _llm_detector_that_raises(exc_factory):
     """A bare LLMDetector instance whose detect() raises whatever
-    exc_factory returns. Bypasses the real httpx wiring."""
+    exc_factory returns. Bypasses the real httpx wiring.
+
+    Attaches a disabled InMemoryDetectionCache so Pipeline.stats() (which
+    iterates SPECS_WITH_CACHE and calls cache_stats() on each active
+    detector) doesn't trip on the missing attribute. The fake detect()
+    bypasses the cache anyway by replacing the public method outright.
+    """
+    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
     from anonymizer_guardrail.detector.llm import LLMDetector
 
     bad = LLMDetector.__new__(LLMDetector)
     bad.name = "llm"
+    bad._cache = InMemoryDetectionCache(0)
 
     async def boom(*_args, **_kwargs):
         raise exc_factory()
@@ -342,7 +360,8 @@ async def test_pf_and_llm_fail_modes_are_independent(
 
 async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
     """Pipeline.stats() snapshots vault size, surrogate cache size + cap,
-    and per-detector in-flight + cap. Used by /health for ops monitoring."""
+    per-detector in-flight + cap, and per-detector result-cache stats.
+    Used by /health for ops monitoring."""
     s = pipeline.stats()
     expected_keys = {
         "vault_size",
@@ -354,6 +373,22 @@ async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
         "pf_max_concurrency",
         "gliner_pii_in_flight",
         "gliner_pii_max_concurrency",
+        # Per-detector result cache. All four keys must be present
+        # for every detector that opts into has_cache=True even when
+        # the cache is disabled (cache_max_size=0) so dashboards can
+        # pin to stable names.
+        "llm_cache_size",
+        "llm_cache_max",
+        "llm_cache_hits",
+        "llm_cache_misses",
+        "pf_cache_size",
+        "pf_cache_max",
+        "pf_cache_hits",
+        "pf_cache_misses",
+        "gliner_pii_cache_size",
+        "gliner_pii_cache_max",
+        "gliner_pii_cache_hits",
+        "gliner_pii_cache_misses",
     }
     assert expected_keys.issubset(s.keys())
     assert s["vault_size"] == 0
@@ -361,6 +396,9 @@ async def test_stats_reports_cache_and_concurrency(pipeline: Pipeline) -> None:
     assert s["pf_in_flight"] == 0
     assert s["gliner_pii_in_flight"] == 0
     assert s["surrogate_cache_max"] >= 1
+    # Default config disables LLM result caching (cache_max_size=0).
+    assert s["llm_cache_max"] == 0
+    assert s["llm_cache_size"] == 0
 
     # Anonymize a request — surrogate cache should grow, vault should fill.
     await pipeline.anonymize(
@@ -381,9 +419,13 @@ async def test_llm_in_flight_increments_around_detect(
     started = asyncio.Event()
     finish = asyncio.Event()
 
+    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
     from anonymizer_guardrail.detector.llm import LLMDetector
     bad = LLMDetector.__new__(LLMDetector)
     bad.name = "llm"
+    # Pipeline.stats() reads cache_stats() on detectors with has_cache=True;
+    # a disabled cache satisfies that without enabling caching for the test.
+    bad._cache = InMemoryDetectionCache(0)
 
     async def slow_detect(*_args, **_kwargs):
         started.set()
@@ -412,11 +454,13 @@ async def test_pf_in_flight_increments_around_detect(
     started = asyncio.Event()
     finish = asyncio.Event()
 
+    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
     from anonymizer_guardrail.detector.remote_privacy_filter import (
         RemotePrivacyFilterDetector,
     )
     bad = RemotePrivacyFilterDetector.__new__(RemotePrivacyFilterDetector)
     bad.name = "privacy_filter"
+    bad._cache = InMemoryDetectionCache(0)
 
     async def slow_detect(*_args, **_kwargs):
         started.set()
@@ -445,11 +489,13 @@ async def test_gliner_pii_in_flight_increments_around_detect(
     started = asyncio.Event()
     finish = asyncio.Event()
 
+    from anonymizer_guardrail.detector.cache import InMemoryDetectionCache
     from anonymizer_guardrail.detector.remote_gliner_pii import (
         RemoteGlinerPIIDetector,
     )
     bad = RemoteGlinerPIIDetector.__new__(RemoteGlinerPIIDetector)
     bad.name = "gliner_pii"
+    bad._cache = InMemoryDetectionCache(0)
 
     async def slow_detect(*_args, **_kwargs):
         started.set()

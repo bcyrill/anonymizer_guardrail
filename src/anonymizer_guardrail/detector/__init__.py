@@ -51,11 +51,22 @@ SPECS_WITH_SEMAPHORE: tuple[DetectorSpec, ...] = tuple(
     s for s in REGISTERED_SPECS if s.has_semaphore
 )
 
+# Subset of specs that surface a per-detector result cache. Pipeline
+# iterates this narrower list when emitting cache stats on /health.
+# Membership ≠ "cache is currently active" — an operator can set
+# CONFIG.cache_max_size=0 to keep the spec wired for stats while the
+# detector runs uncached. The stats payload reflects that as size=0,
+# max=0, hits=0, misses=0.
+SPECS_WITH_CACHE: tuple[DetectorSpec, ...] = tuple(
+    s for s in REGISTERED_SPECS if s.has_cache
+)
+
 
 __all__ = [
     "DetectorSpec",
     "REGISTERED_SPECS",
     "SPECS_BY_NAME",
+    "SPECS_WITH_CACHE",
     "SPECS_WITH_SEMAPHORE",
     "TYPED_UNAVAILABLE_ERRORS",
 ]

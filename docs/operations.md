@@ -52,8 +52,100 @@ How to read each counter:
   bottleneck detector — either the upstream service is slow, or the
   cap needs to come up. The counters are actual in-flight counts, not
   semaphore queue depth, so they top out at the matching cap.
+- **`<prefix>_cache_size`** / **`<prefix>_cache_max`** /
+  **`<prefix>_cache_hits`** / **`<prefix>_cache_misses`** — per-detector
+  result-cache counters, emitted for every detector that opted into
+  caching (currently only `llm_*`). All four keys are present even when
+  caching is disabled (`*_cache_max=0`), so dashboards can pin to stable
+  names. See [Detector result caching](#detector-result-caching) below.
 
 When extra detectors with semaphores are configured (e.g. `gliner_pii`),
 their `<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency`
 keys appear in `/health` automatically — see
 [Adding a new detector](development.md#adding-a-new-detector).
+
+## Detector result caching
+
+LiteLLM forwards the *full* conversation history in `texts` on every
+turn — see [examples → Multi-text batch](examples.md#multi-text-batch).
+For long chats this means every slow detector re-classifies every
+prior turn from scratch on each call. The detector result cache is an
+opt-in process-wide LRU keyed by input text plus the overrides that
+affect that detector's output, letting repeat calls skip the slow
+detection work entirely.
+
+### Configuration
+
+Three detectors opt into caching. Each has its own cap, default
+off (`0` disables). The cap controls the in-memory LRU; eviction
+fires once the size grows past the cap.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_CACHE_MAX_SIZE` | `0` | LRU cap on the LLM detector's result cache. |
+| `PRIVACY_FILTER_CACHE_MAX_SIZE` | `0` | LRU cap on the privacy-filter detector's result cache. |
+| `GLINER_PII_CACHE_MAX_SIZE` | `0` | LRU cap on the gliner-pii detector's result cache. |
+
+The fast detectors (`regex`, `denylist`) are intentionally not on
+this list — they're microseconds per call against pre-built data
+structures, so caching would add overhead for negligible savings.
+
+The cache key per detector is the input text plus the overrides
+that affect that detector's output:
+
+| Detector | Cache key |
+|---|---|
+| LLM | `(text, llm_model, llm_prompt)` |
+| Privacy filter | `(text,)` |
+| GLiNER-PII | `(text, labels_tuple, threshold)` |
+
+Per-call overrides resolved to the same effective value share a
+slot (`prompt_name=None` and `prompt_name="default"` collapse;
+`labels=None` and `labels=<configured default>` collapse). The
+forwarded `api_key` is deliberately *not* in the LLM cache key —
+same input + prompt + model produces the same detection regardless
+of which user authenticated. For gliner, label *order* IS part of
+the key — different orderings are treated as different calls
+because the wire request preserves order.
+
+### When to enable
+
+Worth turning on when you serve multi-turn conversations and the LLM
+detector's per-call latency is the dominant cost. With caching off,
+turn N pays the LLM round-trip for every replayed prior message; with
+caching on, only newly-introduced text incurs the round-trip.
+
+Skip it for:
+
+- **Single-turn workloads** — there's nothing to reuse.
+- **Privacy-sensitive deployments where stable surrogates would be a
+  leak channel** — caching makes the detector's output stable across
+  turns, which by design makes the surrogate output stable too.
+
+### Trade-off: stability vs. fresh detection
+
+Caching the LLM detector freezes whatever it returned on first sight.
+If the model missed a borderline entity on turn 1, every subsequent
+turn that replays that text gets the same miss, until LRU eviction.
+That's usually an upgrade for chat workloads (turn-to-turn
+disagreement is worse than a stable miss), but it is a behaviour
+change worth flagging — operators who want fresh detection on every
+call should leave the cache disabled.
+
+### Sizing alongside the surrogate cache
+
+Pair `LLM_CACHE_MAX_SIZE` with `SURROGATE_CACHE_MAX_SIZE`. A detector
+cache hit that finds a surrogate-cache *miss* re-derives the surrogate
+deterministically — *usually* the same value, but the
+[collision-retry path](surrogates.md#surrogate-cache) can flip it. To
+keep cross-turn surrogate consistency intact, keep the surrogate cache
+comfortably above the conversation's expected unique-entity count.
+`/health` exposes both so saturation is visible.
+
+### Restart behaviour
+
+Process-local, like every other in-memory store. After a restart the
+cache is cold and the first occurrence of each input pays the full
+detection cost again. There's no on-disk persistence and no
+replication across replicas — see [limitations](limitations.md) for
+the broader single-replica story.

@@ -121,6 +121,15 @@ class DetectorSpec:
     exception message — that gets logged separately, and BLOCKED
     reasons are surfaced to the upstream LLM client (no leakage)."""
 
+    # ── Result caching (optional) ─────────────────────────────────────
+    has_cache: bool = False
+    """When True, the pipeline pulls cache stats from the detector and
+    surfaces them on /health. Setting this without the detector
+    actually owning a `DetectionCache` (or without a `cache_stats()`
+    method) is a programmer error caught at request time, not at
+    boot. Cap size comes from `spec.config.cache_max_size`; 0 disables
+    the cache at runtime even when `has_cache=True`."""
+
     @property
     def config(self) -> Any:
         """Live lookup of the detector module's `CONFIG` attribute.
@@ -168,6 +177,23 @@ class DetectorSpec:
                 f"DetectorSpec(name={self.name!r}): unavailable_error "
                 f"requires CONFIG.fail_closed on {self.module.__name__}."
             )
+        if self.has_cache:
+            # The cap lives on the detector module's CONFIG so operators
+            # can tune it via env var alongside the rest of the
+            # detector's settings — same shape as max_concurrency.
+            if not hasattr(cfg, "cache_max_size"):
+                raise ValueError(
+                    f"DetectorSpec(name={self.name!r}): has_cache=True "
+                    f"requires CONFIG.cache_max_size on {self.module.__name__}."
+                )
+            # stats_prefix is reused for cache stat keys
+            # (`<prefix>_cache_size`, `<prefix>_cache_hits`, etc.) so
+            # has_cache without it would mean stats can't be emitted.
+            if self.stats_prefix is None:
+                raise ValueError(
+                    f"DetectorSpec(name={self.name!r}): has_cache=True "
+                    f"requires stats_prefix to be set."
+                )
 
 
 __all__ = ["DetectorSpec"]
