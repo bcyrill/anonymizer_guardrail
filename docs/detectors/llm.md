@@ -42,24 +42,33 @@ shape):
 
 ## Customising the detection prompt
 
-Two prompts ship with the package under
+Four prompts ship with the package under
 `src/anonymizer_guardrail/prompts/`:
 
-- `llm_default.md` — small, conservative prompt loaded by default.
-- `llm_pentest.md` — verbatim port of the
-  [DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI/blob/main/src/llm_detector.py)
-  system prompt. Tuned for security-engagement output (cracked-password
-  artifacts, NetBIOS names, K8s namespace conventions, pentest tool noise
-  to ignore, etc.).
+| Prompt | Tuned for | Size |
+|---|---|---|
+| `llm_default.md` | General-purpose, model-neutral. Loaded when `LLM_SYSTEM_PROMPT_PATH` is unset. | ~250 tokens |
+| `llm_pentest.md` | Security-engagement output. Verbatim port of the [DontFeedTheAI](https://github.com/zeroc00I/DontFeedTheAI/blob/main/src/llm_detector.py) system prompt — handles cracked-password artifacts, NetBIOS names, K8s namespace conventions, pentest tool noise to ignore, etc. | ~2,400 tokens |
+| `llm_default_claude.md` | Same coverage as `llm_default.md`, distilled for Claude's instruction-following. Use this when `LLM_MODEL` is a Claude alias. | ~220 tokens |
+| `llm_pentest_claude.md` | Same coverage as `llm_pentest.md`, distilled for Claude. Drops enumerated examples in favour of categorical rules. | ~1,000 tokens |
 
-To swap in one of those (or your own — extra entity types, domain-specific
+The Claude-targeted variants are byte-for-byte smaller because Claude
+generalises from one canonical example per category — repeating
+"flag this and this and this" doesn't add recall, just cost. The
+non-`_claude` variants stay verbose because models that follow
+instructions less reliably benefit from the redundancy. Pick the pair
+that matches your `LLM_MODEL`. See
+[LiteLLM integration → Using Claude as the detection LLM](../litellm-integration.md#using-claude-as-the-detection-llm)
+for the matching backend wiring.
+
+To swap in one of these (or your own — extra entity types, domain-specific
 guidance, a different language), set `LLM_SYSTEM_PROMPT_PATH`. Two forms
 are accepted:
 
 - `bundled:<filename>` — a file shipped inside the package, e.g.
-  `bundled:llm_pentest.md`. Resolved via `importlib.resources`, so the env
-  var is independent of the Python version embedded in the site-packages
-  path.
+  `bundled:llm_pentest_claude.md`. Resolved via `importlib.resources`, so
+  the env var is independent of the Python version embedded in the
+  site-packages path.
 - A regular filesystem path — typically a mounted volume:
 
 ```bash
