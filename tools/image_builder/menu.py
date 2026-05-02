@@ -79,6 +79,71 @@ _CUSTOM_PRESET = "custom"
 _DEFAULT_PRESET = "minimal"
 
 
+class _PresetRadioSet(RadioSet):
+    """RadioSet variant where arrow nav commits the new highlight as
+    the selection AND skips past the `custom` sentinel.
+
+    Two deviations from stock Textual RadioSet:
+
+      * Stock treats left/right as highlight movement only — the
+        operator must then press Enter to commit. For a horizontal
+        preset row that *is* the selection, that's a confusing extra
+        step: the operator sees the highlight move but the checkboxes
+        below don't update until they hit Enter. Auto-committing on
+        navigation makes left/right feel like "switch preset".
+      * `custom` is a state indicator (lights up when the operator's
+        manual checkbox toggling no longer matches any named preset),
+        not a destination. Selecting it explicitly is a no-op
+        (`_on_preset_changed` early-returns), so arrowing onto it
+        and committing would be a dead keypress. The action methods
+        skip past it in whichever direction the operator was going.
+    """
+
+    def action_next_button(self) -> None:
+        super().action_next_button()
+        if self._highlight_is_custom():
+            super().action_next_button()
+        self._commit_highlight()
+
+    def action_previous_button(self) -> None:
+        super().action_previous_button()
+        if self._highlight_is_custom():
+            super().action_previous_button()
+        self._commit_highlight()
+
+    def _highlight_is_custom(self) -> bool:
+        idx = getattr(self, "_selected", None)
+        if idx is None:
+            return False
+        buttons = list(self.query(RadioButton))
+        return 0 <= idx < len(buttons) and buttons[idx].name == _CUSTOM_PRESET
+
+    def _commit_highlight(self) -> None:
+        # `_selected` is RadioSet's internal highlight index. Setting
+        # value=True on that RadioButton triggers a Changed event the
+        # outer RadioSet handles to deselect the others — same path
+        # an Enter would take, just without the operator having to
+        # press it.
+        idx = getattr(self, "_selected", None)
+        if idx is None:
+            return
+        buttons = list(self.query(RadioButton))
+        if 0 <= idx < len(buttons):
+            buttons[idx].value = True
+
+
+class _NoFocusScroll(VerticalScroll):
+    """VerticalScroll that doesn't take keyboard focus so `down` from
+    the preset radio lands on the first Checkbox directly. The stock
+    VerticalScroll is focusable so operators can page-scroll long
+    content — but our flavour grid is short enough to fit on one
+    screen, and putting the scroll wrapper in the focus chain forces
+    a no-op `down` press before the operator can navigate flavours.
+    """
+
+    can_focus = False
+
+
 class BuilderApp(App):
     """Single-screen flavour picker. State is the selected-flavour
     set; the preset radio is a derived view of that state."""
@@ -167,7 +232,7 @@ class BuilderApp(App):
         # Preset section — `border_title` puts the label inline with
         # the top border so we don't burn a row on a separate Static.
         with Container(id="presets"):
-            with RadioSet(id="preset-radio"):
+            with _PresetRadioSet(id="preset-radio"):
                 for name in preset_names():
                     yield RadioButton(name, name=name)
                 yield RadioButton(_CUSTOM_PRESET, name=_CUSTOM_PRESET)
@@ -176,7 +241,7 @@ class BuilderApp(App):
         # checkboxes live in their own 2-column grid (a single grid
         # spanning all groups would let column 1 of one group sit
         # next to column 2 of the next, which is confusing).
-        with VerticalScroll(id="flavour-grid"):
+        with _NoFocusScroll(id="flavour-grid"):
             for group_const, group_label in _GROUP_ORDER:
                 yield Static(group_label, classes="group-header")
                 with Container(classes="flavour-cols"):
@@ -203,6 +268,14 @@ class BuilderApp(App):
         # the preset-radio sync below.
         self.query_one("#presets", Container).border_title = "Preset"
         self._sync_preset_radio()
+        # Anchor initial focus on the preset radio. Textual's default
+        # auto-focus picks the first focusable in layout order, which
+        # can land on the VerticalScroll wrapping the flavour grid —
+        # the operator's first arrow keypress then walks checkboxes
+        # before they've even seen the preset row. Forcing focus to
+        # the radio here gives a predictable starting point: left/
+        # right cycles presets, down drops into the grid.
+        self.query_one("#preset-radio", RadioSet).focus()
 
     # ── Focus actions ─────────────────────────────────────────────────────
     # Bound to up/down at priority so they short-circuit the RadioSet's
