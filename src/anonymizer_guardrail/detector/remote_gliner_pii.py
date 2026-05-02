@@ -47,7 +47,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .base import Detector, Match
-from .cache import DetectorResultCache, InMemoryDetectionCache
+from .remote_base import BaseRemoteDetector
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.gliner_pii.remote")
@@ -206,7 +206,7 @@ def _parse_threshold(raw: str) -> float | None:
         return None
 
 
-class RemoteGlinerPIIDetector:
+class RemoteGlinerPIIDetector(BaseRemoteDetector):
     """Talks HTTP to a gliner-pii inference service."""
 
     name = "gliner_pii"
@@ -218,8 +218,8 @@ class RemoteGlinerPIIDetector:
         labels: list[str] | None = None,
         threshold: float | None = None,
     ) -> None:
-        self.url = (url or CONFIG.url).rstrip("/")
-        if not self.url:
+        resolved_url = (url or CONFIG.url).rstrip("/")
+        if not resolved_url:
             # The factory in pipeline.py only constructs this class when
             # the URL is set, so reaching here means a caller bypassed
             # the factory. Fail loud rather than send requests to "/detect".
@@ -229,16 +229,14 @@ class RemoteGlinerPIIDetector:
                 "deploy the gliner-pii-service container and set "
                 "GLINER_PII_URL=http://<host>:<port>."
             )
-        self.timeout_s = timeout_s or CONFIG.timeout_s
+        super().__init__(
+            timeout_s=timeout_s or CONFIG.timeout_s,
+            cache_max_size=CONFIG.cache_max_size,
+        )
+        self.url = resolved_url
         self.labels = labels if labels is not None else _parse_labels(CONFIG.labels)
         self.threshold = (
             threshold if threshold is not None else _parse_threshold(CONFIG.threshold)
-        )
-        self._client = httpx.AsyncClient(timeout=self.timeout_s)
-        # Per-detector result cache. Disabled (max_size=0) by default;
-        # operators opt in via GLINER_PII_CACHE_MAX_SIZE.
-        self._cache: DetectorResultCache = InMemoryDetectionCache(
-            CONFIG.cache_max_size
         )
         log.info(
             "GLiNER-PII detector wired to remote service at %s "
@@ -261,9 +259,6 @@ class RemoteGlinerPIIDetector:
         per-request override path (`additional_provider_specific_params`)
         pin a different label vocabulary per route without redeploying.
         """
-        if not text or not text.strip():
-            return []
-
         # Per-call overrides win; otherwise use what was configured at
         # construction time (which itself fell back to the env defaults).
         # Local variables — never mutate self.labels / self.threshold,
@@ -287,8 +282,8 @@ class RemoteGlinerPIIDetector:
             tuple(effective_labels) if effective_labels is not None else None,
             effective_threshold,
         )
-        return await self._cache.get_or_compute(
-            cache_key,
+        return await self._detect_via_cache(
+            text, cache_key,
             lambda: self._do_detect(
                 text,
                 effective_labels=effective_labels,
@@ -361,14 +356,7 @@ class RemoteGlinerPIIDetector:
 
         return _parse_matches(payload, text, endpoint)
 
-    def cache_stats(self) -> dict[str, int]:
-        """Cache stats snapshot for Pipeline.stats() / the /health probe."""
-        return self._cache.stats()
-
-    async def aclose(self) -> None:
-        """Drain the httpx connection pool. Wired to Pipeline.aclose
-        which fires on FastAPI shutdown."""
-        await self._client.aclose()
+    # cache_stats() and aclose() come from BaseRemoteDetector.
 
 
 def _parse_matches(body: Any, source_text: str, endpoint: str) -> list[Match]:

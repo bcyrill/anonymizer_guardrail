@@ -39,7 +39,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .base import Detector, Match
-from .cache import DetectorResultCache, InMemoryDetectionCache
+from .remote_base import BaseRemoteDetector
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.privacy_filter")
@@ -322,7 +322,7 @@ def _to_matches(spans: Any, source_text: str) -> list[Match]:
 
 
 # ── Detector ──────────────────────────────────────────────────────────────
-class RemotePrivacyFilterDetector:
+class RemotePrivacyFilterDetector(BaseRemoteDetector):
     """Talks HTTP to a privacy-filter inference service."""
 
     name = "privacy_filter"
@@ -332,8 +332,8 @@ class RemotePrivacyFilterDetector:
         url: str | None = None,
         timeout_s: int | None = None,
     ) -> None:
-        self.url = (url or CONFIG.url).rstrip("/")
-        if not self.url:
+        resolved_url = (url or CONFIG.url).rstrip("/")
+        if not resolved_url:
             # The factory below only constructs this class when the URL
             # is set, so reaching here means a caller bypassed the
             # factory. Fail loud rather than send requests to "/detect".
@@ -341,15 +341,11 @@ class RemotePrivacyFilterDetector:
                 "RemotePrivacyFilterDetector requires PRIVACY_FILTER_URL "
                 "to be set."
             )
-        self.timeout_s = timeout_s or CONFIG.timeout_s
-        self._client = httpx.AsyncClient(timeout=self.timeout_s)
-        # Per-detector result cache. Disabled (max_size=0) by default;
-        # operators opt in via PRIVACY_FILTER_CACHE_MAX_SIZE. The cap
-        # is fixed at construction; a Pipeline rebuild gives a fresh
-        # cache without special teardown.
-        self._cache: DetectorResultCache = InMemoryDetectionCache(
-            CONFIG.cache_max_size
+        super().__init__(
+            timeout_s=timeout_s or CONFIG.timeout_s,
+            cache_max_size=CONFIG.cache_max_size,
         )
+        self.url = resolved_url
         log.info(
             "Privacy-filter detector wired to remote service at %s "
             "(timeout=%ds).", self.url, self.timeout_s,
@@ -360,11 +356,9 @@ class RemotePrivacyFilterDetector:
         overrides today, so the cache key is just `(text,)`. Single-
         element tuple keeps the shape consistent with the other
         cache-using detectors and makes future overrides easy to add."""
-        if not text or not text.strip():
-            return []
         cache_key = (text,)
-        return await self._cache.get_or_compute(
-            cache_key, lambda: self._do_detect(text)
+        return await self._detect_via_cache(
+            text, cache_key, lambda: self._do_detect(text),
         )
 
     async def _do_detect(self, text: str) -> list[Match]:
@@ -415,14 +409,7 @@ class RemotePrivacyFilterDetector:
 
         return _parse_matches(body, text, endpoint)
 
-    def cache_stats(self) -> dict[str, int]:
-        """Cache stats snapshot for Pipeline.stats() / the /health probe."""
-        return self._cache.stats()
-
-    async def aclose(self) -> None:
-        """Drain the httpx connection pool. Wired to Pipeline.aclose
-        which fires on FastAPI shutdown."""
-        await self._client.aclose()
+    # cache_stats() and aclose() come from BaseRemoteDetector.
 
 
 # ── Wire-format parsing ───────────────────────────────────────────────────

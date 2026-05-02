@@ -24,7 +24,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ..bundled_resource import read_bundled_default, resolve_spec
 from ..registry import parse_named_path_registry
 from .base import Match
-from .cache import DetectorResultCache, InMemoryDetectionCache
+from .remote_base import BaseRemoteDetector
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.llm")
@@ -254,7 +254,7 @@ def _parse_entities(raw: str, source_text: str) -> list[Match]:
     return out
 
 
-class LLMDetector:
+class LLMDetector(BaseRemoteDetector):
     """OpenAI Chat Completions detector, JSON mode."""
 
     name = "llm"
@@ -266,24 +266,13 @@ class LLMDetector:
         model: str | None = None,
         timeout_s: int | None = None,
     ) -> None:
+        super().__init__(
+            timeout_s=timeout_s or CONFIG.timeout_s,
+            cache_max_size=CONFIG.cache_max_size,
+        )
         self.api_base = (api_base or CONFIG.api_base).rstrip("/")
         self.api_key = api_key if api_key is not None else CONFIG.api_key
         self.model = model or CONFIG.model
-        self.timeout_s = timeout_s or CONFIG.timeout_s
-        self._client = httpx.AsyncClient(timeout=self.timeout_s)
-        # Per-detector result cache. Disabled (max_size=0) by default;
-        # operators opt in via LLM_CACHE_MAX_SIZE. The cap is fixed at
-        # construction — Pipeline rebuild (which tests do via
-        # `monkeypatch.setattr(llm_mod, "CONFIG", ...)`) gives a fresh
-        # cache for free, no special teardown needed.
-        #
-        # Annotated as the Protocol so a future swap to a different
-        # backend (e.g. Redis when horizontal scaling lands) is a
-        # one-line factory change here, with no edits to the rest of
-        # the detector code. See detector/cache.py for the seam.
-        self._cache: DetectorResultCache = InMemoryDetectionCache(
-            CONFIG.cache_max_size
-        )
 
     async def detect(
         self,
@@ -295,16 +284,13 @@ class LLMDetector:
     ) -> list[Match]:
         """Public entry point. Resolves the cache key from the text plus
         the overrides that affect output, then delegates to `_do_detect`
-        through the cache.
+        through the base's cache wrapper.
 
         `api_key` is intentionally NOT in the cache key: same model +
         prompt + text → same detection result regardless of which key
         authenticated the call. Including it would fragment the cache
         across users (e.g. forwarded keys) for no correctness benefit.
         """
-        if not text or not text.strip():
-            return []
-
         # Resolve overrides to their effective concrete values so the
         # cache key is canonical: a None-override and a no-override
         # carrying the matching default share one cache slot. Same
@@ -313,8 +299,8 @@ class LLMDetector:
         effective_prompt_name = prompt_name if prompt_name else "default"
 
         cache_key = (text, effective_model, effective_prompt_name)
-        return await self._cache.get_or_compute(
-            cache_key,
+        return await self._detect_via_cache(
+            text, cache_key,
             lambda: self._do_detect(
                 text,
                 api_key=api_key,
@@ -434,16 +420,7 @@ class LLMDetector:
 
         return _parse_entities(content, text)
 
-    def cache_stats(self) -> dict[str, int]:
-        """Cache stats snapshot for Pipeline.stats() / the /health probe.
-        Always defined (even when caching is disabled) so the spec's
-        has_cache=True flag is the single switch the pipeline reads."""
-        return self._cache.stats()
-
-    async def aclose(self) -> None:
-        """Close the shared httpx client. Called from Pipeline.aclose() at
-        FastAPI shutdown so the connection pool drains cleanly."""
-        await self._client.aclose()
+    # cache_stats() and aclose() come from BaseRemoteDetector.
 
 
 def _llm_call_kwargs(overrides: Any, api_key: str | None) -> dict[str, Any]:
