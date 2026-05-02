@@ -4,11 +4,13 @@ Known constraints of the current implementation. None of these are
 hard blockers for the typical single-replica deployment, but each is
 worth knowing about before you commit to a topology.
 
-## Single replica (default; opt out with `VAULT_BACKEND=redis`)
+## Single replica
 
-The default [vault](vault.md) backend (`MemoryVault`) is
-process-local; mappings written on one replica aren't visible from
-another. Two consequences when running this default:
+Applies to the **default** vault backend; opt out with
+`VAULT_BACKEND=redis` (see below). The default
+[vault](vault.md) backend (`MemoryVault`) is process-local;
+mappings written on one replica aren't visible from another. Two
+consequences when running this default:
 
 - **No horizontal scale-out.** A second replica can serve traffic,
   but every `request` and the matching `response` MUST land on the

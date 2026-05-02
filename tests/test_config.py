@@ -82,3 +82,33 @@ def test_detector_mode_lowercased(monkeypatch: pytest.MonkeyPatch) -> None:
     folded for /health readability and downstream parsing."""
     monkeypatch.setenv("DETECTOR_MODE", "Regex,LLM")
     assert Config().detector_mode == "regex,llm"
+
+
+def test_redis_backend_without_url_fails_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`VAULT_BACKEND=redis` requires `VAULT_REDIS_URL`. The model
+    validator catches the misconfiguration at construction so the
+    process refuses to start rather than failing at first request.
+    Pins the cross-field invariant in `config.py:_vault_redis_url_required_for_redis_backend`."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("VAULT_BACKEND", "redis")
+    monkeypatch.setenv("VAULT_REDIS_URL", "")  # explicit empty
+    with pytest.raises(ValidationError, match="VAULT_REDIS_URL"):
+        Config()
+
+
+def test_redis_backend_with_url_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VAULT_BACKEND", "redis")
+    monkeypatch.setenv("VAULT_REDIS_URL", "redis://localhost:6379/0")
+    cfg = Config()
+    assert cfg.vault_backend == "redis"
+    assert cfg.vault_redis_url == "redis://localhost:6379/0"
+
+
+def test_memory_backend_does_not_require_url() -> None:
+    """Defaults / explicit memory backend should construct fine with
+    an empty URL — only the `redis` branch demands it."""
+    cfg = Config(vault_backend="memory", vault_redis_url="")
+    assert cfg.vault_backend == "memory"

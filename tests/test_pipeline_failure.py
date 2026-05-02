@@ -301,3 +301,72 @@ async def test_unexpected_gliner_pii_failure_routes_through_fail_closed(
 
     with pytest.raises(GlinerPIIUnavailableError, match="Unexpected failure"):
         await p.anonymize(["alice"], call_id="gliner-unexpected-fail")
+
+
+# ── Vault-backend failure ───────────────────────────────────────────────
+
+
+async def test_vault_put_failure_propagates_blocks_request() -> None:
+    """Critical correctness invariant: if `vault.put` raises (e.g.
+    Redis unreachable), `Pipeline.anonymize` MUST propagate the error
+    so the caller returns BLOCKED. Returning the modified texts
+    without storing the mapping would ship surrogates that nobody
+    can deanonymize on the response side — silent surrogate leakage
+    to the user.
+
+    Pinned here as a Pipeline-level invariant rather than a
+    detector-failure test because it's about state-storage
+    correctness, not detection availability."""
+    from anonymizer_guardrail.vault_redis import RedisVaultError
+
+    p = Pipeline()
+
+    # Replace the vault with a stub whose put raises the typed error.
+    class _FailingVault:
+        async def put(self, call_id, mapping):
+            raise RedisVaultError("simulated Redis outage")
+
+        async def pop(self, call_id):
+            return {}
+
+        def size(self) -> int:
+            return 0
+
+        async def aclose(self) -> None:
+            return None
+
+    p._vault = _FailingVault()  # type: ignore[assignment]
+
+    # Use a text that triggers regex matches so anonymize actually
+    # has a non-empty mapping to store. Without matches, the vault
+    # path is skipped entirely (mapping is empty).
+    with pytest.raises(RedisVaultError, match="simulated Redis outage"):
+        await p.anonymize(
+            ["email me at alice@example.com"],
+            call_id="vault-put-fails",
+        )
+
+
+async def test_pipeline_aclose_invokes_vault_aclose() -> None:
+    """`Pipeline.aclose()` must call `vault.aclose()` so RedisVault's
+    connection pool drains on FastAPI shutdown. Pin the wiring so a
+    future refactor can't silently drop the call."""
+    p = Pipeline()
+
+    aclose_called = False
+
+    class _TrackingVault:
+        async def put(self, call_id, mapping): pass
+
+        async def pop(self, call_id): return {}
+
+        def size(self) -> int: return 0
+
+        async def aclose(self) -> None:
+            nonlocal aclose_called
+            aclose_called = True
+
+    p._vault = _TrackingVault()  # type: ignore[assignment]
+
+    await p.aclose()
+    assert aclose_called, "Pipeline.aclose() did not invoke vault.aclose()"

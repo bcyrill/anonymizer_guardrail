@@ -7,8 +7,9 @@ to perform reversible anonymization of LLM traffic.
 LiteLLM calls this service before forwarding a request upstream
 (`input_type="request"`) to anonymize sensitive substrings, then again after
 the upstream model responds (`input_type="response"`) to deanonymize them. A
-short-lived in-memory mapping keyed by `litellm_call_id` connects the two
-sides of the round-trip.
+short-lived mapping keyed by `litellm_call_id` connects the two sides of the
+round-trip — in-memory by default; Redis-backed when running multi-replica
+(see [docs/vault.md](docs/vault.md#backends)).
 
 ## Quick start
 

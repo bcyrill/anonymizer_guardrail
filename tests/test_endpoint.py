@@ -177,10 +177,10 @@ class _ExplodingPipeline:
     LLM machinery."""
 
     def __init__(self, exc_factory) -> None:
-        from anonymizer_guardrail.vault import Vault
+        from anonymizer_guardrail.vault_memory import MemoryVault
 
         self._exc = exc_factory
-        self.vault = Vault()  # /health needs vault.size()
+        self.vault = MemoryVault()  # /health needs vault.size()
 
     def stats(self) -> dict[str, int]:
         return {
@@ -281,9 +281,9 @@ class _CapturingPipeline:
     detection."""
 
     def __init__(self) -> None:
-        from anonymizer_guardrail.vault import Vault
+        from anonymizer_guardrail.vault_memory import MemoryVault
 
-        self.vault = Vault()
+        self.vault = MemoryVault()
         self.received_api_key: str | None = "<not called>"
 
     def stats(self) -> dict[str, int]:

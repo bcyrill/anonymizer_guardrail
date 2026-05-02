@@ -83,10 +83,23 @@ class RedisVault:
     timeouts, TLS) via the connection URL.
     """
 
+    # Reserved keyspace prefix. Promoted to a class constant so a
+    # future "shared Redis with namespace" config can swap it
+    # without grep-and-replace, and tests can assert keys without
+    # repeating the literal. Operators are still encouraged to use
+    # a dedicated logical DB index (`/<n>` in the URL) on top of
+    # this prefix.
+    _KEY_PREFIX = "vault:"
+
     def __init__(self, *, url: str, ttl_s: int) -> None:
-        # Local import — see module docstring. Operators on the
-        # memory backend never reach here, so they don't need the
-        # redis package installed even if they construct a Pipeline.
+        # Local import (NOT module-level) so importing this module
+        # doesn't require redis-py — operators on the memory backend
+        # never construct a RedisVault and shouldn't pay for the
+        # dep. Hoisting this import to module top would defeat the
+        # slim-image goal: the package itself remains importable
+        # without `[vault-redis]` even when `from
+        # anonymizer_guardrail.vault_redis import RedisVaultError`
+        # happens elsewhere (the error class doesn't need redis).
         try:
             import redis.asyncio as redis_asyncio
         except ImportError as exc:
@@ -106,9 +119,15 @@ class RedisVault:
 
         self._url = url
         self._ttl_s = ttl_s
-        # `decode_responses=True` so we get str back from Redis
-        # rather than bytes. The connection pool is created lazily
-        # on first command; `aclose()` drains it.
+        # `decode_responses=True` so we get `str` back from Redis
+        # rather than `bytes`. Safe because we serialize values via
+        # `json.dumps` which (with the default `ensure_ascii=True`)
+        # emits pure ASCII — non-ASCII characters in the original
+        # text get escaped as `\uXXXX`. Don't switch to
+        # `ensure_ascii=False` without revisiting this: arbitrary
+        # bytes on the wire could trip `decode_responses=True`'s
+        # UTF-8 decoder. Connection pool is created lazily on
+        # first command; `aclose()` drains it.
         self._client = redis_asyncio.from_url(
             url,
             decode_responses=True,
@@ -119,13 +138,13 @@ class RedisVault:
             url, ttl_s,
         )
 
-    @staticmethod
-    def _key(call_id: str) -> str:
+    @classmethod
+    def _key(cls, call_id: str) -> str:
         """Namespaced key — the `vault:` prefix is reserved so this
         backend can share a Redis instance with other consumers
         without colliding. Operators are still encouraged to use a
         dedicated logical DB index (`/<n>` in the URL)."""
-        return f"vault:{call_id}"
+        return f"{cls._KEY_PREFIX}{call_id}"
 
     async def put(self, call_id: str, mapping: dict[str, str]) -> None:
         """SET <key> <json> EX <ttl>. Single round-trip; Redis evicts

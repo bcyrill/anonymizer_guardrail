@@ -72,6 +72,14 @@ _MERGE_SENTINEL = "\n\n--- ANONYMIZER-SEGMENT-BREAK ---\n\n"
 # any partial match the model invents around the marker.
 _MERGE_SENTINEL_MARKER = "ANONYMIZER-SEGMENT-BREAK"
 
+# Per-resource budget for `Pipeline.aclose`. A wedged backend (Redis
+# hung, httpx pool stuck on a slow socket) shouldn't be able to hang
+# FastAPI shutdown indefinitely. 5 seconds is generous for any healthy
+# pool drain and short enough that operators don't notice on a clean
+# stop. Not tunable via env — this is a shutdown safety budget, not
+# operator-facing behaviour.
+_ACLOSE_TIMEOUT_S = 5.0
+
 
 def _build_detectors() -> list[Detector]:
     """Parse DETECTOR_MODE as a comma-separated list of detector names.
@@ -525,23 +533,45 @@ class Pipeline:
     async def aclose(self) -> None:
         """Release per-detector resources (httpx connection pools, etc)
         plus the vault backend (Redis connection pool when applicable).
-        Wired to FastAPI's lifespan in main.py so shutdown is clean."""
-        # Vault first — its aclose is a no-op for MemoryVault and a
-        # connection-pool drain for RedisVault. Order doesn't matter
-        # for correctness; doing vault first surfaces Redis errors
-        # before we churn through detector clients.
-        try:
-            await self._vault.aclose()
-        except Exception as exc:  # noqa: BLE001 — never fail shutdown
-            log.warning("Vault aclose failed: %s", exc)
+        Wired to FastAPI's lifespan in main.py so shutdown is clean.
 
+        Order: detectors first, vault last. The pipeline's own request
+        path is `detect → vault.put` (`anonymize`) and `vault.pop`
+        (`deanonymize`). If a request is mid-anonymize when shutdown
+        fires, the detector path needs the vault to still be live for
+        the put; closing the vault first would leave that put hitting
+        a closed Redis client. Uvicorn drains in-flight requests
+        before the lifespan teardown fires today, but pinning the
+        order defensively here doesn't hurt and removes the implicit
+        dependency on graceful-shutdown ordering.
+
+        Each `aclose` is wrapped in `asyncio.wait_for` with a 5-second
+        budget so a wedged backend (Redis hung, httpx pool stuck on a
+        slow socket) can't hang FastAPI shutdown indefinitely.
+        """
         for det in self._detectors:
             close = getattr(det, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except Exception as exc:  # noqa: BLE001 — never fail shutdown
-                    log.warning("Detector %s aclose failed: %s", det.name, exc)
+            if close is None:
+                continue
+            try:
+                await asyncio.wait_for(close(), timeout=_ACLOSE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Detector %s aclose timed out after %ds; abandoning.",
+                    det.name, _ACLOSE_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail shutdown
+                log.warning("Detector %s aclose failed: %s", det.name, exc)
+
+        try:
+            await asyncio.wait_for(self._vault.aclose(), timeout=_ACLOSE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning(
+                "Vault aclose timed out after %ds; abandoning.",
+                _ACLOSE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail shutdown
+            log.warning("Vault aclose failed: %s", exc)
 
     async def _run_detection(
         self,

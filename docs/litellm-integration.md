@@ -5,9 +5,11 @@ The guardrail implements LiteLLM's
 LiteLLM calls it before forwarding a request upstream
 (`input_type="request"`) to anonymize sensitive substrings, then again
 after the upstream model responds (`input_type="response"`) to
-deanonymize them. A short-lived in-memory mapping keyed by
-`litellm_call_id` connects the two sides of the round-trip — see
-[vault](vault.md) for the lifecycle.
+deanonymize them. A short-lived mapping keyed by `litellm_call_id`
+connects the two sides of the round-trip (in-memory by default;
+Redis-backed under `VAULT_BACKEND=redis` for multi-replica
+deployments) — see [vault](vault.md) for the lifecycle and backend
+selection.
 
 A working `config.yaml` snippet (see `litellm.config.example.yaml` for the
 full file):

@@ -19,6 +19,7 @@ from .config import config
 from .detector import REGISTERED_SPECS, TYPED_UNAVAILABLE_ERRORS
 from .detector import llm as llm_mod
 from .pipeline import Pipeline
+from .vault_redis import RedisVaultError
 
 logging.basicConfig(
     level=getattr(logging, config.log_level.upper(), logging.INFO),
@@ -312,6 +313,28 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
         return GuardrailResponse(
             action="BLOCKED",
             blocked_reason=spec.blocked_reason,
+        )
+    except RedisVaultError as exc:
+        # Vault-backend availability failure (Redis unreachable / wrong
+        # type / auth / etc.). Distinct from detector unavailability:
+        # this isn't about whether we can scan the text, it's about
+        # whether we can store or restore the round-trip mapping. The
+        # request is BLOCKED unconditionally — there's no fail-open
+        # for vault errors because (a) `put` failure means the
+        # caller's already-anonymized response can't be deanonymized
+        # later (silent surrogate leakage to the user), and (b) `pop`
+        # failure means we can't restore the response. Both are
+        # correctness, not coverage. LiteLLM's `unreachable_fallback`
+        # also doesn't apply here — that's for "guardrail endpoint
+        # unreachable," not internal-state errors.
+        log.error("Blocking request — vault backend unavailable: %s", exc)
+        return GuardrailResponse(
+            action="BLOCKED",
+            blocked_reason=(
+                "Vault backend unavailable; request blocked to prevent "
+                "the response from shipping with un-restorable surrogates "
+                "(or failing to deanonymize the response)."
+            ),
         )
     except Exception as exc:
         # Unexpected failure → block. LiteLLM's `unreachable_fallback` setting

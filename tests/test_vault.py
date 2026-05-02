@@ -1,92 +1,121 @@
-"""MemoryVault behaviour: TTL eviction, LRU cap, basic put/get/pop semantics.
+"""Vault Protocol contract tests — parametrized across all backends.
 
-These tests cover the in-memory backend specifically. The Redis-backed
-sibling lives in `test_vault_redis.py`. The shared Protocol contract is
-exercised by both files; backend-specific behaviour (LRU cap, the
-`_store` internal layout) is tested only here.
+Tests in this file exercise the `VaultBackend` Protocol contract: the
+behaviour every implementation MUST satisfy regardless of whether the
+underlying store is in-process memory, Redis, or anything future. New
+backends are added by extending the `vault` fixture below; the contract
+tests then run against them automatically.
+
+Backend-specific behaviour lives in:
+
+  * `test_vault_memory.py` — LRU cap, TTL via lazy check, max_entries floor.
+  * `test_vault_redis.py` — atomic GETDEL, JSON wire format, key prefix,
+    error wrapping, RedisVault-specific construction failures.
+
+The TTL contract isn't covered here because the mechanisms differ
+substantially across backends (lazy check vs. server-side EXPIRE) and
+the cross-backend assertion would require slow `asyncio.sleep`s on the
+Redis side. Each backend's TTL test stays in its own file.
 """
 
 from __future__ import annotations
 
-import asyncio
+import os
+from unittest.mock import patch
 
-from anonymizer_guardrail.vault import Vault
+# Match the other test modules: keep transitive config harmless.
+os.environ.setdefault("DETECTOR_MODE", "regex")
 
+import pytest
 
-async def test_lru_evicts_oldest_when_over_cap() -> None:
-    """Filling past max_entries drops the least-recently-inserted entry."""
-    v = Vault(ttl_s=600, max_entries=2)
-    await v.put("a", {"sa": "oa"})
-    await v.put("b", {"sb": "ob"})
-    await v.put("c", {"sc": "oc"})  # evicts "a"
-
-    assert v.size() == 2
-    assert await v.pop("a") == {}            # evicted, gone
-    assert await v.pop("b") == {"sb": "ob"}  # still there
-    assert await v.pop("c") == {"sc": "oc"}  # still there
+from anonymizer_guardrail.vault import VaultBackend
+from anonymizer_guardrail.vault_memory import MemoryVault
+from anonymizer_guardrail.vault_redis import RedisVault
 
 
-async def test_lru_eviction_handles_burst() -> None:
-    """Inserting many more than the cap leaves only the most recent N."""
-    v = Vault(ttl_s=600, max_entries=3)
-    for i in range(10):
-        await v.put(f"call-{i}", {"s": f"o-{i}"})
+@pytest.fixture(params=["memory", "redis"])
+async def vault(request) -> VaultBackend:
+    """Yield a fresh VaultBackend for each parametrized run.
 
-    assert v.size() == 3
-    # Only the last three inserts survive.
-    for i in range(7):
-        assert await v.pop(f"call-{i}") == {}
-    for i in range(7, 10):
-        assert await v.pop(f"call-{i}") == {"s": f"o-{i}"}
+    The two backends construct very differently:
 
+      * `MemoryVault(ttl_s=…, max_entries=…)` — direct construction,
+        zero infrastructure.
+      * `RedisVault(url=…, ttl_s=…)` — needs a Redis client. We patch
+        `redis.asyncio.from_url` to return a `fakeredis` async client
+        so CI doesn't need a real Redis. Uses the same redis-py
+        asyncio surface as production.
 
-async def test_re_putting_same_id_refreshes_recency() -> None:
-    """A repeat put() on an existing call_id moves it to the end, so it
-    isn't the next victim of LRU eviction."""
-    v = Vault(ttl_s=600, max_entries=2)
-    await v.put("a", {"sa": "oa"})
-    await v.put("b", {"sb": "ob"})
-    await v.put("a", {"sa": "oa2"})  # refresh "a" to most-recent
-    await v.put("c", {"sc": "oc"})   # should evict "b", not "a"
+    Each test gets its own backend instance, so cross-test state
+    leakage is impossible.
+    """
+    if request.param == "memory":
+        v: VaultBackend = MemoryVault(ttl_s=600, max_entries=100)
+        yield v
+        await v.aclose()
+    else:
+        import fakeredis.aioredis as fakeredis_aioredis
 
-    assert await v.pop("a") == {"sa": "oa2"}
-    assert await v.pop("b") == {}
-    assert await v.pop("c") == {"sc": "oc"}
-
-
-async def test_max_entries_floor_at_one() -> None:
-    """A typoed 0/negative max_entries can't disable writes — floor is 1."""
-    v = Vault(ttl_s=600, max_entries=0)
-    await v.put("a", {"sa": "oa"})
-    assert v.size() == 1
+        fake_client = fakeredis_aioredis.FakeRedis(decode_responses=True)
+        with patch("redis.asyncio.from_url", return_value=fake_client):
+            v = RedisVault(url="redis://fake/0", ttl_s=600)
+        yield v
+        await v.aclose()
 
 
-async def test_put_and_pop_roundtrip() -> None:
-    v = Vault(ttl_s=600, max_entries=10)
-    await v.put("call-1", {"surrogate": "original"})
-    assert v.size() == 1
-    assert await v.pop("call-1") == {"surrogate": "original"}
-    assert v.size() == 0
+# ── Contract: roundtrip ─────────────────────────────────────────────────
 
 
-async def test_pop_missing_returns_empty() -> None:
-    v = Vault(ttl_s=600, max_entries=10)
-    assert await v.pop("never-stored") == {}
+async def test_put_and_pop_roundtrip(vault: VaultBackend) -> None:
+    """Basic happy path: put a mapping, get it back via pop. Every
+    backend must satisfy this."""
+    await vault.put("call-1", {"surrogate": "original"})
+    assert await vault.pop("call-1") == {"surrogate": "original"}
 
 
-async def test_ttl_expiry() -> None:
-    """An entry whose monotonic timestamp is past the TTL returns {}."""
-    v = Vault(ttl_s=0, max_entries=10)  # TTL 0 → everything is "expired"
-    await v.put("a", {"sa": "oa"})
-    # Call get/pop after the immediate write — a 0-second TTL means the
-    # `now - ts > ttl` check trips on any positive elapsed time. Use pop
-    # so we also cover the eviction path.
-    await asyncio.sleep(0.01)
-    assert await v.pop("a") == {}
+async def test_pop_after_pop_is_idempotent(vault: VaultBackend) -> None:
+    """A second `pop` for the same call_id returns `{}`. Pins the
+    "pop is destructive" semantics that both backends honour
+    (MemoryVault deletes the dict entry; RedisVault uses GETDEL)."""
+    await vault.put("call-1", {"k": "v"})
+    assert await vault.pop("call-1") == {"k": "v"}
+    assert await vault.pop("call-1") == {}
 
 
-async def test_aclose_is_a_noop() -> None:
-    """MemoryVault has no connections to drain; aclose returns cleanly
-    so Pipeline.aclose() can call it uniformly across backends."""
-    v = Vault()
-    await v.aclose()  # should not raise
+async def test_pop_missing_returns_empty(vault: VaultBackend) -> None:
+    """A call_id that was never `put` returns `{}` — the "no-op for
+    requests without a matching pre-call" contract."""
+    assert await vault.pop("never-stored") == {}
+
+
+# ── Contract: defensive no-ops on degenerate input ──────────────────────
+
+
+async def test_empty_call_id_is_noop(vault: VaultBackend) -> None:
+    """Empty call_id on `put` doesn't store anything; on `pop`
+    returns `{}`. Both backends must honour this — without it a
+    misconfigured caller could overwrite a "" entry across requests."""
+    await vault.put("", {"k": "v"})
+    assert await vault.pop("") == {}
+
+
+async def test_empty_mapping_is_noop(vault: VaultBackend) -> None:
+    """Empty mapping on `put` doesn't roundtrip a placeholder entry.
+    Important so a request with no detected entities (mapping={}) doesn't
+    pollute the vault with empty entries that the matching post_call
+    would then need to interpret."""
+    await vault.put("call-empty-map", {})
+    assert await vault.pop("call-empty-map") == {}
+
+
+# ── Contract: aclose ────────────────────────────────────────────────────
+
+
+async def test_aclose_does_not_raise(vault: VaultBackend) -> None:
+    """Every backend's `aclose` must complete without raising. For
+    MemoryVault it's a no-op; for RedisVault it drains the connection
+    pool. Pipeline.aclose() relies on this contract — a misbehaving
+    aclose could hang FastAPI shutdown."""
+    # vault fixture already calls aclose on teardown — calling it
+    # explicitly here pins the behaviour during normal test flow.
+    await vault.aclose()

@@ -1,5 +1,10 @@
-"""RedisVault behaviour: put/pop round-trip, TTL eviction, atomic
-GETDEL semantics, JSON serialization, error wrapping.
+"""RedisVault-specific behaviour: atomic GETDEL semantics, TTL via
+`EXPIRE`, JSON wire format, key prefix, error wrapping, construction
+failures, `size()` placeholder.
+
+Cross-backend contract tests (put/pop roundtrip, pop-missing, empty
+inputs, aclose) live in `test_vault.py` and run against RedisVault
+automatically via the parametrized `vault` fixture there.
 
 Uses `fakeredis.aioredis` so CI doesn't need a real Redis server.
 The fakeredis instance speaks the redis-py asyncio protocol, so
@@ -38,28 +43,10 @@ async def vault() -> RedisVault:
     await v.aclose()
 
 
-# ── Round-trip ──────────────────────────────────────────────────────────
-
-
-async def test_put_and_pop_roundtrip(vault: RedisVault) -> None:
-    """Basic happy path: put a mapping, get it back via pop, pop again
-    returns empty (GETDEL removed the entry)."""
-    await vault.put("call-1", {"surrogate": "original"})
-    assert await vault.pop("call-1") == {"surrogate": "original"}
-    assert await vault.pop("call-1") == {}  # GETDEL already removed it
-
-
-async def test_pop_missing_returns_empty(vault: RedisVault) -> None:
-    assert await vault.pop("never-stored") == {}
-
-
-async def test_empty_call_id_or_mapping_is_noop(vault: RedisVault) -> None:
-    """Defensive: empty call_id / empty mapping should not roundtrip
-    a placeholder entry into Redis."""
-    await vault.put("", {"a": "b"})
-    await vault.put("call-1", {})
-    assert await vault.pop("") == {}
-    assert await vault.pop("call-1") == {}
+# Roundtrip / pop-missing / empty-input contract tests live in
+# `test_vault.py` and run against this backend automatically via the
+# parametrized `vault` fixture there. This file only owns
+# RedisVault-specific behaviour.
 
 
 # ── Atomic GETDEL semantics ─────────────────────────────────────────────
@@ -100,6 +87,37 @@ async def test_ttl_set_on_put() -> None:
     # -2 = key doesn't exist, positive = seconds remaining.
     ttl = await fake_client.ttl("vault:call-ttl")
     assert ttl > 0 and ttl <= 10
+    await v.aclose()
+
+
+async def test_re_put_refreshes_ttl() -> None:
+    """A second `put` for the same call_id must reset the TTL to the
+    full window (Redis's `SET ... EX` semantics — pin so a future
+    refactor that uses `SETEX NX` doesn't silently break the contract).
+    A re-put on an existing entry is rare in practice but the
+    `MemoryVault` path explicitly re-stores the timestamp on re-put,
+    so the Redis path should mirror that."""
+    import fakeredis.aioredis as fakeredis
+
+    fake_client = fakeredis.FakeRedis(decode_responses=True)
+    with patch("redis.asyncio.from_url", return_value=fake_client):
+        v = RedisVault(url="redis://fake/0", ttl_s=60)
+
+    await v.put("call-refresh", {"k": "v1"})
+    # Manually wind the TTL down (fakeredis supports EXPIRE) so we can
+    # tell whether the second put resets it.
+    await fake_client.expire("vault:call-refresh", 5)
+    ttl_before = await fake_client.ttl("vault:call-refresh")
+    assert ttl_before <= 5
+
+    # Second put — should reset TTL to the full window.
+    await v.put("call-refresh", {"k": "v2"})
+    ttl_after = await fake_client.ttl("vault:call-refresh")
+    assert ttl_after > 5  # refreshed
+    assert ttl_after <= 60
+
+    # And the value was overwritten.
+    assert await v.pop("call-refresh") == {"k": "v2"}
     await v.aclose()
 
 

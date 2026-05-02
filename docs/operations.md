@@ -57,9 +57,13 @@ How to read each counter:
 - **`vault_size`** — number of *open* round-trips. A steady-state value
   near zero is healthy; a monotonically growing value points at
   LiteLLM losing the response side, which the TTL eventually catches
-  up with. Full lifecycle in [vault](vault.md). Multi-replica
-  deployments need a shared store for the vault — tracked in
-  [`TASKS.md` → Multi-replica support](../TASKS.md#multi-replica-support-redis-backed-vault).
+  up with. Full lifecycle in [vault](vault.md). Backend-specific:
+  `MemoryVault` returns the exact in-process count; the Redis backend
+  returns `0` as a placeholder — operators query Redis directly for
+  the actual depth (`DBSIZE` on a dedicated DB index, or `redis-cli
+  --scan --pattern "vault:*" | wc -l`). See
+  [vault → Backends](vault.md#backends) for the multi-replica
+  deployment path.
 - **`surrogate_cache_size`** vs **`surrogate_cache_max`** — when these
   converge, LRU eviction is firing and the oldest cross-request
   consistency invariants are quietly being lost. Bump

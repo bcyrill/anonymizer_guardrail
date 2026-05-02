@@ -268,42 +268,80 @@ Volume options compared:
 
 ## State and replicas — read this before scaling out
 
-The guardrail keeps two stores in process memory:
+The guardrail keeps two stores. The **vault**
+(`litellm_call_id → surrogate→original mapping`, written by the
+pre-call hook and consumed by the matching post-call hook) supports
+two backends:
 
-- **The vault** — `litellm_call_id → surrogate→original mapping`,
-  written by the pre-call hook and consumed by the matching post-call
-  hook. Without the matching mapping, the post-call hook ships
-  surrogates back to the user instead of restoring originals.
-- **The surrogate cache** — cross-request consistency for
-  multi-turn conversations (same input → same surrogate).
+  * **`MemoryVault`** (default, `VAULT_BACKEND=memory`) — process-local.
+  * **`RedisVault`** (`VAULT_BACKEND=redis`) — shared across replicas.
 
-Three production implications fall out of "in-memory":
+The **surrogate cache** (cross-request consistency for multi-turn
+conversations) is always per-process — `SURROGATE_SALT` covers the
+cross-replica consistency case without a shared backend.
 
-1. **Pre/post-call hooks must land on the same replica.** Round-trip
-   anonymization breaks the moment a load balancer routes the
-   pre-call to replica A and the post-call to replica B — B has no
-   mapping to restore. Required posture for >1 replica: sticky
-   routing keyed on `litellm_call_id`, OR run a single replica.
-   See [limitations → Single replica](limitations.md#single-replica).
-2. **Restarts lose in-flight round-trips.** A pre-call written
-   before a restart can't be deanonymized by a post-call after the
-   restart. The
-   [`VAULT_TTL_S`](configuration.md#vault) backstop bounds the
-   *other* direction (vault grows when responses don't arrive); the
-   restart-mid-roundtrip case has no fix beyond accepting it.
-3. **Surrogate consistency is per-process.** Replica A and replica
-   B will issue different surrogates for the same original unless
-   you pin a stable [`SURROGATE_SALT`](surrogates.md#surrogate-salt-privacy-hardening).
-   Even then, salt only stabilises the surrogate value, not the LRU
-   cache contents — the *consistency window* (how far back two
-   identical inputs still produce the same surrogate) is bounded by
-   `SURROGATE_CACHE_MAX_SIZE` per replica.
+Pick a posture based on whether you need >1 replica:
 
-For multi-replica deployments where sticky routing isn't an option,
-swap the `Vault` for a shared backend (Redis is the natural fit).
-The interface is two methods (`put` / `pop`); see
-[`TASKS.md` → Multi-replica support](../TASKS.md) for the design
-sketch when this becomes urgent.
+### Single replica (default)
+
+Both stores are in-memory. Two implications:
+
+  * **Restarts lose in-flight round-trips.** A pre-call written
+    before a restart can't be deanonymized by a post-call after the
+    restart. The [`VAULT_TTL_S`](configuration.md#vault) backstop
+    bounds the *other* direction (vault grows when responses don't
+    arrive); the restart-mid-roundtrip case has no fix beyond
+    accepting it.
+  * **Sticky routing not required** because there's only one
+    replica.
+
+### Multi-replica via sticky routing
+
+Keep `VAULT_BACKEND=memory`, but the load balancer must hash on
+`litellm_call_id` so the pre-call and post-call land on the same
+replica. Pin a stable
+[`SURROGATE_SALT`](surrogates.md#surrogate-salt-privacy-hardening)
+so replicas issue the same surrogates for the same originals.
+
+This works when sticky routing is available (e.g. Envoy / nginx
+hash-based balancing) and is the cheapest multi-replica option —
+no extra infrastructure beyond the LB config. The trade-off:
+hash-based balancing can imbalance load if call_ids cluster, and
+there's no story for restart-mid-roundtrip.
+
+### Multi-replica via shared Redis
+
+Set `VAULT_BACKEND=redis` and `VAULT_REDIS_URL=redis://host:port/db`,
+install the optional dep:
+
+```bash
+pip install "anonymizer-guardrail[vault-redis]"
+```
+
+The vault becomes a shared store; pre-call and post-call can land
+on any replica. Restart-mid-roundtrip survives provided Redis stayed
+up. Pin a stable `SURROGATE_SALT` for cross-replica surrogate
+consistency.
+
+Operational notes:
+
+  * **Use a dedicated logical DB index** (`/<n>` in the URL) so
+    `DBSIZE` and SCAN are scoped to vault entries.
+  * **`maxmemory` policy.** Vault entries are TTL-bounded
+    server-side, so memory steady-state is roughly `(in-flight
+    rate) × (TTL) × (entry size)`. A typical mapping is hundreds of
+    bytes; budget accordingly. The default `VAULT_MAX_ENTRIES` cap
+    doesn't apply to the Redis backend — Redis enforces its own
+    `maxmemory` policy.
+  * **Failure modes.** Redis unreachable on `put` or `pop` returns
+    BLOCKED to the caller (LiteLLM client retries). The vault errors
+    do *not* route through `unreachable_fallback` — they're
+    internal-state errors, distinct from "guardrail endpoint is
+    unreachable." See [vault → Backends](vault.md#backends) for the
+    full failure-mode story.
+  * **`vault_size` on `/health`** returns `0` for the Redis backend
+    — sync health endpoint can't run an async SCAN. Query Redis
+    directly when you need the actual depth.
 
 `/health` exposes `vault_size` and `surrogate_cache_size` — see
 [operations](operations.md) for how to monitor them.
