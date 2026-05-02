@@ -202,3 +202,70 @@ not address.
 - LiteLLM's guardrail contract changes such that response-side
   hooks become async / non-blocking from the caller's view (the
   latency objection above weakens substantially in that world).
+
+---
+
+## Oversized per-text input under fail_closed blocks the whole batch
+
+**Considered:** when a single text in `req.texts` exceeds
+`LLM_MAX_CHARS` (and `LLM_FAIL_CLOSED=true`, the default),
+`LLMDetector._do_detect` raises `LLMUnavailableError`, the
+TaskGroup propagates it, and `Pipeline.anonymize` aborts the
+*entire request* — including the other texts that fit fine and
+might have been anonymized successfully. Could we drop the
+oversized text and proceed with the rest, since "all the others
+are anonymized" sounds like more coverage, not less?
+
+**Why we declined (the silent-bypass argument):**
+
+- **The full `req.texts` array is forwarded to the upstream LLM.**
+  LiteLLM's guardrail contract is "guardrail returns modified
+  texts; LiteLLM substitutes them and forwards the request." If
+  the guardrail drops one entry from anonymization, the
+  *original* (un-anonymized) text still reaches the upstream
+  model — there's no "skip this text" option in the request
+  forwarded.
+- **Dropping under `fail_closed=true` would be the silent bypass
+  fail-closed exists to prevent.** Operators who set fail-closed
+  did so because they want the guardrail to *refuse* uncertain
+  situations, not loosen them. "We couldn't scan one text, but
+  we anonymized the others, so call it good" is exactly the
+  posture fail-closed rejects.
+- **There's no safe middle ground.** Truncation was already
+  rejected for the per-text `LLM_MAX_CHARS` check (silently
+  scanning 90% and shipping the last 10% unredacted is the worst
+  possible outcome). A separate "oversize policy" knob would
+  just rename the same trade-off without resolving it.
+
+**Consequence (current behaviour, document explicitly):**
+
+- Under `LLM_FAIL_CLOSED=true`, a single oversized text in
+  `req.texts` blocks the entire request. Operators see a
+  `BLOCKED` action with the LLM's blocked_reason; their client
+  retries with smaller payloads or a higher cap.
+- Under `LLM_FAIL_CLOSED=false`, the LLM detector swallows the
+  `LLMUnavailableError` and contributes no matches for the
+  oversized text. The other detectors (regex, denylist, PF,
+  gliner) still run on it, providing whatever coverage they
+  can. The upstream LLM receives the request — possibly with
+  un-anonymized PII the LLM detector would have caught. This is
+  the trade-off `fail_open` operators have explicitly chosen.
+- This is not asymmetric with merged-mode size fallback (which
+  *does* per-detector demote on oversized blob). There, no
+  detector has yet committed to "I can scan this text"; demoting
+  to per_text means we still scan every text, just one detector
+  at a time. Here, the per-text dispatch has already
+  committed — exceeding the cap on one text means *that text*
+  cannot be scanned, period.
+
+**When to re-evaluate:**
+
+- LiteLLM's guardrail contract grows a "skip this text" or
+  "block-by-index" mechanism that lets the guardrail surface
+  partial unscanability without reaching the upstream model.
+- A use case shows up where heterogeneous traffic (one large
+  document + several short messages) is genuinely common AND
+  raising `LLM_MAX_CHARS` is not a viable mitigation. The
+  remediation today is "use a larger detection model and bump
+  the cap"; a real production case where that's insufficient
+  would be load-bearing evidence.
