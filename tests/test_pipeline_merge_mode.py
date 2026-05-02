@@ -42,13 +42,12 @@ def _stub_llm_detector(detect_fn) -> LLMDetector:
 
 
 def _patch_llm_config(monkeypatch: pytest.MonkeyPatch, **updates) -> None:
-    """Patch `llm.CONFIG` with the given field overrides. Pipeline
-    reads `spec.config.<field>` live, so the patch takes effect on
-    next Pipeline()."""
-    monkeypatch.setattr(
-        llm_mod, "CONFIG",
-        llm_mod.CONFIG.model_copy(update=updates),
-    )
+    """Thin shim over the generic `_patch_detector_config` helper —
+    kept because `_patch_llm_config(monkeypatch, fail_closed=False)`
+    reads more clearly at call sites than threading `llm_mod`
+    through every test."""
+    from tests._pipeline_helpers import _patch_detector_config
+    _patch_detector_config(monkeypatch, llm_mod, **updates)
 
 
 # ── Per-text mode is unchanged (regression) ─────────────────────────────
@@ -338,10 +337,10 @@ def _stub_pf_detector(detect_fn):
 
 
 def _patch_pf_config(monkeypatch: pytest.MonkeyPatch, **updates) -> None:
+    """Thin shim — same rationale as `_patch_llm_config` above."""
     from anonymizer_guardrail.detector import remote_privacy_filter as pf_mod
-    monkeypatch.setattr(
-        pf_mod, "CONFIG", pf_mod.CONFIG.model_copy(update=updates),
-    )
+    from tests._pipeline_helpers import _patch_detector_config
+    _patch_detector_config(monkeypatch, pf_mod, **updates)
 
 
 async def test_pf_merged_mode_calls_detector_once_with_joined_blob(
@@ -415,10 +414,10 @@ def _stub_gliner_detector(detect_fn):
 
 
 def _patch_gliner_config(monkeypatch: pytest.MonkeyPatch, **updates) -> None:
+    """Thin shim — same rationale as `_patch_llm_config` above."""
     from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
-    monkeypatch.setattr(
-        gp_mod, "CONFIG", gp_mod.CONFIG.model_copy(update=updates),
-    )
+    from tests._pipeline_helpers import _patch_detector_config
+    _patch_detector_config(monkeypatch, gp_mod, **updates)
 
 
 async def test_gliner_merged_mode_calls_detector_once_with_joined_blob(

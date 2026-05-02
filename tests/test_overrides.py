@@ -290,18 +290,23 @@ def test_surrogate_override_use_faker_separates_cache_buckets() -> None:
     overridden = gen.for_match(m, use_faker=False)
     # Override forced opaque-token shape.
     assert overridden.startswith("[PERSON_")
-    # Both cached, separately.
-    assert (m.entity_type, m.text, gen._use_faker, None) in gen._cache
-    assert (m.entity_type, m.text, False, None) in gen._cache
-    # And consistent across calls for the override bucket too.
+    # Both buckets exist independently — repeat calls return the same
+    # value per bucket. (The `_cache` internal dict-key shape used to
+    # be asserted directly here, but separate-bucket-consistency is
+    # observable via the public API: same input + same overrides →
+    # same surrogate.)
     assert gen.for_match(m, use_faker=False) == overridden
-    # Default behaviour unaffected.
     assert gen.for_match(m) == default
+    # Default and override produce different surrogates (the override
+    # forces opaque, the default uses Faker — they're shape-different).
+    assert default != overridden
 
 
 def test_surrogate_override_locale_caches_per_locale_tuple() -> None:
     """Different locale tuples → different cache slots, each consistent
-    on its own."""
+    on its own. (The internal `_cache` dict-key shape used to be
+    asserted directly here; per-bucket consistency is observable via
+    the public API.)"""
     gen = SurrogateGenerator()
     m = Match(text="Alice Smith", entity_type="PERSON")
     pt = gen.for_match(m, use_faker=True, locale=("pt_BR",))
@@ -311,8 +316,6 @@ def test_surrogate_override_locale_caches_per_locale_tuple() -> None:
     # At minimum the cache key separates them and per-locale calls are stable.
     assert gen.for_match(m, use_faker=True, locale=("pt_BR",)) == pt
     assert gen.for_match(m, use_faker=True, locale=("de_DE",)) == de
-    assert ("PERSON", "Alice Smith", True, ("pt_BR",)) in gen._cache
-    assert ("PERSON", "Alice Smith", True, ("de_DE",)) in gen._cache
 
 
 def test_surrogate_override_invalid_locale_warns_and_falls_back(
@@ -541,7 +544,12 @@ def test_surrogate_faker_lru_evicts_oldest_locale(
     # Use four real Faker locales so each one constructs successfully.
     for loc in [("pt_BR",), ("de_DE",), ("fr_FR",), ("es_ES",)]:
         gen.for_match(m, use_faker=True, locale=loc)
-    assert len(gen._faker_by_locale) == 3, "LRU cap must hold"
+
+    # Probe via the public `faker_cache_keys()` accessor so the test
+    # doesn't reach into `_faker_by_locale` directly. Same contract,
+    # robust against internal-data-structure refactors.
+    cached = gen.faker_cache_keys()
+    assert len(cached) == 3, "LRU cap must hold"
     # The oldest entry (pt_BR) should be the one evicted.
-    assert ("pt_BR",) not in gen._faker_by_locale
-    assert ("es_ES",) in gen._faker_by_locale
+    assert ("pt_BR",) not in cached
+    assert ("es_ES",) in cached

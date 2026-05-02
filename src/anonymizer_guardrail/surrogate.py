@@ -291,6 +291,19 @@ class SurrogateGenerator:
         after __init__. Used by Pipeline.stats() for the /health probe."""
         return len(self._cache), self._max_cache_size
 
+    def faker_cache_keys(self) -> tuple[tuple[str, ...], ...]:
+        """Snapshot of the locale tuples currently cached in the
+        per-locale Faker LRU. Read-only inspection accessor — callers
+        get a tuple-of-tuples copy so they can't mutate the underlying
+        OrderedDict.
+
+        Existed so tests can verify LRU-eviction behaviour without
+        reaching into `_faker_by_locale` directly. Operators rarely
+        need this; the cap (`SURROGATE_FAKER_LRU_MAX`) bounds memory,
+        and an evicted Faker is reconstructible on next use at
+        ~1–2 ms cost. No `/health` integration today."""
+        return tuple(self._faker_by_locale.keys())
+
     def _resolve_faker_locked(
         self, locale_tuple: tuple[str, ...] | None, use_faker: bool
     ) -> Faker | None:

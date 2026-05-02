@@ -186,16 +186,24 @@ def test_response_with_unknown_call_id_returns_none(client: TestClient) -> None:
 # ── Error paths ──────────────────────────────────────────────────────────────
 
 
-class _ExplodingPipeline:
-    """Stand-in pipeline whose anonymize/deanonymize raise on demand.
-    Lets us exercise main.guardrail's exception handling without any
-    LLM machinery."""
+class _BasePipelineStub:
+    """Shared scaffolding for pipeline test stubs. Provides the vault,
+    `stats()` payload, and `aclose` no-op that every Pipeline-shaped
+    stub needs; subclasses implement the `anonymize` / `deanonymize`
+    behaviour they're trying to exercise.
 
-    def __init__(self, exc_factory) -> None:
+    Putting this here (instead of in `_pipeline_helpers.py`) because
+    these stubs are endpoint-test-specific — they fake the *Pipeline
+    Protocol* main.py expects, not the per-detector Protocol other
+    tests fake. If a third stub class shows up that's also Pipeline-
+    shaped, this is the natural extension point."""
+
+    def __init__(self) -> None:
         from anonymizer_guardrail.vault_memory import MemoryVault
 
-        self._exc = exc_factory
-        self.vault = MemoryVault()  # /health needs vault.size()
+        # /health reads vault.size(); a real MemoryVault gives a working
+        # size() without forcing every subclass to fake one.
+        self.vault = MemoryVault()
 
     def stats(self) -> dict[str, int]:
         return {
@@ -206,14 +214,24 @@ class _ExplodingPipeline:
             "llm_max_concurrency": 1,
         }
 
+    async def aclose(self) -> None:
+        return None
+
+
+class _ExplodingPipeline(_BasePipelineStub):
+    """Stand-in pipeline whose anonymize/deanonymize raise on demand.
+    Lets us exercise main.guardrail's exception handling without any
+    LLM machinery."""
+
+    def __init__(self, exc_factory) -> None:
+        super().__init__()
+        self._exc = exc_factory
+
     async def anonymize(self, *args: Any, **kwargs: Any):
         raise self._exc()
 
     async def deanonymize(self, *args: Any, **kwargs: Any):
         raise self._exc()
-
-    async def aclose(self) -> None:
-        return None
 
 
 def test_llm_unavailable_returns_blocked_with_specific_reason(
@@ -314,40 +332,29 @@ def test_unexpected_exception_returns_blocked_with_internal_error(
 
 
 def _patch_llm_config(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
-    """Patch the LLM detector's CONFIG with the given field overrides.
-    Tests that previously called `_patch_config(llm_use_forwarded_key=True)`
-    against the central Config now patch `llm_mod.CONFIG.use_forwarded_key`
-    — same effect via the new per-detector config layout."""
+    """Thin shim over the generic `_patch_detector_config` helper.
+
+    Tests in this file historically used `llm_use_forwarded_key=True`
+    style kwargs from when this was a central-Config knob; the
+    `llm_` prefix gets stripped here so existing call sites keep
+    working without churn. New tests should pass field names directly
+    (e.g. `use_forwarded_key=True`)."""
     from anonymizer_guardrail.detector import llm as llm_mod
+    from tests._pipeline_helpers import _patch_detector_config
 
-    # Drop the legacy `llm_` prefix from override keys so test call
-    # sites don't have to track which prefix the central Config used.
     cleaned = {k.removeprefix("llm_"): v for k, v in overrides.items()}
-    monkeypatch.setattr(
-        llm_mod, "CONFIG", llm_mod.CONFIG.model_copy(update=cleaned),
-    )
+    _patch_detector_config(monkeypatch, llm_mod, **cleaned)
 
 
-class _CapturingPipeline:
+class _CapturingPipeline(_BasePipelineStub):
     """Pipeline stand-in that records the api_key it was called with so
     the test can assert on the forwarded-key extraction path. Returns no
     matches so the response is action=NONE — we're testing wiring, not
     detection."""
 
     def __init__(self) -> None:
-        from anonymizer_guardrail.vault_memory import MemoryVault
-
-        self.vault = MemoryVault()
+        super().__init__()
         self.received_api_key: str | None = "<not called>"
-
-    def stats(self) -> dict[str, int]:
-        return {
-            "vault_size": 0,
-            "surrogate_cache_size": 0,
-            "surrogate_cache_max": 1,
-            "llm_in_flight": 0,
-            "llm_max_concurrency": 1,
-        }
 
     async def anonymize(
         self,
@@ -366,9 +373,6 @@ class _CapturingPipeline:
 
     async def deanonymize(self, texts: list[str], call_id: str | None):
         return list(texts)
-
-    async def aclose(self) -> None:
-        return None
 
 
 def test_forwarded_bearer_extracted_when_feature_enabled(
@@ -529,6 +533,65 @@ def test_health_request_passes_through_middleware(monkeypatch: pytest.MonkeyPatc
     r = c.get("/ping")
     assert r.status_code == 200
     assert r.json() == {"ok": True}
+
+
+def test_content_length_lie_caught_by_streaming_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attacker (or buggy client) might declare Content-Length within
+    the cap and then send a chunked body that exceeds it. The middleware's
+    fast-path Content-Length check passes, but the streaming counter must
+    still catch the actual oversize and reject with 503. Pins that the
+    declared CL doesn't get treated as authoritative."""
+    c = _client_with_cap(monkeypatch, max_bytes=100)
+
+    def chunked_body():
+        # Far over 100 bytes when actually summed.
+        yield b"x" * 500
+
+    # Force a tiny declared Content-Length while sending a much larger
+    # chunked body. httpx normally chooses one transfer mode or the
+    # other; we force the Content-Length header explicitly. Starlette
+    # / uvicorn TestClient honor this.
+    r = c.post(
+        "/echo",
+        content=chunked_body(),
+        headers={
+            "content-type": "application/json",
+            "content-length": "10",  # the lie
+        },
+    )
+    # Either path should reject. With the explicit CL=10 < cap=100, the
+    # fast-path doesn't trip — the streaming path catches the actual
+    # 500-byte body.
+    assert r.status_code == 503
+    assert b"MAX_BODY_BYTES" in r.content
+
+
+def test_concurrent_over_cap_requests_each_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The middleware must not share state across concurrent requests.
+    Two concurrent oversized POSTs both reject; neither leaks bytes /
+    counter state into the other's request."""
+    import threading
+
+    c = _client_with_cap(monkeypatch, max_bytes=100)
+    big = {"pad": "x" * 1000}
+
+    results: dict[int, int] = {}
+
+    def post(idx: int) -> None:
+        r = c.post("/echo", json=big)
+        results[idx] = r.status_code
+
+    threads = [threading.Thread(target=post, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == {0: 503, 1: 503, 2: 503, 3: 503}
 
 
 def test_real_endpoint_default_cap_doesnt_reject_legitimate_traffic(

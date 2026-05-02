@@ -370,3 +370,48 @@ async def test_pipeline_aclose_invokes_vault_aclose() -> None:
 
     await p.aclose()
     assert aclose_called, "Pipeline.aclose() did not invoke vault.aclose()"
+
+
+async def test_pipeline_aclose_times_out_on_hung_vault(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Pipeline.aclose()` wraps each backend's `aclose` in
+    `asyncio.wait_for(timeout=_ACLOSE_TIMEOUT_S)` so a wedged Redis
+    can't hang FastAPI shutdown indefinitely. Stub a vault whose
+    `aclose` blocks forever, lower the timeout to keep the test fast,
+    and verify Pipeline.aclose returns within the budget AND logs
+    a WARNING naming the vault.
+
+    Pins the contract that a misbehaving backend produces a clean
+    timeout-and-warn at shutdown rather than a hang."""
+    import logging
+    from anonymizer_guardrail import pipeline as pipeline_mod
+
+    # Lower the budget so a real test doesn't sit for 5 seconds.
+    monkeypatch.setattr(pipeline_mod, "_ACLOSE_TIMEOUT_S", 0.1)
+
+    p = Pipeline()
+
+    class _HungVault:
+        async def put(self, call_id, mapping): pass
+
+        async def pop(self, call_id): return {}
+
+        def size(self) -> int: return 0
+
+        async def aclose(self) -> None:
+            # Block effectively forever — wait_for must cut us off.
+            await asyncio.sleep(60)
+
+    p._vault = _HungVault()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="anonymizer.pipeline"):
+        await p.aclose()  # must return cleanly, NOT hang
+
+    assert any(
+        "vault aclose timed out" in r.message.lower()
+        for r in caplog.records
+    ), (
+        "expected a WARNING naming the timed-out vault aclose; got: "
+        f"{[r.message for r in caplog.records]}"
+    )

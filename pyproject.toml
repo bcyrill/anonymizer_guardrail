@@ -28,6 +28,15 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
+    # Random test-order plugin. Pytest discovery is alphabetical by
+    # default, which is deterministic but masks test pollution that
+    # only fires under specific orderings — we hit exactly that in
+    # 2026 when a file rename shifted alphabetical order and revealed
+    # a `_COMPILED_PATTERNS` mutation that had been leaking across
+    # tests. With this plugin tests run in randomized order each
+    # invocation, so cross-test state leakage gets caught at the
+    # next CI run instead of the next refactor that touches naming.
+    "pytest-randomly>=3.15",
     # In-process Redis substitute for `RedisVault` tests. Implements
     # the redis-py asyncio interface against an in-memory store, so
     # CI doesn't need a real Redis server. Pinned major version
