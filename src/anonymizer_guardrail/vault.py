@@ -96,10 +96,10 @@ def build_vault() -> VaultBackend:
         at `VAULT_REDIS_URL`.
 
     Imports are deferred to *inside* each branch so memory-only
-    operators never pay for the `redis-py` import — the slim
-    production image stays unaffected when only the memory backend
-    is in use. MemoryVault's import is also lazy for symmetry, even
-    though it has no extra cost.
+    operators never pay for the `redis-py` import — the production
+    image stays unaffected when only the memory backend is in use.
+    MemoryVault's import is also lazy for symmetry, even though it
+    has no extra cost.
     """
     backend = config.vault_backend
     if backend == "memory":

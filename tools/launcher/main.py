@@ -134,14 +134,14 @@ def grouped_option(*args: Any, group: str = "Options", **kwargs: Any):
 # LaunchConfig; flags applied after the preset override.
 _PRESETS: dict[str, dict[str, object]] = {
     "uuid-debug": {
-        "flavour": "slim",
+        "flavour": "default",
         "detector_mode": "regex,llm",
         "log_level": "debug",
         "use_faker": False,
         "_llm_backend": "service",
     },
     "pentest": {
-        "flavour": "slim",
+        "flavour": "default",
         "detector_mode": "regex,privacy_filter,llm",
         "log_level": "debug",
         "use_faker": False,
@@ -153,7 +153,7 @@ _PRESETS: dict[str, dict[str, object]] = {
         },
     },
     "regex-only": {
-        "flavour": "slim",
+        "flavour": "default",
         "detector_mode": "regex",
         "log_level": "info",
         "use_faker": True,
@@ -250,7 +250,7 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
 @grouped_option(
     "--type", "-t", "type_",
     type=str, default=None, group=_S_REQUIRED,
-    help="Image flavour: slim (the only flavour). Reserved for future expansion.",
+    help="Image flavour. Reserved for future expansion.",
 )
 @grouped_option(
     "--detector-mode", "-d",

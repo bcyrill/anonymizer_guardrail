@@ -157,7 +157,7 @@ fi
 
 git tag -a "$new_tag" -m "$msg"
 git push "$remote" "$new_tag"
-ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create the release."
+ok "Tag ${new_tag} pushed. GitHub Actions will build the guardrail image and create the release."
 
 # ── Flavour variants ─────────────────────────────────────────────────────────
 # Three independent axes, each prompted separately so an operator can
@@ -182,7 +182,7 @@ variants=()
 
 say ""
 say "Also publish the standalone privacy-filter-service image?"
-say "(separate ghcr package; pair with the slim guardrail and PRIVACY_FILTER_URL)"
+say "(separate ghcr package; pair with the guardrail image and PRIVACY_FILTER_URL)"
 say ""
 say "  ${c_grn}1)${c_rst} no"
 say "  ${c_grn}2)${c_rst} +pf-service"
@@ -208,7 +208,7 @@ esac
 
 say ""
 say "Also publish the standalone gliner-pii-service image?"
-say "(separate ghcr package; pair with the slim guardrail and GLINER_PII_URL)"
+say "(separate ghcr package; pair with the guardrail image and GLINER_PII_URL)"
 say ""
 say "  ${c_grn}1)${c_rst} no"
 say "  ${c_grn}2)${c_rst} +gliner-service"

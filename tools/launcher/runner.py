@@ -32,11 +32,15 @@ _console = Console(stderr=True)
 
 
 # ── Per-flavour image map ─────────────────────────────────────────────────
-# Slim is the only guardrail flavour — privacy-filter and gliner-pii
-# ship as standalone services. Tag override comes from `TAG_SLIM` so
-# image_builder.sh and the launcher agree on naming.
-_FLAVOUR_TAG_DEFAULTS = {"slim": "anonymizer-guardrail:latest"}
-_FLAVOUR_TAG_ENVS = {"slim": "TAG_SLIM"}
+# `default` is the only guardrail flavour — privacy-filter and
+# gliner-pii ship as standalone services. The flavour mechanism is
+# kept (rather than reduced to a single hardcoded image) for future
+# expansion: a future GPU-bundled or alternate-runtime variant
+# would slot in here as a sibling entry. Tag override comes from
+# `TAG_DEFAULT` so image_builder.sh and the launcher agree on
+# naming.
+_FLAVOUR_TAG_DEFAULTS = {"default": "anonymizer-guardrail:latest"}
+_FLAVOUR_TAG_ENVS = {"default": "TAG_DEFAULT"}
 
 
 def resolve_image(flavour: str) -> str:
@@ -44,7 +48,9 @@ def resolve_image(flavour: str) -> str:
     `TAG_<FLAVOUR>` env wins; otherwise the bundled default."""
     env = _FLAVOUR_TAG_ENVS.get(flavour)
     if env is None:
-        raise RuntimeError(f"Unknown flavour {flavour!r}. Valid: slim.")
+        raise RuntimeError(
+            f"Unknown flavour {flavour!r}. Valid: default."
+        )
     return os.environ.get(env) or _FLAVOUR_TAG_DEFAULTS[flavour]
 
 
@@ -58,7 +64,7 @@ class LaunchConfig:
     decisions, just translation.
     """
 
-    flavour: str = "slim"
+    flavour: str = "default"
     detector_mode: str = "regex"
     log_level: str = "info"
 

@@ -7,15 +7,15 @@ whichever `DETECTOR_MODE` matches the example you want to try:
 
 ```bash
 # Regex-only (covers most examples below).
-scripts/launcher.sh -t slim -d regex --no-faker
+scripts/launcher.sh -t default -d regex --no-faker
 
 # Add the privacy-filter NER for the address / name examples.
 # The launcher auto-starts the privacy-filter-service sidecar with
 # `--privacy-filter-backend service` (the default).
-scripts/launcher.sh -t slim -d regex,privacy_filter
+scripts/launcher.sh -t default -d regex,privacy_filter
 
 # Full stack, requires LLM_API_BASE / LLM_API_KEY for the LLM examples.
-scripts/launcher.sh -t slim -d regex,privacy_filter,llm \
+scripts/launcher.sh -t default -d regex,privacy_filter,llm \
   --llm-backend external \
   --llm-api-base http://litellm:4000/v1 \
   --llm-api-key sk-litellm-master \
@@ -284,7 +284,7 @@ entries:
 Pass it via `--denylist-path`, or set `DENYLIST_PATH` directly:
 
 ```bash
-scripts/launcher.sh -t slim -d denylist,regex --denylist-path /etc/anonymizer/deny.yaml
+scripts/launcher.sh -t default -d denylist,regex --denylist-path /etc/anonymizer/deny.yaml
 ```
 
 Then a request mentioning any of the entries gets them flagged:
@@ -309,7 +309,7 @@ fast up to low thousands of entries) and `aho` (Aho-Corasick via
 
 Requires `DETECTOR_MODE` to include `privacy_filter`. The detector
 talks HTTP to a standalone `privacy-filter-service` sidecar — set
-`PRIVACY_FILTER_URL` on the slim guardrail (or pass
+`PRIVACY_FILTER_URL` on the guardrail (or pass
 `--privacy-filter-backend service` to auto-start one). See
 [docs/detectors/privacy-filter.md](detectors/privacy-filter.md) for
 image flavours (cpu / cu130, with optional baked-in weights) and

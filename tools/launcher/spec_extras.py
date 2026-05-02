@@ -1,7 +1,7 @@
 """Per-detector launcher metadata.
 
 Lives outside the main package (`src/anonymizer_guardrail/`) so the
-production wheel and the slim guardrail container don't pick up the
+production wheel and the guardrail image container don't pick up the
 launcher's deps (typer, questionary, etc.). Operators install this via
 `pip install -e ".[dev]"` from a checkout when they want the launcher.
 

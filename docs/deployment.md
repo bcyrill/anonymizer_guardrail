@@ -9,11 +9,10 @@ auto-start of both the fake-llm test backend and the privacy-filter
 inference service when the operator opts into them.
 
 ```bash
-# Build every CPU flavour: the slim guardrail image plus the
-# auxiliary services (privacy-filter-service, gliner-pii-service,
-# fake-llm). Pass -t to build a single one (e.g. -t slim, or
-# -t pf-service-cu130 for the CUDA build of the privacy-filter
-# service).
+# Build every CPU flavour: the guardrail image plus the auxiliary
+# services (privacy-filter-service, gliner-pii-service, fake-llm).
+# Pass -t to build a single one (e.g. -t default, or -t pf-service-cu130
+# for the CUDA build of the privacy-filter service).
 scripts/image_builder.sh --preset all
 
 # Interactive launcher — single-screen menuconfig-style UI, every
@@ -21,9 +20,9 @@ scripts/image_builder.sh --preset all
 scripts/launcher.sh --ui
 
 # Flag-driven launcher with bundled presets:
-scripts/launcher.sh --preset uuid-debug      # slim + regex,llm + fake-llm + LOG_LEVEL=debug
-scripts/launcher.sh --preset pentest         # slim + regex,privacy_filter,llm + pf-service + fake-llm + pentest patterns/prompt
-scripts/launcher.sh --preset regex-only      # slim + regex only — no LLM creds needed
+scripts/launcher.sh --preset uuid-debug      # guardrail + regex,llm + fake-llm + LOG_LEVEL=debug
+scripts/launcher.sh --preset pentest         # guardrail + regex,privacy_filter,llm + pf-service + fake-llm + pentest patterns/prompt
+scripts/launcher.sh --preset regex-only      # guardrail + regex only — no LLM creds needed
 
 # Exercise the curl recipes against a running guardrail
 # (or pass --preset to spin one up + tear it down):
@@ -70,7 +69,7 @@ and [GLiNER-PII detector](detectors/gliner-pii.md).
 
 The repo builds three artifacts: the **guardrail** itself, the
 standalone **privacy-filter-service** and **gliner-pii-service**
-(paired with the slim guardrail when you don't want torch in the API
+(paired with the guardrail image when you don't want torch in the API
 container), and the **fake-llm** test backend.
 `scripts/image_builder.sh` knows about every flavour listed below. The
 *published as* column shows the GHCR tag CI ships; flavours marked
@@ -80,7 +79,7 @@ for the rationale.
 
 ### Guardrail (`anonymizer-guardrail`)
 
-One slim image — no ML deps. Privacy-filter and gliner-pii ship as
+One image — no ML deps. Privacy-filter and gliner-pii ship as
 standalone services; the guardrail talks to them over HTTP via
 `PRIVACY_FILTER_URL` / `GLINER_PII_URL`. See
 [Privacy-filter detector](detectors/privacy-filter.md) for the
@@ -88,13 +87,13 @@ service-side image flavours and their device knobs.
 
 | flavour | size | published as | what's in it |
 |---|---|---|---|
-| `slim` | ~200 MB | `:vX.Y.Z` | regex / denylist / LLM detectors in-process; remote clients for privacy_filter / gliner_pii. |
+| `default` | ~200 MB | `:vX.Y.Z` | regex / denylist / LLM detectors in-process; remote clients for privacy_filter / gliner_pii. Bundles `denylist-aho` (Aho-Corasick) and `vault-redis` (redis-py) so operators flip `DENYLIST_BACKEND=aho` / `VAULT_BACKEND=redis` without rebuilding. |
 
 ### Privacy-filter-service (`privacy-filter-service`) — opf-only variant
 
 Default privacy-filter sidecar. Standalone HTTP wrapper around
 opf's full inference stack (forward + constrained-Viterbi decode)
-for the openai/privacy-filter model. Pair with the slim guardrail
+for the openai/privacy-filter model. Pair with the guardrail image
 and auto-started by `scripts/launcher.sh` when `DETECTOR_MODE`
 includes `privacy_filter`. Each variant gets an explicit tag suffix
 (no implicit default) so a typoed pull fails loud rather than
@@ -185,7 +184,7 @@ CI publishes the variants most operators pull. The local-only set is:
 ## Building manually
 
 `scripts/image_builder.sh` is the recommended path; the equivalent raw
-command for the slim guardrail is:
+command for the guardrail image is:
 
 ```bash
 podman build --format=docker -t anonymizer-guardrail:latest -f Containerfile .
@@ -205,7 +204,7 @@ adds it conditionally).
 
 ## Running manually
 
-The slim guardrail runs without any volume:
+The guardrail runs without any volume:
 
 ```bash
 podman run --rm -p 8000:8000 \

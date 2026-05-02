@@ -11,7 +11,7 @@ retraining.
 
 There is intentionally no in-process variant today. Pulling the gliner
 library + ~570M weights into the guardrail image would defeat the
-point of having a slim guardrail; deploy the inference container
+ML-deps-in-sidecars architecture; deploy the inference container
 separately and point this detector at it via GLINER_PII_URL.
 
 Behaviour mirrors RemotePrivacyFilterDetector:
@@ -432,7 +432,7 @@ def _gliner_pii_factory() -> Detector:
     """Construct the gliner-pii detector, requiring GLINER_PII_URL.
 
     Unlike privacy_filter, there is no in-process fallback — the
-    gliner library + ~570M weights would defeat the slim guardrail.
+    gliner library + ~570M weights would defeat the guardrail image.
     An empty URL therefore raises at construction time so an operator
     who set DETECTOR_MODE=...,gliner_pii without setting GLINER_PII_URL
     sees a clear error at boot rather than the request-time confusion

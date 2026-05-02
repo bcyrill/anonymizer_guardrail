@@ -3,7 +3,7 @@
 #
 # CLI mode (default):
 #   scripts/image_builder.sh --preset minimal
-#   scripts/image_builder.sh -f slim -f pf-service
+#   scripts/image_builder.sh -f default -f pf-service
 #   scripts/image_builder.sh --preset all -- --no-cache
 #
 # Interactive Textual menu (preset radio + checkbox grid):
@@ -16,7 +16,7 @@
 # The mode switch lives in tools.image_builder (Click eager callback
 # on --ui / --interactive); this script just forwards argv. The
 # builder itself lives at tools/image_builder/ — outside the production
-# wheel — so adding it didn't grow the slim image.
+# wheel — so adding it didn't grow the production image.
 
 set -uo pipefail
 

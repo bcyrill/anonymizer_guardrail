@@ -7,7 +7,7 @@
 # skipped when the running guardrail's DETECTOR_MODE doesn't include
 # the relevant detector.
 #
-# Default preset is `uuid-debug` (slim + regex,llm + fake-llm,
+# Default preset is `uuid-debug` (default flavour + regex,llm + fake-llm,
 # USE_FAKER=false at startup). The override tests then flip these
 # per call to verify each path.
 #
@@ -418,7 +418,7 @@ fi
 say ""
 say "${c_bld}7. regex_overlap_strategy override${c_rst}"
 if $has_regex; then
-  # On the slim image with the bundled default YAML, regex_pentest's
+  # On the default image with the bundled default YAML, regex_pentest's
   # \d{12} pattern isn't present, so this test only meaningfully
   # demonstrates that the override is plumbed and accepted. We still
   # verify both values come back as INTERVENED.

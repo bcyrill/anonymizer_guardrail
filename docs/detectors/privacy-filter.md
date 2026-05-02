@@ -10,7 +10,7 @@ IP/MAC, etc.) — a *complement* to, not a replacement for, the LLM
 detector.
 
 The detector is HTTP-only: the guardrail talks to a standalone
-sidecar over HTTP. The slim guardrail image carries no ML deps —
+sidecar over HTTP. The guardrail image carries no ML deps —
 torch, [`opf`](https://github.com/openai/privacy-filter) (OpenAI's
 own inference wrapper for this model), and the model weights all
 live in the sidecar.

@@ -78,7 +78,7 @@ _GROUP_ORDER: tuple[tuple[str, str], ...] = (
 _CUSTOM_PRESET = "custom"
 
 # Default preset on first open. Matches the recommended development
-# setup (slim guardrail + CPU runtime-download services). Operators
+# setup (guardrail image + CPU runtime-download services). Operators
 # almost always want this for local iteration.
 _DEFAULT_PRESET = "minimal"
 

@@ -14,16 +14,16 @@ round-trip — in-memory by default; Redis-backed when running multi-replica
 ## Quick start
 
 ```bash
-# Build all images (slim guardrail + privacy-filter-service + fake-llm).
+# Build all images (guardrail + privacy-filter-service + fake-llm).
 scripts/image_builder.sh --preset all
 
 # Interactive launcher.
 scripts/launcher.sh --ui
 
 # Or flag-driven with a preset:
-scripts/launcher.sh --preset uuid-debug      # slim + regex,llm + fake-llm
-scripts/launcher.sh --preset pentest         # slim + regex,privacy_filter,llm + pf-service + fake-llm + pentest config
-scripts/launcher.sh --preset regex-only      # slim + regex only — no LLM creds needed
+scripts/launcher.sh --preset uuid-debug      # guardrail + regex,llm + fake-llm
+scripts/launcher.sh --preset pentest         # guardrail + regex,privacy_filter,llm + pf-service + fake-llm + pentest config
+scripts/launcher.sh --preset regex-only      # guardrail + regex only — no LLM creds needed
 ```
 
 For LiteLLM wiring, see [docs/litellm-integration.md](docs/litellm-integration.md).

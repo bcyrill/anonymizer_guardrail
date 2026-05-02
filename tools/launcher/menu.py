@@ -504,7 +504,7 @@ class LauncherApp(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self.cfg = LaunchConfig(flavour="slim", detector_mode="regex")
+        self.cfg = LaunchConfig(flavour="default", detector_mode="regex")
         self._launch_requested = False
 
     # ── Compose ───────────────────────────────────────────────────────────
@@ -697,7 +697,7 @@ class LauncherApp(App):
         if key == "flavour":
             self._pick(
                 "Image flavour",
-                [("slim", "slim (the only flavour — privacy-filter ships as a sidecar)")],
+                [("default", "default")],
                 cfg.flavour,
                 self._set_flavour,
             )
@@ -1008,10 +1008,10 @@ def _validate(cfg: LaunchConfig) -> tuple[bool, str]:
             "DETECTOR_MODE includes 'llm' but no backend is set. "
             "Open 'LLM backend' and pick service or external."
         )
-    if "privacy_filter" in detectors and cfg.flavour == "slim" \
+    if "privacy_filter" in detectors and cfg.flavour == "default" \
             and not cfg.backends.get("privacy_filter"):
         return False, (
-            "Privacy-filter on slim needs a remote backend. "
+            "Privacy-filter needs a remote backend. "
             "Open 'PF backend' and pick service or external."
         )
     if "gliner_pii" in detectors and not cfg.backends.get("gliner_pii"):

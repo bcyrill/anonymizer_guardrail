@@ -71,15 +71,18 @@ def _resolve_default_tag(env_name: str, fallback: str) -> str:
 def _build_catalog() -> tuple[Flavour, ...]:
     return (
         # ── Guardrail (one Containerfile, no build-args) ───────────────
-        # Slim is the only guardrail flavour. Privacy-filter and
-        # gliner-pii ship as standalone services.
+        # `default` is the only guardrail flavour. Privacy-filter and
+        # gliner-pii ship as standalone services. The flavour
+        # mechanism is kept (rather than reduced to a single hardcoded
+        # name) for future expansion — a future GPU-bundled or
+        # alternate-runtime variant slots in here.
         Flavour(
-            name="slim",
+            name="default",
             group=GROUP_GUARDRAIL,
-            label="slim",
+            label="default",
             containerfile="Containerfile",
             context=".",
-            default_tag=_resolve_default_tag("TAG_SLIM", "anonymizer-guardrail:latest"),
+            default_tag=_resolve_default_tag("TAG_DEFAULT", "anonymizer-guardrail:latest"),
         ),
         # ── Privacy-filter standalone service ───────────────────────────
         Flavour(
@@ -229,18 +232,18 @@ def flavours_in_group(group: str) -> tuple[Flavour, ...]:
 # and the menu's preset radio. Keys must be lower-case, no spaces.
 #
 # `all` covers every flavour including baked + CUDA. The "minimal"
-# pair is the recommended development setup (slim guardrail plus the
-# CPU runtime-download services). Per-service presets bundle every
-# variant of one image for operators rebuilding a single component
-# across CPU/CUDA/baked combos.
+# pair is the recommended development setup (the guardrail image
+# plus the CPU runtime-download services). Per-service presets
+# bundle every variant of one image for operators rebuilding a
+# single component across CPU/CUDA/baked combos.
 PRESETS: dict[str, tuple[str, ...]] = {
     "all": tuple(f.name for f in FLAVOURS),
     "guardrail": tuple(f.name for f in flavours_in_group(GROUP_GUARDRAIL)),
     "privacy-filter": tuple(f.name for f in flavours_in_group(GROUP_PF)),
     "privacy-filter-hf": tuple(f.name for f in flavours_in_group(GROUP_PF_HF)),
     "gliner-pii": tuple(f.name for f in flavours_in_group(GROUP_GLINER)),
-    "minimal": ("slim", "pf-service", "gliner-service"),
-    "minimal-fakellm": ("slim", "pf-service", "gliner-service", "fake-llm"),
+    "minimal": ("default", "pf-service", "gliner-service"),
+    "minimal-fakellm": ("default", "pf-service", "gliner-service", "fake-llm"),
 }
 
 

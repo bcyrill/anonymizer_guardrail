@@ -56,9 +56,11 @@ denylist-aho = [
     "pyahocorasick>=2.0",
 ]
 # Redis-backed vault for multi-replica deployments. Default backend
-# stays the in-memory `MemoryVault` (zero deps); install this extra
-# when setting `VAULT_BACKEND=redis`. The slim production image
-# stays unaffected when operators don't need Redis.
+# stays the in-memory `MemoryVault` (zero deps); operators install
+# this extra when setting `VAULT_BACKEND=redis`. Bundled into the
+# default container image (see Containerfile) so operators flipping
+# the env var don't need to rebuild — direct-pip-install users can
+# still opt out by skipping the extra.
 vault-redis = [
     "redis>=5.0",
 ]

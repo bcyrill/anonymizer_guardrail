@@ -52,7 +52,7 @@ detector tuning without restarting:
 
 ```bash
 # Terminal 1 — running guardrail with your preferred config
-scripts/launcher.sh -t slim --detector-mode regex,denylist,privacy_filter --privacy-filter-backend service
+scripts/launcher.sh -t default --detector-mode regex,denylist,privacy_filter --privacy-filter-backend service
 
 # Terminal 2 — score it
 scripts/detector_bench.sh --config bundled:pentest
@@ -75,7 +75,7 @@ scripts/detector_bench.sh --config bundled:pentest --preset regex-only
 Each preset bundles a coherent `--type` / `--detector-mode` /
 backend choice — see the `_PRESETS` table in
 `tools/launcher/main.py`. To benchmark a configuration that doesn't
-match any preset (e.g. just `regex,denylist` on the slim image), use
+match any preset (e.g. just `regex,denylist`), use
 the manual approach above.
 
 The corpus's `overrides:` block layers
@@ -92,7 +92,7 @@ compare and pass `--compare`:
 
 ```bash
 # Terminal 1 — guardrail with everything switched on
-scripts/launcher.sh -t slim --detector-mode regex,denylist,privacy_filter,llm \
+scripts/launcher.sh -t default --detector-mode regex,denylist,privacy_filter,llm \
     --privacy-filter-backend service --llm-backend service
 
 # Terminal 2 — score each detector individually + the full mix
@@ -157,7 +157,7 @@ detector wired in, then run `--compare` on the bundled pentest corpus.
 
 # 2. Start the guardrail with everything switched on. Worth knowing
 #    which flag does what:
-#      -t slim                       slim API container; ML deps live in sidecars.
+#      -t default                       API container; ML deps live in sidecars.
 #      -d ...                        every detector enabled.
 #      --*-backend service           auto-start each sidecar (pf, gliner, fake-llm).
 #      --regex-patterns bundled:...  pentest pattern set (cloud creds, hashes, …).
@@ -169,7 +169,7 @@ detector wired in, then run `--compare` on the bundled pentest corpus.
 #      --rules ...                   deterministic fake-LLM responses for the
 #                                    benchmark (correct calls, mistypings,
 #                                    hallucinations, malformed output).
-./scripts/launcher.sh -t slim -d regex,denylist,privacy_filter,gliner_pii,llm \
+./scripts/launcher.sh -t default -d regex,denylist,privacy_filter,gliner_pii,llm \
     --privacy-filter-backend service \
     --gliner-pii-backend service \
     --llm-backend service \

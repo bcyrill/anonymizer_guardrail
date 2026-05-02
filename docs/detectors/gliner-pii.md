@@ -18,7 +18,7 @@ build via `scripts/image_builder.sh -f gliner-service-baked`.
 
 **Remote only.** No in-process variant ships. The model is heavy
 (~570 MB weights + the `gliner` library + torch) and the production
-deployment shape we want — slim guardrail + a sharable inference
+deployment shape we want — guardrail + a sharable inference
 service on a GPU node — doesn't benefit from an in-process option.
 Setting `gliner_pii` in `DETECTOR_MODE` without `GLINER_PII_URL`
 crashes loud at boot.

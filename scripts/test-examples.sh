@@ -10,7 +10,7 @@
 #
 # Tests whose required detection layer isn't in the running guardrail's
 # DETECTOR_MODE are skipped (not failed) so this script can run against
-# slim/regex-only setups too.
+# regex-only / partial-stack setups too.
 #
 # Two modes:
 #   default            connect to $BASE_URL (caller manages the guardrail).

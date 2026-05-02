@@ -96,7 +96,7 @@ class RedisVault:
         # doesn't require redis-py — operators on the memory backend
         # never construct a RedisVault and shouldn't pay for the
         # dep. Hoisting this import to module top would defeat the
-        # slim-image goal: the package itself remains importable
+        # production-image size goal: the package itself remains importable
         # without `[vault-redis]` even when `from
         # anonymizer_guardrail.vault_redis import RedisVaultError`
         # happens elsewhere (the error class doesn't need redis).

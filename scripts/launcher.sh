@@ -2,7 +2,7 @@
 # Thin wrapper that execs into the Python launcher.
 #
 # CLI mode (default):
-#   scripts/launcher.sh -t slim -d regex,llm --llm-backend service
+#   scripts/launcher.sh -t default -d regex,llm --llm-backend service
 #
 # Interactive Textual menu:
 #   scripts/launcher.sh --ui
@@ -11,7 +11,7 @@
 # The mode switch lives in tools.launcher (Click eager callback on
 # --ui / --interactive); this script just forwards argv. The launcher
 # itself lives at tools/launcher/ — outside the production wheel —
-# so adding it didn't grow the slim image.
+# so adding it didn't grow the production image.
 
 set -uo pipefail
 

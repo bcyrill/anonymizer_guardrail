@@ -49,7 +49,7 @@ shipped in the wheel; one bash wrapper, two interlocking modes
 
 The catalog of build targets lives in
 `tools/image_builder/specs.py` as `FLAVOURS` (one `Flavour` per
-buildable image — slim guardrail, the privacy-filter and gliner-pii
+buildable image — guardrail, the privacy-filter and gliner-pii
 sidecars across CPU/CUDA/baked variants, the fake-llm companion) and
 `PRESETS` (named subsets — `all`, `guardrail`, `privacy-filter`,
 `gliner-pii`, `minimal`, `minimal-fakellm`). Adding an image flavour
