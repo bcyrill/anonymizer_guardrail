@@ -33,10 +33,17 @@ import atexit
 import os
 import time
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 
 from .engine import Engine
+
+if TYPE_CHECKING:
+    # Type-only import — runtime would create a cycle (runner.py
+    # imports services.py). The helper below takes a LaunchConfig
+    # by reference, so the forward reference is enough.
+    from .runner import LaunchConfig
 from .spec_extras import (
     LAUNCHER_METADATA,
     SHARED_NETWORK,
@@ -327,6 +334,50 @@ def _print_dead_container_diagnostics(engine: Engine, service: ServiceSpec) -> N
     )
 
 
+def auto_start_services(
+    engine: Engine,
+    cfg: "LaunchConfig",
+    *,
+    extra_volumes: dict[str, list[tuple[str, str]]] | None = None,
+) -> list[str]:
+    """Iterate `cfg.backends` and start every detector with
+    `backend="service"`. Returns the list of started detector names so
+    the caller can pass it to `register_atexit_cleanup`.
+
+    Honours `cfg.service_variants` for variant resolution (e.g.
+    `privacy_filter` → `hf` picks `privacy-filter-hf-service`). Forwards
+    `cfg.log_level`. Optional `extra_volumes` lets the caller mount
+    additional bind volumes per detector — used by the CLI for
+    `--rules` on the auto-started fake-llm; the TUI doesn't expose
+    that knob today and passes None.
+
+    Replaces the pre-existing duplicated loop in `main.py` (CLI) and
+    `menu.py` (TUI). The two had drifted — the TUI was silently
+    dropping `cfg.service_variants` so the menu's variant picker
+    became a no-op. Centralising the loop here makes that class of
+    drift impossible: any future per-detector start-time concern
+    (e.g. extra env, GPU policy) lives in one place.
+
+    `SystemExit` from a failed health-check inside `start_service`
+    propagates. The CLI lets Click handle it; the TUI catches it
+    around the call so it can return a clean exit code from
+    `run_interactive`.
+    """
+    extra_volumes = extra_volumes or {}
+    started: list[str] = []
+    for det_name, backend in cfg.backends.items():
+        if backend != "service":
+            continue
+        start_service(
+            engine, det_name,
+            log_level=cfg.log_level,
+            extra_volumes=extra_volumes.get(det_name) or None,
+            variant=cfg.service_variants.get(det_name) or None,
+        )
+        started.append(det_name)
+    return started
+
+
 def cleanup_service(engine: Engine, name: str) -> None:
     """Stop and remove the service container if WE started it. No-op
     otherwise.
@@ -369,6 +420,7 @@ def started_services() -> set[str]:
 
 
 __all__ = [
+    "auto_start_services",
     "start_service",
     "cleanup_service",
     "register_atexit_cleanup",

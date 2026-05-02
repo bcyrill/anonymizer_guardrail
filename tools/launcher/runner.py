@@ -22,7 +22,11 @@ from rich.table import Table
 
 from .engine import Engine
 from .services import started_services
-from .spec_extras import LAUNCHER_METADATA, CONTAINER_NAME_DEFAULT
+from .spec_extras import (
+    CONTAINER_NAME_DEFAULT,
+    CROSS_CUTTING_GUARDRAIL_ENV_PASSTHROUGHS,
+    LAUNCHER_METADATA,
+)
 
 
 # stderr console so plan/status output doesn't interleave with the
@@ -168,6 +172,25 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
                             break
                 else:
                     env_args.extend(["-e", f"{k}={v}"])
+
+    # Cross-cutting env vars (vault state, cache redis URL/salt,
+    # body-size cap) — same forwarding shape as the per-detector
+    # passthroughs above, just for vars that don't belong to one
+    # specific detector. The list lives in spec_extras so a future
+    # cross-cutting knob has a single place to land. Only emitted
+    # when the operator set a non-empty value, keeping the env clean
+    # at default settings.
+    already_set_keys = {
+        env_args[i + 1].split("=", 1)[0]
+        for i in range(0, len(env_args), 2)
+        if i + 1 < len(env_args) and env_args[i] == "-e"
+    }
+    for var in CROSS_CUTTING_GUARDRAIL_ENV_PASSTHROUGHS:
+        if var in already_set_keys:
+            continue  # detector-specific override took precedence
+        val = cfg.env_overrides.get(var) or os.environ.get(var, "")
+        if val:
+            env_args.extend(["-e", f"{var}={val}"])
 
     # Faker / locale knobs live on the central Config, not per-detector.
     if not cfg.use_faker:

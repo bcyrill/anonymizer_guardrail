@@ -1,0 +1,49 @@
+# Bundled launcher presets — applied via `./scripts/launcher.sh --preset NAME`
+# or selected from the TUI's preset radio.
+#
+# Schema: see `tools/launcher/preset_loader.py:LauncherPreset`. Each preset
+# partially populates a LaunchConfig; explicit CLI flags override.
+#
+# Operators can extend or replace this set by pointing
+# `LAUNCHER_PRESETS_FILE` (or `--presets-file PATH`) at their own YAML.
+# Operator entries with names that collide with bundled ones replace
+# the bundled entry; new names are appended.
+#
+# Field reference (all optional except where the validator requires them):
+#   flavour          Image flavour. Default: "default".
+#   detector_mode    Comma-separated detector list (regex, denylist,
+#                    privacy_filter, gliner_pii, llm). Required.
+#   log_level        debug | info | warning | error. Default: "info".
+#   use_faker        true → Faker surrogates; false → opaque tokens.
+#   llm_backend      "service" → auto-start fake-llm; "external" →
+#                    operator-supplied LLM_API_BASE; omit → no LLM.
+#   pf_backend       Same shape, for privacy_filter.
+#   gliner_backend   Same shape, for gliner_pii.
+#   env_overrides    Map of env-var name → value, merged into the
+#                    guardrail's environment after preset apply but
+#                    before per-flag overrides.
+
+presets:
+  uuid-debug:
+    flavour: default
+    detector_mode: regex,llm
+    log_level: debug
+    use_faker: false
+    llm_backend: service
+
+  pentest:
+    flavour: default
+    detector_mode: regex,privacy_filter,llm
+    log_level: debug
+    use_faker: false
+    llm_backend: service
+    pf_backend: service
+    env_overrides:
+      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml
+      LLM_SYSTEM_PROMPT_PATH: bundled:llm_pentest.md
+
+  regex-only:
+    flavour: default
+    detector_mode: regex
+    log_level: info
+    use_faker: true

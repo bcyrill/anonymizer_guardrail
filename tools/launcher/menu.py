@@ -35,6 +35,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -55,7 +56,7 @@ Separator = lambda: None  # noqa: E731 — intentional sentinel-as-callable
 
 from .engine import detect_engine
 from .runner import LaunchConfig, run_guardrail
-from .services import register_atexit_cleanup, start_service
+from .services import auto_start_services, register_atexit_cleanup
 from .spec_extras import LAUNCHER_METADATA
 
 
@@ -220,7 +221,9 @@ class DetectorOrderScreen(ModalScreen[list[str] | None]):
         Binding("space", "toggle", "Toggle"),
         Binding("ctrl+up", "move_up", "Move ↑"),
         Binding("ctrl+down", "move_down", "Move ↓"),
-        Binding("enter", "ok", "OK", show=False),
+        # Enter on a list row toggles (handled via OptionSelected
+        # below); Enter on the OK button confirms (Textual's default
+        # button activation). To confirm by keyboard, Tab to OK.
     ]
 
     DEFAULT_CSS = """
@@ -270,8 +273,9 @@ class DetectorOrderScreen(ModalScreen[list[str] | None]):
         with Container():
             yield Label("Enabled detectors", classes="title")
             yield Label(
-                "Space toggles, Ctrl+↑/↓ moves, Enter confirms. Order = "
-                "type-resolution priority (first-listed wins on duplicate matches).",
+                "Click or Space toggles, Ctrl+↑/↓ moves, OK confirms. "
+                "Order = type-resolution priority (first-listed wins on "
+                "duplicate matches).",
                 classes="hint",
             )
             yield OptionList(*self._render_items(), id="order_list")
@@ -301,7 +305,10 @@ class DetectorOrderScreen(ModalScreen[list[str] | None]):
     def _refresh(self, focus_index: int | None = None) -> None:
         """Rebuild the OptionList in place. Preserves the highlight
         position so toggling/moving feels continuous — without this
-        the highlight would snap back to the top after every change."""
+        the highlight would snap back to the top after every change.
+
+        Also reconciles the OK button's disabled state with the current
+        enable mask — see `_update_ok_button_state` for why."""
         ol = self.query_one("#order_list", OptionList)
         if focus_index is None:
             focus_index = ol.highlighted if ol.highlighted is not None else 0
@@ -309,6 +316,37 @@ class DetectorOrderScreen(ModalScreen[list[str] | None]):
         ol.add_options(self._render_items())
         if 0 <= focus_index < len(self._items):
             ol.highlighted = focus_index
+        self._update_ok_button_state()
+
+    def _update_ok_button_state(self) -> None:
+        """Disable the OK button when no detectors are enabled. An
+        empty selection would render a detectors section with zero
+        rows on the main menu, which is operator confusion (silent
+        no-op of "I picked OK after deselecting everything"). Better
+        UX: surface the constraint visually — the button greys out and
+        clicks/Enter on it become inert. Operators who genuinely want
+        to back out without changes use Esc / Cancel.
+
+        Belt-and-suspenders: `action_ok` still guards against an empty
+        selection at dismiss time, so any future code path that
+        bypasses the button (a different binding, programmatic dismiss)
+        can't slip through."""
+        try:
+            ok = self.query_one("#ok", Button)
+        except NoMatches:
+            # First call from compose() can fire before #ok mounts;
+            # the next _refresh after compose runs (e.g. on first
+            # toggle) re-syncs the state.
+            return
+        ok.disabled = not any(self._enabled.values())
+
+    def on_mount(self) -> None:
+        """Set the initial OK button state. The DetectorOrderScreen is
+        always opened with at least one detector currently enabled
+        (the main menu's "Edit detector list" entry only appears when
+        cfg.detector_mode is non-empty), so this is normally a no-op
+        — but it's the right hook for the inverse case too."""
+        self._update_ok_button_state()
 
     # ── Actions ───────────────────────────────────────────────────────────
     def _highlighted_index(self) -> int | None:
@@ -353,14 +391,29 @@ class DetectorOrderScreen(ModalScreen[list[str] | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
-    # OptionList consumes Enter to fire OptionSelected, which would
-    # otherwise short-circuit our `enter` binding. Dispatch it to
-    # `action_ok` so Enter behaves as the help text says (confirm),
-    # not toggle. Toggle stays Space-only.
+    # OptionList fires `OptionSelected` for BOTH keyboard Enter AND
+    # mouse clicks — there's no built-in way to distinguish them
+    # inside the handler. Treating both as "confirm + close" (the old
+    # behaviour) made clicks instantly dismiss the modal: clicking a
+    # detector to enable it slammed the dialog shut on the operator,
+    # an obvious bug for a multi-select picker.
+    #
+    # Resolution: treat both click-on-row and Enter-on-row as TOGGLE
+    # — matching the visual `[x]` checkbox metaphor and consistent
+    # with Space. Confirm moves to the OK button (Tab to focus + Enter,
+    # or click). Same UX shape every other multi-select dialog uses.
     @on(OptionList.OptionSelected)
     def _on_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
-        self.action_ok()
+        if not (event.option.id and event.option.id.startswith("det:")):
+            return
+        det = event.option.id.removeprefix("det:")
+        try:
+            idx = self._items.index(det)
+        except ValueError:
+            return
+        self._enabled[det] = not self._enabled[det]
+        self._refresh(focus_index=idx)
 
     @on(Button.Pressed, "#ok")
     def _ok_button(self) -> None:
@@ -1032,14 +1085,15 @@ def run_interactive() -> int:
     cfg = app.cfg
     engine = detect_engine()
 
-    auto_started: list[str] = []
-    for det_name, backend in cfg.backends.items():
-        if backend == "service":
-            try:
-                start_service(engine, det_name, log_level=cfg.log_level)
-                auto_started.append(det_name)
-            except SystemExit as exc:
-                return int(exc.code) if isinstance(exc.code, int) else 1
+    try:
+        # Single-source-of-truth for the auto-start loop, including
+        # per-detector variant resolution (`cfg.service_variants`).
+        # Same helper the CLI uses — see services.auto_start_services
+        # for the rationale (the previous duplicated loop here had
+        # silently dropped the variant kwarg).
+        auto_started = auto_start_services(engine, cfg)
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 1
     if auto_started:
         register_atexit_cleanup(engine, auto_started)
 

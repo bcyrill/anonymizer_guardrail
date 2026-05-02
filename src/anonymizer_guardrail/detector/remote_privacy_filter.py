@@ -544,6 +544,10 @@ LAUNCHER_SPEC = LauncherSpec(
         "PRIVACY_FILTER_TIMEOUT_S",
         "PRIVACY_FILTER_FAIL_CLOSED",
         "PRIVACY_FILTER_MAX_CONCURRENCY",
+        "PRIVACY_FILTER_INPUT_MODE",
+        "PRIVACY_FILTER_CACHE_MAX_SIZE",
+        "PRIVACY_FILTER_CACHE_BACKEND",
+        "PRIVACY_FILTER_CACHE_TTL_S",
     ],
     service=ServiceSpec(
         container_name="privacy-filter-service",

@@ -40,6 +40,60 @@ container in the foreground. Auto-startable services (fake-llm,
 privacy-filter-service, gliner-pii-service) are started before the
 guardrail and torn down via `atexit`.
 
+### Presets (`--preset NAME`)
+
+Presets are pre-canned `LaunchConfig` partials that set image
+flavour, detector mode, log level, surrogate mode, per-detector
+backend choices, and any env-var overrides. Bundled defaults ship
+in `tools/launcher/presets/default.yaml`; print the merged set with
+`./scripts/launcher.sh --show-presets` to see exactly what each
+preset applies.
+
+Operators can extend or replace the bundled set via either:
+
+- `--presets-file PATH` — CLI flag, takes precedence.
+- `LAUNCHER_PRESETS_FILE=PATH` — env var, lower priority.
+
+The operator file uses the same schema as the bundled YAML (see
+`tools/launcher/preset_loader.py:LauncherPreset`). Operator entries
+with names matching a bundled preset *replace* the bundled entry
+verbatim (no per-field merging — the alternative invites
+"why didn't my override take effect?" debugging traps). New names
+are appended.
+
+```yaml
+# ~/anonymizer-presets.yaml
+presets:
+  # Replace the bundled "regex-only" with stricter logging.
+  regex-only:
+    detector_mode: regex
+    log_level: debug
+    use_faker: false
+
+  # Add a new "compliance" preset for org-internal scans.
+  compliance:
+    detector_mode: regex,denylist,privacy_filter
+    log_level: warning
+    use_faker: true
+    pf_backend: service
+    env_overrides:
+      DENYLIST_PATH: /etc/anon/compliance-deny.yaml
+```
+
+```bash
+# Inspect the merged set.
+./scripts/launcher.sh --presets-file ~/anonymizer-presets.yaml --show-presets
+
+# Or via env var, then run normally.
+export LAUNCHER_PRESETS_FILE=~/anonymizer-presets.yaml
+./scripts/launcher.sh --preset compliance
+```
+
+The schema rejects unknown fields (`extra="forbid"`) so a typo'd
+key fails loud at YAML load with a Pydantic-formatted error rather
+than silently doing nothing. Missing file paths are also fail-loud —
+operators get a Click error pointing at the offending flag.
+
 ## The image builder
 
 `scripts/image_builder.sh` execs into `python -m tools.image_builder`.

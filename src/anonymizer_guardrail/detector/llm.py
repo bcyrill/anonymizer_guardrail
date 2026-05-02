@@ -484,6 +484,10 @@ LAUNCHER_SPEC = LauncherSpec(
         "LLM_MAX_CHARS",
         "LLM_MAX_CONCURRENCY",
         "LLM_FAIL_CLOSED",
+        "LLM_INPUT_MODE",
+        "LLM_CACHE_MAX_SIZE",
+        "LLM_CACHE_BACKEND",
+        "LLM_CACHE_TTL_S",
     ],
     service=ServiceSpec(
         container_name="fake-llm",

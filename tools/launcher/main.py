@@ -37,8 +37,7 @@ except ImportError as exc:
 
 from .engine import detect_engine
 from .runner import LaunchConfig, run_guardrail
-from .services import register_atexit_cleanup, start_service
-from .spec_extras import LAUNCHER_METADATA
+from .services import auto_start_services, register_atexit_cleanup
 
 
 # ── Section-grouped help formatting ──────────────────────────────────────
@@ -130,55 +129,179 @@ def grouped_option(*args: Any, group: str = "Options", **kwargs: Any):
 
 
 # ── Presets ────────────────────────────────────────────────────────────────
-# Mirror the bash --preset values. Each preset partially populates a
-# LaunchConfig; flags applied after the preset override.
-_PRESETS: dict[str, dict[str, object]] = {
-    "uuid-debug": {
-        "flavour": "default",
-        "detector_mode": "regex,llm",
-        "log_level": "debug",
-        "use_faker": False,
-        "_llm_backend": "service",
-    },
-    "pentest": {
-        "flavour": "default",
-        "detector_mode": "regex,privacy_filter,llm",
-        "log_level": "debug",
-        "use_faker": False,
-        "_llm_backend": "service",
-        "_pf_backend": "service",
-        "_env_overrides": {
-            "REGEX_PATTERNS_PATH": "bundled:regex_pentest.yaml",
-            "LLM_SYSTEM_PROMPT_PATH": "bundled:llm_pentest.md",
-        },
-    },
-    "regex-only": {
-        "flavour": "default",
-        "detector_mode": "regex",
-        "log_level": "info",
-        "use_faker": True,
-    },
-}
+# Definitions live in `tools/launcher/presets/default.yaml` (bundled)
+# plus an optional operator file via `--presets-file PATH` or
+# `LAUNCHER_PRESETS_FILE`. See `preset_loader.py` for the schema and
+# resolution order.
+
+from .preset_loader import (
+    LoadedPreset,
+    load_presets,
+    set_operator_presets_file,
+)
 
 
 def _apply_preset(cfg: LaunchConfig, preset: str) -> dict[str, str | None]:
     """Apply a named preset to `cfg` in-place. Returns a dict of the
-    preset's backend choices (`llm`, `privacy_filter`, …) so the caller
-    can wire auto-start. Keys are detector names; values are backend
-    strings or None."""
-    if preset not in _PRESETS:
-        valid = ", ".join(_PRESETS)
+    preset's backend choices (`llm`, `privacy_filter`, `gliner_pii`)
+    so the caller can wire auto-start. Keys are detector names;
+    values are backend strings or None."""
+    try:
+        presets = load_presets()
+    except RuntimeError as exc:
+        # Operator file schema / parse error. Click-format it the
+        # same way `_show_presets` does so the surface stays uniform
+        # across both reading paths.
+        raise click.UsageError(str(exc)) from exc
+    if preset not in presets:
+        valid = ", ".join(presets)
         raise click.BadParameter(f"Unknown preset {preset!r}. Valid: {valid}")
-    p = _PRESETS[preset]
-    for k, v in p.items():
-        if k.startswith("_"):
-            continue
-        setattr(cfg, k, v)
-    cfg.env_overrides.update(p.get("_env_overrides", {}))  # type: ignore[arg-type]
+    spec = presets[preset].spec
+    cfg.flavour = spec.flavour
+    cfg.detector_mode = spec.detector_mode
+    cfg.log_level = spec.log_level
+    cfg.use_faker = spec.use_faker
+    cfg.env_overrides.update(spec.env_overrides)
     return {
-        "llm": p.get("_llm_backend"),  # type: ignore[arg-type]
-        "privacy_filter": p.get("_pf_backend"),  # type: ignore[arg-type]
+        "llm": spec.llm_backend or None,
+        "privacy_filter": spec.pf_backend or None,
+        "gliner_pii": spec.gliner_backend or None,
     }
+
+
+def _render_presets_table() -> "Table":
+    """Build a rich Table comparing every loaded preset side by side.
+    Used by `--show-presets`. One column per preset, one row per
+    knob — easier to scan "how do these differ?" than per-preset blocks.
+
+    A "Source" row indicates whether each column was loaded from the
+    bundled YAML or from the operator's `LAUNCHER_PRESETS_FILE`. Useful
+    when an operator's file replaces a bundled preset by name — the
+    operator can verify their override actually took effect.
+    """
+    from rich.table import Table
+
+    presets = load_presets()
+    preset_names = list(presets.keys())
+
+    table = Table(
+        title="Launcher presets",
+        title_style="bold",
+        header_style="bold",
+        # Soft border + padding match the print_plan rendering style
+        # used elsewhere in the launcher.
+        padding=(0, 1),
+    )
+    table.add_column("Setting", style="dim", no_wrap=True)
+    for name in preset_names:
+        # `overflow="fold"` so long values (e.g. multi-detector
+        # `detector_mode`, `bundled:regex_pentest.yaml` paths) wrap
+        # within the cell instead of getting ellipsis-truncated.
+        table.add_column(name, style="green", overflow="fold")
+
+    def _backend_cell(spec, attr: str) -> str:
+        v = getattr(spec, attr)
+        if not v:
+            return "[dim]—[/dim]"
+        if v == "service":
+            return "service [dim](auto-start)[/dim]"
+        return str(v)
+
+    def _env_overrides_cell(spec) -> str:
+        if not spec.env_overrides:
+            return "[dim]—[/dim]"
+        # One KEY=VALUE per line so long bundle paths don't blow the
+        # column out horizontally.
+        return "\n".join(f"{k}={v}" for k, v in spec.env_overrides.items())
+
+    def _source_cell(loaded: LoadedPreset) -> str:
+        if loaded.source == "bundled":
+            return "[dim]bundled[/dim]"
+        return "[yellow]operator[/yellow]"
+
+    rows: list[tuple[str, callable]] = [
+        ("Source",            lambda lp: _source_cell(lp)),
+        ("Image flavour",     lambda lp: lp.spec.flavour),
+        ("Detector mode",     lambda lp: lp.spec.detector_mode),
+        ("Log level",         lambda lp: lp.spec.log_level),
+        (
+            "Faker surrogates",
+            lambda lp: "enabled" if lp.spec.use_faker else "disabled [dim](opaque tokens)[/dim]",
+        ),
+        ("LLM backend",       lambda lp: _backend_cell(lp.spec, "llm_backend")),
+        ("Privacy-filter backend", lambda lp: _backend_cell(lp.spec, "pf_backend")),
+        ("GLiNER-PII backend", lambda lp: _backend_cell(lp.spec, "gliner_backend")),
+        ("Env overrides",     lambda lp: _env_overrides_cell(lp.spec)),
+    ]
+
+    for label, extractor in rows:
+        table.add_row(label, *(extractor(presets[n]) for n in preset_names))
+
+    return table
+
+
+def _show_presets(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """Eager `--show-presets` callback — renders the loaded presets as
+    a rich Table and exits cleanly. Doesn't run any container, doesn't
+    engage the engine; pure introspection.
+
+    `expose_value=False` so the flag never reaches the cli() function;
+    `is_eager=True` so we exit before required-arg validation triggers
+    (operators discovering the launcher should be able to run
+    `--show-presets` without first specifying `--type` or `--detector-mode`).
+
+    Reads `--presets-file` if it was passed earlier in the argv (Click
+    eager-callback ordering — `--presets-file` is also eager and
+    declared before this in the option chain). When unset, falls back
+    to `LAUNCHER_PRESETS_FILE`. When neither is set, only bundled
+    presets appear in the table.
+
+    `resilient_parsing` is true during shell-completion; skip the
+    rendering in that case so completion doesn't accidentally print
+    the table into the operator's shell."""
+    if not value or ctx.resilient_parsing:
+        return
+    from rich.console import Console
+    # Schema-validation errors from the operator file surface here as
+    # RuntimeError. Convert to a Click error so the operator sees a
+    # clean "Usage:" header + message instead of a Python traceback —
+    # matches how missing-file is reported by `_set_presets_file`.
+    try:
+        table = _render_presets_table()
+    except RuntimeError as exc:
+        raise click.UsageError(str(exc)) from exc
+    # stderr → keep the table off any stdout pipeline operators might
+    # have set up. Same console destination `services.py` uses for
+    # status messages.
+    Console(stderr=True).print(table)
+    ctx.exit(0)
+
+
+def _set_presets_file(
+    ctx: click.Context, _param: click.Parameter, value: str | None,
+) -> str | None:
+    """Eager callback for `--presets-file`. Stores the path on the
+    preset_loader module so `_show_presets` and `_apply_preset` see it.
+    Returns the value unchanged so Click's normal flow continues.
+
+    Eager-ordering matters: this callback runs before `--show-presets`
+    and before `--preset`, so by the time those fire, the operator
+    file is already wired in. Click invokes eager callbacks in the
+    order options are declared, and `--presets-file` is declared
+    above `--show-presets` and `--preset` in the decorator chain
+    below.
+
+    Validates that the file exists at callback time (rather than at
+    `load_presets()` time) so the operator's mistake surfaces with
+    a clean Click error message tagged to the right flag."""
+    if value and not ctx.resilient_parsing:
+        if not os.path.isfile(value):
+            raise click.BadParameter(
+                f"presets file {value!r} does not exist or isn't a file.",
+                param_hint="--presets-file",
+            )
+        set_operator_presets_file(value)
+    return value
 
 
 # ── Section names ─────────────────────────────────────────────────────────
@@ -246,6 +369,36 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
     group=_S_MODE,
     help="Open the Textual interactive menu instead of CLI mode.",
 )
+# --presets-file MUST be declared before --show-presets and --preset
+# so its eager callback fires first — those downstream callbacks read
+# the operator-file path via preset_loader's module-level state.
+@grouped_option(
+    "--presets-file",
+    type=str, default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_set_presets_file,
+    group=_S_MODE,
+    help=(
+        "Path to a YAML file with operator-supplied launcher presets. "
+        "Operator entries with names that collide with bundled presets "
+        "replace the bundled entry; new names are appended. Same "
+        "behaviour as setting LAUNCHER_PRESETS_FILE in the environment."
+    ),
+)
+@grouped_option(
+    "--show-presets", "--show-preset",
+    is_flag=True,
+    expose_value=False,
+    is_eager=True,
+    callback=_show_presets,
+    group=_S_MODE,
+    help=(
+        "Print a table of bundled (and operator-supplied) --preset "
+        "values and the configuration each one applies, then exit. "
+        "Doesn't engage the container engine."
+    ),
+)
 # ── Required ──────────────────────────────────────────────────────────────
 @grouped_option(
     "--type", "-t", "type_",
@@ -260,7 +413,12 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
 @grouped_option(
     "--preset",
     type=str, default=None, group=_S_REQUIRED,
-    help=f"Bundled preset: {', '.join(_PRESETS)}. Sets type, detector mode, and reasonable defaults.",
+    help=(
+        "Bundled preset name (run `--show-presets` to list). Sets "
+        "type, detector mode, and reasonable defaults. Operators can "
+        "extend the bundled set via `--presets-file` or "
+        "LAUNCHER_PRESETS_FILE."
+    ),
 )
 # ── Container ─────────────────────────────────────────────────────────────
 @grouped_option(
@@ -567,37 +725,23 @@ def cli(
 
     # ── Auto-start services ──────────────────────────────────────────────
     engine = detect_engine()
-    auto_started_detectors: list[str] = []
-    for det_name, backend in cfg.backends.items():
-        if backend == "service":
-            spec = LAUNCHER_METADATA.get(det_name)
-            if spec is None or spec.service is None:
-                raise click.BadParameter(
-                    f"Detector {det_name!r} has no service to auto-start. "
-                    f"Use --{det_name.replace('_', '-')}-backend external."
-                )
-            extra_volumes: list[tuple[str, str]] = []
-            # Mount the operator's --rules YAML into the auto-started
-            # fake-llm. Other services don't currently consume extra
-            # bind mounts; if a second one ever does, generalise via a
-            # ServiceSpec field rather than stacking detector names here.
-            if det_name == "llm" and cfg.fake_llm_rules_file:
-                rules_path = os.path.abspath(cfg.fake_llm_rules_file)
-                if not os.path.isfile(rules_path):
-                    raise click.BadParameter(
-                        f"--rules path {cfg.fake_llm_rules_file!r} doesn't "
-                        f"exist (resolved to {rules_path}).",
-                        param_hint="--rules",
-                    )
-                extra_volumes.append((rules_path, "/app/rules.yaml:ro"))
-            start_service(
-                engine, det_name,
-                log_level=cfg.log_level,
-                extra_volumes=extra_volumes or None,
-                variant=cfg.service_variants.get(det_name) or None,
+    # Validate the operator's `--rules` path here (CLI-side concern),
+    # then let `auto_start_services` do the loop. The TUI doesn't
+    # expose `--rules` so it skips this block and passes no extras.
+    extra_volumes: dict[str, list[tuple[str, str]]] = {}
+    if cfg.backends.get("llm") == "service" and cfg.fake_llm_rules_file:
+        rules_path = os.path.abspath(cfg.fake_llm_rules_file)
+        if not os.path.isfile(rules_path):
+            raise click.BadParameter(
+                f"--rules path {cfg.fake_llm_rules_file!r} doesn't "
+                f"exist (resolved to {rules_path}).",
+                param_hint="--rules",
             )
-            auto_started_detectors.append(det_name)
+        extra_volumes["llm"] = [(rules_path, "/app/rules.yaml:ro")]
 
+    auto_started_detectors = auto_start_services(
+        engine, cfg, extra_volumes=extra_volumes,
+    )
     if auto_started_detectors:
         register_atexit_cleanup(engine, auto_started_detectors)
 

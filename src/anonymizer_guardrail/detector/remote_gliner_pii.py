@@ -494,6 +494,10 @@ LAUNCHER_SPEC = LauncherSpec(
         "GLINER_PII_THRESHOLD",
         "GLINER_PII_FAIL_CLOSED",
         "GLINER_PII_MAX_CONCURRENCY",
+        "GLINER_PII_INPUT_MODE",
+        "GLINER_PII_CACHE_MAX_SIZE",
+        "GLINER_PII_CACHE_BACKEND",
+        "GLINER_PII_CACHE_TTL_S",
     ],
     service=ServiceSpec(
         container_name="gliner-pii-service",

@@ -42,6 +42,37 @@ CONTAINER_NAME_DEFAULT = "anonymizer-guardrail"
 """Default name for the guardrail container itself. Operator can override
 via `--name`."""
 
+CROSS_CUTTING_GUARDRAIL_ENV_PASSTHROUGHS: tuple[str, ...] = (
+    # Vault — operators selecting `VAULT_BACKEND=redis` for multi-replica
+    # deployments. Memory backend is the default and needs no env vars.
+    "VAULT_BACKEND",
+    "VAULT_REDIS_URL",
+    "VAULT_TTL_S",
+    "VAULT_MAX_ENTRIES",
+    # Detector cache cross-cutting (per-detector backend selection lives
+    # in each detector's LAUNCHER_SPEC). Only forwarded when the operator
+    # set them; the validator in central Config rejects redis selection
+    # without the matching URL at boot.
+    "CACHE_REDIS_URL",
+    "CACHE_SALT",
+    # Body-size DoS cap. Pre-existing knob that wasn't being forwarded
+    # to the guardrail container — operators tuning the default away
+    # from 10 MiB needed `-- -e` extras to make it stick. Now forwarded
+    # via the same path as the redis URLs.
+    "MAX_BODY_BYTES",
+)
+"""Env vars forwarded from the operator's environment to the guardrail
+container that aren't tied to a specific detector. Per-detector vars
+live on each detector's `LauncherSpec.guardrail_env_passthroughs`;
+this list covers truly cross-cutting concerns (vault state, cache
+state shared across detectors, body-size DoS cap).
+
+Same forwarding rule as the per-detector passthroughs: only emitted
+when the var has a non-empty value, so default deployments stay
+clean. The runner walks this list after the per-detector lists, so
+detector-specific values take precedence on collisions (none today,
+but pinning ordering keeps a future name clash deterministic)."""
+
 
 def get_image_tag(envs: tuple[str, ...], defaults: tuple[str, ...]) -> tuple[str, str | None]:
     """Pick the operator-resolved image tag for a service.
@@ -68,5 +99,6 @@ __all__ = [
     "ServiceSpec",
     "SHARED_NETWORK",
     "CONTAINER_NAME_DEFAULT",
+    "CROSS_CUTTING_GUARDRAIL_ENV_PASSTHROUGHS",
     "get_image_tag",
 ]
