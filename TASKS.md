@@ -573,6 +573,104 @@ Option 1 is more honest about what the data actually is. Option
 
 ---
 
+## BaseRemoteDetector consolidation
+
+**What:** extract the shared shape across LLM, privacy_filter, and
+gliner_pii detectors into a small base class. Each currently
+duplicates ~80% of `__init__`, `cache_stats()`, `aclose()`, and the
+cache-wrapper template inside `detect()`.
+
+**Why:** the three detectors all do the same five things — construct
+an httpx.AsyncClient, instantiate a `DetectorResultCache`, expose
+`cache_stats()`, drain the client on `aclose()`, and wrap `detect()`
+with the cache template (`get_or_compute(key, lambda: self._do_detect(...))`).
+Adding a fourth remote detector would copy the same boilerplate a
+fourth time. Refactoring one of the existing detectors (e.g. for
+the BaseRemoteDetector design itself, or for streaming, or for any
+other cross-cutting work) currently requires three parallel edits.
+
+**Why deferred:** the current shape works; the consolidation would
+touch three production detectors plus their tests; and there's a
+real divergence point (each detector's `detect()` signature
+differs — LLM has `api_key`/`model`/`prompt_name`, gliner has
+`labels`/`threshold`, PF has nothing) that needs careful handling.
+The benefit is structural cleanliness, not a fix for a current bug,
+so it's worth deferring until the next detector lands or a related
+refactor coincides.
+
+**Concrete trigger:**
+
+- A fourth remote detector is on the way (the boilerplate cost
+  becomes 4x).
+- A cross-cutting refactor (e.g. retry policy, request logging,
+  per-call telemetry) wants a single integration point across all
+  remote detectors.
+- The three detectors drift apart — e.g. one starts logging
+  request bodies and the others don't, or one's `aclose()` grows
+  cleanup logic the others lack.
+
+**Sketch:**
+
+1. Create `detector/remote_base.py` with `BaseRemoteDetector`
+   (or a mixin). It owns:
+
+   - `self.url`, `self.timeout_s`, `self._client`
+   - `self._cache: DetectorResultCache`
+   - `cache_stats()` → `self._cache.stats()`
+   - `aclose()` → `await self._client.aclose()`
+   - A template `detect()` that calls `self._cache_key(text, **kwargs)`
+     and `self._do_detect(text, **kwargs)`.
+
+2. Subclasses provide:
+
+   - `_cache_key(self, text, **kwargs) -> Hashable` — builds the
+     detector-specific cache key (LLM: `(text, model, prompt_name)`;
+     gliner: `(text, labels_tuple, threshold)`; PF: `(text,)`).
+   - `_do_detect(self, text, **kwargs) -> list[Match]` — the actual
+     HTTP call. Same shape as today's `_do_detect` methods, just
+     virtual.
+
+3. The diverging `detect()` signatures stay subclass-specific.
+   The base's `detect()` is `async def detect(self, text, **kwargs)`
+   and dispatches via `_cache_key` / `_do_detect`. Subclasses
+   declare their concrete signature for type-checker friendliness:
+
+   ```python
+   class LLMDetector(BaseRemoteDetector):
+       async def detect(
+           self, text, *, api_key=None, model=None, prompt_name=None,
+       ) -> list[Match]:
+           return await super().detect(
+               text, api_key=api_key, model=model, prompt_name=prompt_name,
+           )
+   ```
+
+4. `Pipeline._run_detector` is unaffected — it already calls
+   `det.detect(text, **kwargs)` with the spec-prepared kwargs.
+5. Tests: each detector's existing test file stays valid (the
+   public `detect()` signature is unchanged); add a small
+   `tests/test_base_remote_detector.py` for the shared template
+   itself if useful.
+
+**Non-goals:**
+
+- **Don't force a single `detect()` signature.** The whole point of
+  the divergence is per-detector overrides; flattening them into a
+  generic `**kwargs` would lose IDE autocomplete and type-check
+  coverage at every call site.
+- **Don't pull regex/denylist into the base.** They're in-process,
+  not remote, and have no httpx client or cache. The base is for
+  *remote* detectors specifically.
+- **Don't extract the cache instantiation behind a factory.** The
+  per-detector `cache_max_size` config is the right granularity;
+  hiding it behind a factory adds indirection without saving lines.
+
+**Effort:** medium. Touches 3 detectors + 3 test files; the
+production code change is mechanical, the test side might surface
+unexpected coupling.
+
+---
+
 ## Pin Viterbi calibration JSON for privacy-filter
 
 **What:** ship a default `services/privacy_filter/calibration.json`
