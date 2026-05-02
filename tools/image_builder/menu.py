@@ -9,17 +9,20 @@ Single-screen menuconfig-style picker. Two interlocking widgets:
     named preset.
 
   * **Checkbox grid** (below): every flavour in `FLAVOURS`, grouped
-    by `Flavour.group`. Checking/unchecking a box updates the live
-    selection set; the preset radio re-snaps to whatever named
-    preset matches (or to `custom`).
+    by `Flavour.group` and laid out two columns wide so the catalog
+    fits on a normal terminal without scrolling. Checking/unchecking
+    a box updates the live selection set; the preset radio re-snaps
+    to whatever named preset matches (or to `custom`).
 
 The two are kept in sync via a `_syncing` re-entrancy guard — without
 it, programmatic widget updates trigger the same `Checkbox.Changed` /
 `RadioSet.Changed` handlers that drove them, looping forever.
 
-Hitting Build (or Enter) exits the app with the selected set; the
-caller (`run_interactive`) resolves it into BuildPlans and calls the
-runner. Cancel/Esc/Q exits with no selection (return code 0).
+Keyboard model: arrow up/down move focus between widgets (priority
+bindings, so they trump the RadioSet's own up/down which would
+otherwise trap focus inside the preset row). Left/right still cycles
+within the horizontal RadioSet. Tab works as a fallback. Build is
+ctrl+b (Enter would clash with checkbox toggling); Cancel is q/Esc.
 """
 
 from __future__ import annotations
@@ -85,11 +88,17 @@ class BuilderApp(App):
 
     #presets {
         height: auto;
-        padding: 1 2;
+        padding: 0 2;
         border: solid $primary;
         margin: 1 1 0 1;
     }
-    #presets RadioSet { layout: horizontal; height: auto; }
+    #presets RadioSet {
+        layout: horizontal;
+        height: auto;
+        border: none;
+        padding: 0;
+        background: transparent;
+    }
     #presets RadioButton { margin-right: 2; }
 
     #flavour-grid {
@@ -104,20 +113,38 @@ class BuilderApp(App):
         color: $accent;
     }
 
+    .flavour-cols {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 2;
+        height: auto;
+    }
+
     Checkbox { margin: 0 1; height: auto; }
 
     #buttons {
-        height: 3;
+        height: auto;
         align: center middle;
         padding: 1;
     }
     #buttons Button { margin: 0 1; }
     """
 
+    # Up/down are `priority=True` so they fire BEFORE focused-widget
+    # bindings — RadioSet's own up/down would otherwise cycle radio
+    # buttons and trap focus inside the preset row. Left/right are
+    # left to RadioSet's defaults so the operator can still scroll
+    # horizontally through presets. ctrl+b for Build instead of enter
+    # because enter on a focused Checkbox toggles it; a global enter
+    # binding would surprise the operator mid-selection.
     BINDINGS = [
         Binding("q", "cancel", "Cancel"),
         Binding("escape", "cancel", "Cancel"),
-        Binding("enter", "build", "Build"),
+        Binding("ctrl+b", "build", "Build"),
+        Binding("up", "focus_previous_widget", show=False, priority=True),
+        Binding("down", "focus_next_widget", show=False, priority=True),
     ]
 
     TITLE = "anonymizer-guardrail image builder"
@@ -137,25 +164,31 @@ class BuilderApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
 
+        # Preset section — `border_title` puts the label inline with
+        # the top border so we don't burn a row on a separate Static.
         with Container(id="presets"):
-            yield Static("Preset:", classes="group-header")
             with RadioSet(id="preset-radio"):
                 for name in preset_names():
                     yield RadioButton(name, name=name)
                 yield RadioButton(_CUSTOM_PRESET, name=_CUSTOM_PRESET)
 
+        # Flavour catalog — one Container per group so each group's
+        # checkboxes live in their own 2-column grid (a single grid
+        # spanning all groups would let column 1 of one group sit
+        # next to column 2 of the next, which is confusing).
         with VerticalScroll(id="flavour-grid"):
             for group_const, group_label in _GROUP_ORDER:
                 yield Static(group_label, classes="group-header")
-                for f in flavours_in_group(group_const):
-                    yield Checkbox(
-                        f.label,
-                        value=(f.name in self._selected),
-                        # Carry the flavour name as the widget's `name`
-                        # so the Changed handler can map back.
-                        name=f.name,
-                        id=f"cb-{f.name}",
-                    )
+                with Container(classes="flavour-cols"):
+                    for f in flavours_in_group(group_const):
+                        yield Checkbox(
+                            f.label,
+                            value=(f.name in self._selected),
+                            # Carry the flavour name as the widget's
+                            # `name` so the Changed handler can map back.
+                            name=f.name,
+                            id=f"cb-{f.name}",
+                        )
 
         with Horizontal(id="buttons"):
             yield Button("Build", id="build-btn", variant="primary")
@@ -164,10 +197,22 @@ class BuilderApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # RadioSet's pressed-item is set after compose so the pressed
-        # state lands on the actual mounted RadioButton (setting it
-        # before mount races with widget creation in Textual 0.50+).
+        # `border_title` is set after mount so the title lands on the
+        # actual rendered border (assignment before mount can race
+        # with widget creation in Textual 0.50+). Same reasoning as
+        # the preset-radio sync below.
+        self.query_one("#presets", Container).border_title = "Preset"
         self._sync_preset_radio()
+
+    # ── Focus actions ─────────────────────────────────────────────────────
+    # Bound to up/down at priority so they short-circuit the RadioSet's
+    # built-in up/down (which would otherwise re-cycle radio buttons
+    # and never let focus leave the preset row).
+    def action_focus_next_widget(self) -> None:
+        self.screen.focus_next()
+
+    def action_focus_previous_widget(self) -> None:
+        self.screen.focus_previous()
 
     # ── Event handlers ─────────────────────────────────────────────────────
     @on(RadioSet.Changed, "#preset-radio")
