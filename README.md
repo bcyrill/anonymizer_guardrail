@@ -41,7 +41,6 @@ Five detection layers, all optional, controlled by `DETECTOR_MODE`:
   8 PII categories.
 - **[gliner_pii](docs/detectors/gliner-pii.md)** — remote zero-shot
   NER (`nvidia/gliner-pii`). Caller-supplied label set per request.
-  **Experimental.**
 - **[llm](docs/detectors/llm.md)** — OpenAI-compatible Chat Completions
   in JSON mode. Catches contextual entities regex can't.
 

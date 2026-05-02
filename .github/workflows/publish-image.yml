@@ -12,9 +12,11 @@ name: Publish container image
 # privacy-filter-service baked variant in publish-pf-service-image.yml.
 #
 # vX.Y.Z+pf-service tags are handled by publish-pf-service-image.yml,
-# which publishes a SEPARATE GHCR package (privacy-filter-service).
-# This workflow short-circuits on those tags so a single tag push only
-# fires the matching workflow.
+# and vX.Y.Z+gliner-service tags by publish-gliner-service-image.yml,
+# each of which publishes a SEPARATE GHCR package
+# (privacy-filter-service / gliner-pii-service). This workflow
+# short-circuits on those tags so a single tag push only fires the
+# matching workflow.
 #
 # Branch pushes do NOT trigger image builds — most testing happens
 # locally via scripts/build-image.sh and scripts/run_container.sh, and
@@ -27,7 +29,7 @@ name: Publish container image
 
 on:
   push:
-    tags: ['v*.*.*']  # also matches v*.*.*+pf and v*.*.*+pf-service
+    tags: ['v*.*.*']  # also matches v*.*.*+pf, v*.*.*+pf-service, v*.*.*+gliner-service
   workflow_dispatch:
     inputs:
       flavor:
@@ -45,13 +47,13 @@ env:
 
 jobs:
   build-and-push:
-    # Skip on +pf-service / +pf-service-baked tags — those are handled
-    # by publish-pf-service-image.yml (different image, different
-    # Containerfile). The skip lives at the job level rather than as a
-    # negative tag pattern because GitHub Actions' minimatch parser
-    # treats `+*` as the extglob "one or more" quantifier and rejects
-    # the workflow with "invalid tags patterns".
-    if: ${{ !contains(github.ref_name, '+pf-service') }}
+    # Skip on +pf-service* / +gliner-service* tags — those are handled
+    # by publish-pf-service-image.yml / publish-gliner-service-image.yml
+    # (different images, different Containerfiles). The skip lives at the
+    # job level rather than as a negative tag pattern because GitHub
+    # Actions' minimatch parser treats `+*` as the extglob "one or more"
+    # quantifier and rejects the workflow with "invalid tags patterns".
+    if: ${{ !contains(github.ref_name, '+pf-service') && !contains(github.ref_name, '+gliner-service') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -83,7 +85,7 @@ jobs:
                 exit 1
                 ;;
               *+*)
-                echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf or +pf-service."
+                echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf, +pf-service, or +gliner-service."
                 exit 1
                 ;;
               *)          FLAVOR=slim ;;

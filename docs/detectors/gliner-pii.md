@@ -10,11 +10,11 @@ rather than baked into the architecture. A caller can configure
 `["ssn", "medical_record_number", "iban"]` for one deployment and
 `["person", "organization"]` for another, no retraining.
 
-**Status: experimental.** The detector is fully functional and tested,
-but the gliner-pii-service container images are not yet published to
-GHCR — operators evaluate the model locally first via
-`scripts/build-image.sh -t gliner-service`. CI publishing follows once
-the model graduates out of experimental status.
+CI publishes CPU + CUDA 13.0 runtime-download variants of the
+gliner-pii-service to GHCR (`gliner-pii-service:vX.Y.Z-cpu` /
+`-cu130`); see [deployment → GLiNER-PII service](../deployment.md#gliner-pii-service-gliner-pii-service)
+for the full flavour matrix. Baked variants are local-build only —
+build via `scripts/build-image.sh -t gliner-service-baked`.
 
 **Remote only.** No in-process variant ships. The model is heavy
 (~570 MB weights + the `gliner` library + torch) and the production

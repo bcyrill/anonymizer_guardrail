@@ -107,14 +107,13 @@ wrong torch build.
 
 Standalone HTTP wrapper around the `nvidia/gliner-pii` zero-shot model.
 Same shape as the privacy-filter service (CPU + CUDA matrix, baked /
-runtime-download split). **Local-build only** while the detector is
-being evaluated — see [GLiNER-PII detector](detectors/gliner-pii.md)
-for the experimental status and the model license note.
+runtime-download split). See [GLiNER-PII detector](detectors/gliner-pii.md)
+for the model license note.
 
 | flavour | torch wheels | model | published as | runtime needs |
 |---|---|---|---|---|
-| `gliner-service` | CPU-only | downloads on first start | local only | none beyond the container |
-| `gliner-service-cu130` | CUDA 13.0 | downloads on first start | local only | nvidia GPU + nvidia-container-toolkit |
+| `gliner-service` | CPU-only | downloads on first start | `:vX.Y.Z-cpu` | none beyond the container |
+| `gliner-service-cu130` | CUDA 13.0 | downloads on first start | `:vX.Y.Z-cu130` | nvidia GPU + nvidia-container-toolkit |
 | `gliner-service-baked` | CPU-only | shipped inside image | local only | none beyond the container |
 | `gliner-service-baked-cu130` | CUDA 13.0 | shipped inside image | local only | nvidia GPU + nvidia-container-toolkit |
 
@@ -132,15 +131,13 @@ Not for production.
 CI publishes the variants most operators pull. The local-only set is:
 
 - **Baked-model variants** (`pf-baked`, `pf-service-baked`,
-  `pf-service-baked-cu130`, all `gliner-service-*`) — multi-GB images
-  that store indefinitely on GHCR for what's usually a build-once
-  artifact. A runtime-download image with a persistent HF cache volume
-  gets you to the same place after one cold start, so the registry
-  mass isn't worth it. Build with `scripts/build-image.sh -t pf-baked`
-  (etc.) when you actually need them.
-- **All `gliner-pii-service` variants** — the detector is being
-  evaluated locally first; CI publishing follows once it graduates
-  out of experimental status.
+  `pf-service-baked-cu130`, `gliner-service-baked`,
+  `gliner-service-baked-cu130`) — multi-GB images that store
+  indefinitely on GHCR for what's usually a build-once artifact. A
+  runtime-download image with a persistent HF cache volume gets you to
+  the same place after one cold start, so the registry mass isn't
+  worth it. Build with `scripts/build-image.sh -t pf-baked` (etc.)
+  when you actually need them.
 - **`fake-llm`** — a test/dev tool with no place in a production
   registry. Operators who need it for their own CI typically build
   once into their own infra registry.

@@ -7,20 +7,23 @@
 # via scripts/build-image.sh covers the iteration loop.
 #
 # Pushing a tag triggers the workflows in .github/workflows/:
-#   - publish-image.yml             (guardrail image → ghcr.io)
-#   - publish-pf-service-image.yml  (privacy-filter-service → ghcr.io)
-#   - release.yml                   (GitHub Release; canonical tag only)
+#   - publish-image.yml                  (guardrail image → ghcr.io)
+#   - publish-pf-service-image.yml       (privacy-filter-service → ghcr.io)
+#   - publish-gliner-service-image.yml   (gliner-pii-service → ghcr.io)
+#   - release.yml                        (GitHub Release; canonical tag only)
 #
 # After the canonical vX.Y.Z tag, the script optionally also pushes
 # flavour-variant tags pointing at the same commit:
-#   vX.Y.Z+pf         → publishes the guardrail pf image
-#   vX.Y.Z+pf-service → publishes the standalone privacy-filter-service
+#   vX.Y.Z+pf             → publishes the guardrail pf image
+#   vX.Y.Z+pf-service     → publishes the standalone privacy-filter-service
+#   vX.Y.Z+gliner-service → publishes the standalone gliner-pii-service
 # Each one triggers its matching workflow separately. release.yml only
 # creates a GitHub Release for the canonical tag (variants reuse it).
 #
-# Baked variants (`+pf-baked`, `+pf-service-baked`) are NOT published
-# from CI — the images are multi-GB. Build them locally with
-# `scripts/build-image.sh -t pf-baked` (or `-t pf-service-baked`).
+# Baked variants (`+pf-baked`, `+pf-service-baked`, `+gliner-service-baked`)
+# are NOT published from CI — the images are multi-GB. Build them
+# locally with `scripts/build-image.sh -t pf-baked` (or
+# `-t pf-service-baked` / `-t gliner-service-baked`).
 
 set -euo pipefail
 
@@ -149,8 +152,8 @@ git push "$remote" "$new_tag"
 ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create the release."
 
 # ── Flavour variants ─────────────────────────────────────────────────────────
-# Two independent axes, each prompted separately so an operator can
-# decide per-axis instead of navigating a 2x2 combined menu.
+# Three independent axes, each prompted separately so an operator can
+# decide per-axis instead of navigating a combined menu.
 #
 # Axis 1 — guardrail privacy-filter flavour (publish-image.yml):
 #   vX.Y.Z+pf → guardrail image with privacy-filter built-in
@@ -158,9 +161,12 @@ ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create t
 # Axis 2 — standalone privacy-filter-service (publish-pf-service-image.yml):
 #   vX.Y.Z+pf-service → separate ghcr package: privacy-filter-service
 #
-# Baked variants of either axis are intentionally absent — they're
+# Axis 3 — standalone gliner-pii-service (publish-gliner-service-image.yml):
+#   vX.Y.Z+gliner-service → separate ghcr package: gliner-pii-service
+#
+# Baked variants of any axis are intentionally absent — they're
 # local-build only (`scripts/build-image.sh -t pf-baked` /
-# `-t pf-service-baked`).
+# `-t pf-service-baked` / `-t gliner-service-baked`).
 variants=()
 
 say ""
@@ -185,6 +191,19 @@ read -r -p "Choose [1-2, default 1]: " sv_choice || true
 case "${sv_choice:-1}" in
   1) ;;
   2) variants+=("pf-service") ;;
+  *) err "Invalid choice."; exit 1 ;;
+esac
+
+say ""
+say "Also publish the standalone gliner-pii-service image?"
+say "(separate ghcr package; pair with the slim guardrail and GLINER_PII_URL)"
+say ""
+say "  ${c_grn}1)${c_rst} no"
+say "  ${c_grn}2)${c_rst} +gliner-service"
+read -r -p "Choose [1-2, default 1]: " gs_choice || true
+case "${gs_choice:-1}" in
+  1) ;;
+  2) variants+=("gliner-service") ;;
   *) err "Invalid choice."; exit 1 ;;
 esac
 

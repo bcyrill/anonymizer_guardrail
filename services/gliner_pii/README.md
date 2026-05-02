@@ -100,9 +100,12 @@ Or use `scripts/build-image.sh` from the repo root: types
 `gliner-service`, `gliner-service-baked`, `gliner-service-cu130`,
 `gliner-service-baked-cu130`.
 
-None of these are currently published to GHCR — gliner-pii is being
-evaluated locally first. If it graduates, CI publishing will follow the
-same `+gliner-service` tag convention as the privacy-filter-service.
+CI publishes the runtime-download variants (`gliner-service`,
+`gliner-service-cu130`) to GHCR as
+`ghcr.io/<owner>/gliner-pii-service:vX.Y.Z-cpu` / `:vX.Y.Z-cu130` on
+each `vX.Y.Z+gliner-service` tag — same `+gliner-service` tag
+convention as the privacy-filter-service. The baked flavours stay
+local-build only (multi-GB; not worth the registry mass).
 
 ## Run
 

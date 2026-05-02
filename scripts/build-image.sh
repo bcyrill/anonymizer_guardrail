@@ -76,8 +76,8 @@ Without -t, prompts interactively.
                         pf-service-baked-cu130  pf-service + model baked in,
                                           CUDA 13.0 torch wheels
                         gliner-service          nvidia/gliner-pii inference
-                                          service (experimental — not yet
-                                          wired into the guardrail)
+                                          service. Runtime download,
+                                          CPU-only torch.
                         gliner-service-baked    gliner-service + model baked in
                         gliner-service-cu130    gliner-service with CUDA 13.0
                         gliner-service-baked-cu130  gliner-service + model
@@ -87,9 +87,12 @@ Without -t, prompts interactively.
                                           with a YAML rules file, for driving
                                           the guardrail's LLM detector
                                           deterministically (see services/fake_llm/)
-                        all               build all flavours in sequence
+                        all               build every CPU flavour in sequence
                                           (uses the default tag for each — pass
                                           -T separately if you want overrides)
+                        all-runtime       like 'all' but skips baked variants
+                                          (slim, pf, pf-service,
+                                          gliner-service, fake-llm)
   -T, --tag TAG       Override the default image tag (single-flavour only).
   -h, --help          Show this help.
 
@@ -158,14 +161,15 @@ if [[ -z "$TYPE" ]]; then
   say "  ${c_grn} 5)${c_rst} pf-service-baked           pf-service + model baked in ${c_dim}(CPU)${c_rst}"
   say "  ${c_grn} 6)${c_rst} pf-service-cu130           pf-service with CUDA 13.0 torch ${c_dim}(needs GPU at runtime)${c_rst}"
   say "  ${c_grn} 7)${c_rst} pf-service-baked-cu130     pf-service + model baked in, CUDA 13.0"
-  say "  ${c_grn} 8)${c_rst} gliner-service             nvidia/gliner-pii service ${c_dim}(CPU; experimental)${c_rst}"
+  say "  ${c_grn} 8)${c_rst} gliner-service             nvidia/gliner-pii service ${c_dim}(CPU)${c_rst}"
   say "  ${c_grn} 9)${c_rst} gliner-service-baked       gliner-service + model baked in ${c_dim}(CPU)${c_rst}"
   say "  ${c_grn}10)${c_rst} gliner-service-cu130       gliner-service with CUDA 13.0"
   say "  ${c_grn}11)${c_rst} gliner-service-baked-cu130 gliner-service + model baked in, CUDA 13.0"
   say "  ${c_grn}12)${c_rst} fake-llm                   companion test backend ${c_dim}(deterministic LLM)${c_rst}"
-  say "  ${c_grn} a)${c_rst} all                        build every CPU non-experimental flavour ${c_dim}(skips CUDA + gliner)${c_rst}"
+  say "  ${c_grn} a)${c_rst} all                        build every CPU flavour ${c_dim}(skips CUDA)${c_rst}"
+  say "  ${c_grn} r)${c_rst} all-runtime                like 'all' but skips baked variants ${c_dim}(no model baked into image)${c_rst}"
   say ""
-  read -r -p "Choose [1-12/a, comma-separated for multiple e.g. 1,4,8, default 1]: " choice || true
+  read -r -p "Choose [1-12/a/r, comma-separated for multiple e.g. 1,4,8, default 1]: " choice || true
   choice="${choice:-1}"
 
   # Translate the comma-separated menu input (e.g. "1,4,8") into the
@@ -180,6 +184,8 @@ if [[ -z "$TYPE" ]]; then
     [[ -z "$tok" ]] && continue
     if [[ "$tok" == "a" || "$tok" == "A" ]]; then
       _menu_flavours+=("all")
+    elif [[ "$tok" == "r" || "$tok" == "R" ]]; then
+      _menu_flavours+=("all-runtime")
     elif [[ "$tok" =~ ^[0-9]+$ ]] && [[ -n "${MENU_FLAVOURS[$tok]:-}" ]]; then
       _menu_flavours+=("${MENU_FLAVOURS[$tok]}")
     else
@@ -200,14 +206,16 @@ fi
 # build a curated subset without invoking the script repeatedly.
 IFS=',' read -ra TYPE_PARTS <<< "$TYPE"
 
-# Pre-flight: trim whitespace, drop empties, expand "all".
+# Pre-flight: trim whitespace, drop empties, expand "all" / "all-runtime".
 BUILD_LIST=()
 for raw in "${TYPE_PARTS[@]}"; do
   t="${raw#"${raw%%[![:space:]]*}"}"   # ltrim
   t="${t%"${t##*[![:space:]]}"}"        # rtrim
   [[ -z "$t" ]] && continue
   if [[ "$t" == "all" ]]; then
-    BUILD_LIST+=(slim pf pf-baked pf-service pf-service-baked fake-llm)
+    BUILD_LIST+=(slim pf pf-baked pf-service pf-service-baked gliner-service gliner-service-baked fake-llm)
+  elif [[ "$t" == "all-runtime" ]]; then
+    BUILD_LIST+=(slim pf pf-service gliner-service fake-llm)
   else
     BUILD_LIST+=("$t")
   fi

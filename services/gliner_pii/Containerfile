@@ -2,9 +2,9 @@
 # GLiNER-PII inference service.
 #
 # Standalone HTTP wrapper around NVIDIA's nvidia/gliner-pii model. Pair
-# with the guardrail (planned RemoteGlinerDetector — currently not
-# wired) so the heavy ML deps (torch + the gliner library + ~570M
-# weights) live in their own container instead of inflating the
+# with the guardrail's RemoteGlinerPIIDetector (set GLINER_PII_URL on
+# the guardrail) so the heavy ML deps (torch + the gliner library +
+# ~570M weights) live in their own container instead of inflating the
 # guardrail image.
 #
 # Two flavours, controlled by one build-arg:
