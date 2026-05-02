@@ -449,16 +449,16 @@ def cli(
 
     \b
       # Against a guardrail you're managing yourself:
-      scripts/benchmark.sh --config bundled:pentest
+      scripts/detector_bench.sh --config bundled:pentest
 
       # Spawn one for the run, tear it down at exit:
-      scripts/benchmark.sh --config bundled:pentest --preset pentest
+      scripts/detector_bench.sh --config bundled:pentest --preset pentest
 
       # Your own corpus:
-      scripts/benchmark.sh --config tests/corpus/legal.yaml
+      scripts/detector_bench.sh --config tests/corpus/legal.yaml
 
       # Compare every active detector individually + the full mix:
-      scripts/benchmark.sh --config bundled:pentest --compare
+      scripts/detector_bench.sh --config bundled:pentest --compare
     """
     try:
         corpus = load(config)
@@ -527,7 +527,7 @@ def _parse_detector_mode(mode: str) -> list[str]:
 
 def main() -> None:
     """Entry point invoked by `python -m tools.detector_bench` and
-    the scripts/benchmark.sh wrapper."""
+    the scripts/detector_bench.sh wrapper."""
     prog_name = os.environ.get("BENCH_PROG_NAME")
     if prog_name:
         cli.main(prog_name=prog_name)

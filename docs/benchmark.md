@@ -1,6 +1,6 @@
 # Detector quality benchmark
 
-`scripts/benchmark.sh` scores a guardrail's detector mix
+`scripts/detector_bench.sh` scores a guardrail's detector mix
 against a labelled corpus of texts. Where
 `scripts/test-examples.sh` answers *"do the curl recipes still work
 end-to-end?"*, this answers *"for THIS corpus on THIS detector mix,
@@ -20,21 +20,21 @@ Use it to:
 
 ```bash
 # Against a guardrail you're already running:
-scripts/benchmark.sh --config bundled:pentest
+scripts/detector_bench.sh --config bundled:pentest
 
 # Spawn a fresh test guardrail for the run, tear it down on exit:
-scripts/benchmark.sh --config bundled:pentest --preset pentest
+scripts/detector_bench.sh --config bundled:pentest --preset pentest
 
 # Your own corpus, against a custom URL:
 BASE_URL=http://my-host:8000 \
-  scripts/benchmark.sh --config tests/corpus/legal.yaml
+  scripts/detector_bench.sh --config tests/corpus/legal.yaml
 ```
 
 The wrapper accepts the same `--preset`, `--port`, `--keep`
 arguments as
 [`test-examples.sh`](deployment.md#smoke-test) so the two scripts
 slot into the same CI/dev-loop muscle memory. See
-`scripts/benchmark.sh --help` for the full flag list.
+`scripts/detector_bench.sh --help` for the full flag list.
 
 ## Configuring the detector mix
 
@@ -55,7 +55,7 @@ detector tuning without restarting:
 scripts/launcher.sh -t pf --detector-mode regex,denylist,privacy_filter
 
 # Terminal 2 — score it
-scripts/benchmark.sh --config bundled:pentest
+scripts/detector_bench.sh --config bundled:pentest
 ```
 
 The wrapper reads `$BASE_URL` (default `http://localhost:8000`) or
@@ -67,9 +67,9 @@ waits for `/health`, runs the corpus, and tears the guardrail down on
 exit (override with `--keep`). Use this for one-shot comparisons:
 
 ```bash
-scripts/benchmark.sh --config bundled:pentest --preset uuid-debug
-scripts/benchmark.sh --config bundled:pentest --preset pentest
-scripts/benchmark.sh --config bundled:pentest --preset regex-only
+scripts/detector_bench.sh --config bundled:pentest --preset uuid-debug
+scripts/detector_bench.sh --config bundled:pentest --preset pentest
+scripts/detector_bench.sh --config bundled:pentest --preset regex-only
 ```
 
 Each preset bundles a coherent `--type` / `--detector-mode` /
@@ -96,7 +96,7 @@ scripts/launcher.sh -t pf --detector-mode regex,denylist,privacy_filter,llm \
     --llm-backend service
 
 # Terminal 2 — score each detector individually + the full mix
-scripts/benchmark.sh --config bundled:pentest --compare
+scripts/detector_bench.sh --config bundled:pentest --compare
 ```
 
 `--compare` runs the corpus once per active detector (using the
@@ -180,7 +180,7 @@ detector wired in, then run `--compare` on the bundled pentest corpus.
     --rules ./services/fake_llm/rules.pentest.yaml
 
 # 3. In another terminal, run the comparison:
-./scripts/benchmark.sh --config bundled:pentest --compare
+./scripts/detector_bench.sh --config bundled:pentest --compare
 ```
 
 Expected output (numbers vary with model / hardware):
@@ -471,13 +471,13 @@ wins for your traffic shape:
 ```bash
 # Regex + denylist only (no LLM round-trip, sub-millisecond per case)
 DETECTOR_MODE=regex,denylist \
-  scripts/benchmark.sh --config bundled:pentest --preset regex-only
+  scripts/detector_bench.sh --config bundled:pentest --preset regex-only
 
 # Add the privacy_filter NER (~ms per case, picks up names/addresses)
-scripts/benchmark.sh --config bundled:pentest --preset pentest
+scripts/detector_bench.sh --config bundled:pentest --preset pentest
 
 # Full stack (LLM round-trip per case, picks contextual entities too)
-scripts/benchmark.sh --config bundled:pentest --preset pentest
+scripts/detector_bench.sh --config bundled:pentest --preset pentest
 ```
 
 Latency in the per-case rows tells you the cost of each addition;

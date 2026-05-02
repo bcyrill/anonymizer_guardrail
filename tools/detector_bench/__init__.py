@@ -10,6 +10,6 @@ production wheel — same scoping as `tools/launcher/`. Operators install
 via `pip install -e ".[dev]"`.
 
 Entry point: `python -m tools.detector_bench --config <path>`. Bash
-wrapper at `scripts/benchmark.sh` mirrors the launcher
+wrapper at `scripts/detector_bench.sh` mirrors the launcher
 wrappers' shape.
 """

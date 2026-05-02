@@ -8,11 +8,11 @@
 # flag stuff that should be left alone?"
 #
 # Usage:
-#   scripts/benchmark.sh --config bundled:pentest
-#   scripts/benchmark.sh --config bundled:pentest --preset pentest
-#   scripts/benchmark.sh --config tests/corpus/legal.yaml
+#   scripts/detector_bench.sh --config bundled:pentest
+#   scripts/detector_bench.sh --config bundled:pentest --preset pentest
+#   scripts/detector_bench.sh --config tests/corpus/legal.yaml
 #
-# See `scripts/benchmark.sh --help` for the full flag list.
+# See `scripts/detector_bench.sh --help` for the full flag list.
 
 set -uo pipefail
 
@@ -22,5 +22,5 @@ cd "${SCRIPT_DIR}/.."
 # BENCH_PROG_NAME makes --help's "Usage:" line read `scripts/...sh`
 # rather than `python -m tools.detector_bench`, matching how the
 # operator invokes us.
-exec env BENCH_PROG_NAME="scripts/benchmark.sh" \
+exec env BENCH_PROG_NAME="scripts/detector_bench.sh" \
     python3 -m tools.detector_bench "$@"

@@ -1,7 +1,7 @@
 """Tests for tools/detector_bench.
 
 Covers corpus loading + the scoring math. The HTTP layer is tested
-manually via `scripts/benchmark.sh --preset …` — too
+manually via `scripts/detector_bench.sh --preset …` — too
 heavy for the unit suite.
 """
 
