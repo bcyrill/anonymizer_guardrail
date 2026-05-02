@@ -97,32 +97,80 @@ _LABEL_MAP: dict[str, str] = {
 
 _DEFAULT_MODEL = "openai/privacy-filter"
 
-# Per-type rules for merging consecutive same-type spans the model split.
+# Per-label rules for merging consecutive same-type spans the model split.
 # NER models routinely emit two PERSON spans for "Alice Smith" instead of
-# one — without this, each half gets its own surrogate and the output ends
-# up as two concatenated fake names.
+# one — without merging, each half gets its own surrogate and the output
+# ends up as two concatenated fake names.
 #
-# Conservative on purpose: a span gap with ANY non-whitespace character
-# (slash, pipe, semicolon, "and", etc.) is treated as a list separator
-# and the spans stay distinct. We only merge across pure whitespace, so
-# "Alice / Bob" keeps its two-person structure ("Fake1 / Fake2"), while
-# "Alice Smith" collapses into one entity.
+# The rule has three knobs per label: a max-gap length (how far apart can
+# the spans sit), the allowed connector character set (which characters
+# can appear in the gap), and an unconditional `\n\n`-block (paragraph
+# breaks are always a stronger separator than a same-label call).
 #
-# Addresses are the one exception: the comma is part of the address
-# itself ("123 Main St, Springfield" is one place), so the ADDRESS rule
-# also accepts whitespace-and-comma gaps.
-#
-# Both rules forbid `\n\n` (paragraph break). A blank line is a stronger
-# separator than a same-type label call from the model — when a date at
-# the end of one paragraph sits next to a header word at the start of the
-# next that the model misclassified as a date, those should stay two
-# spans, not merge into one. `[^\S\n]` matches whitespace except newline;
-# `\n?` permits at most one newline inside the gap, which still covers
-# normal in-paragraph line wrapping (including `\r\n`).
-_DEFAULT_GAP_PATTERN = re.compile(r"[^\S\n]*\n?[^\S\n]*")
-_GAP_PATTERNS: dict[str, re.Pattern[str]] = {
-    "ADDRESS": re.compile(r"(?:[^\S\n]|,)*\n?(?:[^\S\n]|,)*"),
+# Approach inspired by chiefautism/privacy-parser's `_MAX_GAP_BY_LABEL` —
+# more semantically meaningful than a single shared regex, because each
+# label has its own behaviour: emails don't legitimately span whitespace
+# at all, account numbers shouldn't span more than one connector char,
+# person names are usually one to three whitespace chars apart, etc.
+_MAX_GAP_BY_LABEL: dict[str, int] = {
+    "PERSON": 3,
+    "ADDRESS": 3,
+    "DATE_OF_BIRTH": 3,
+    "URL": 2,
+    "PHONE": 2,
+    "CREDENTIAL": 2,
+    "IDENTIFIER": 1,
+    "EMAIL_ADDRESS": 0,   # never merge — emails don't fragment with whitespace
 }
+# Conservative default for any label not in the table above (e.g. OTHER):
+# allow at most one connector char so a model that emits ad-hoc labels
+# doesn't get permissive merging by default.
+_DEFAULT_MAX_GAP = 1
+
+# Allowed connector characters in a merge gap. Default is whitespace
+# (space, tab, single newline, carriage return) — `\n\n` itself is
+# blocked unconditionally below regardless of label, so listing `\n` here
+# only enables intra-paragraph wrapping merges. ADDRESS adds commas
+# because they're structurally part of the value ("123 Main St,
+# Springfield" is one place). Slashes / semicolons / "and" stay out of
+# every set — those are list separators, not intra-entity glue.
+_DEFAULT_CONNECTORS: frozenset[str] = frozenset(" \t\n\r")
+_CONNECTORS_BY_LABEL: dict[str, frozenset[str]] = {
+    "ADDRESS": _DEFAULT_CONNECTORS | frozenset(","),
+}
+
+
+def _gap_is_mergeable(
+    source_text: str,
+    left_end: int,
+    right_start: int,
+    label: str,
+) -> bool:
+    """Decide whether two adjacent same-label spans should merge,
+    given the gap of source text between them.
+
+    Rules in priority order:
+      1. Negative gap (overlap)              → never merge.
+      2. Empty gap (truly adjacent)          → always merge.
+      3. Gap contains `\\n\\n`               → never merge (a paragraph
+         break is a stronger separator than the model's same-label call).
+      4. Gap longer than the label's max     → never merge.
+      5. Otherwise merge iff every gap char is in the label's allowed
+         connector set.
+    """
+    if right_start < left_end:
+        return False
+    gap = source_text[left_end:right_start]
+    if not gap:
+        return True
+    if "\n\n" in gap:
+        return False
+    max_gap = _MAX_GAP_BY_LABEL.get(label, _DEFAULT_MAX_GAP)
+    if len(gap) > max_gap:
+        return False
+    connectors = _CONNECTORS_BY_LABEL.get(label, _DEFAULT_CONNECTORS)
+    return all(ch in connectors for ch in gap)
+
 
 # Paragraph break — used by the split pass to break apart a single
 # span the HF pipeline already aggregated across a `\n\n`. The
@@ -133,10 +181,6 @@ _GAP_PATTERNS: dict[str, re.Pattern[str]] = {
 # as one span. Splitting it here applies the same logical rule the
 # merge pass enforces from the opposite direction.
 _PARAGRAPH_BREAK = re.compile(r"\n{2,}")
-
-
-def _gap_pattern_for(entity_type: str) -> re.Pattern[str]:
-    return _GAP_PATTERNS.get(entity_type, _DEFAULT_GAP_PATTERN)
 
 
 def _load_pipeline(model_name: str) -> Any:
@@ -234,17 +278,19 @@ class PrivacyFilterDetector:
         # introduced by aggregation strategies in future transformers.
         extracted.sort(key=lambda s: (s[0], s[1]))
 
-        # 2) merge — same type, non-overlapping, gap matches the type's
-        # rule. Anything else stays as a separate entity.
+        # 2) merge — same type, gap mergeable by the label's rule.
+        # `_gap_is_mergeable` handles the negative-gap (overlap),
+        # empty-gap, paragraph-break, length-cap, and connector-set
+        # checks in one call.
         merged: list[tuple[int, int, str]] = []
         for start, end, etype in extracted:
             if merged:
                 prev_start, prev_end, prev_etype = merged[-1]
-                if prev_etype == etype and prev_end <= start:
-                    gap = source_text[prev_end:start]
-                    if not gap or _gap_pattern_for(etype).fullmatch(gap):
-                        merged[-1] = (prev_start, end, etype)
-                        continue
+                if prev_etype == etype and _gap_is_mergeable(
+                    source_text, prev_end, start, etype,
+                ):
+                    merged[-1] = (prev_start, end, etype)
+                    continue
             merged.append((start, end, etype))
 
         # 3) split — break any span that crosses a paragraph break.

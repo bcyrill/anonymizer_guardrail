@@ -245,6 +245,51 @@ async def test_persons_with_comma_stay_distinct(mock_load: MagicMock) -> None:
     assert len(matches) == 2
 
 
+async def test_emails_never_merge_across_whitespace(mock_load: MagicMock) -> None:
+    """EMAIL_ADDRESS has max_gap=0 — emails don't legitimately fragment
+    with whitespace between halves, so two adjacent EMAIL_ADDRESS spans
+    are far more likely two distinct emails (CSV-style listing) than
+    one entity the tokenizer split. Per-label cap from the privacy-
+    parser-inspired _MAX_GAP_BY_LABEL table."""
+    from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterDetector
+
+    text = "Contacts: alice@example.com bob@example.com cc'd."
+    mock_load.return_value = [
+        {"entity_group": "private_email", "score": 0.99,
+         "word": "alice@example.com",
+         "start": 10, "end": 27},
+        {"entity_group": "private_email", "score": 0.99,
+         "word": "bob@example.com",
+         "start": 28, "end": 43},
+    ]
+    detector = PrivacyFilterDetector()
+    matches = await detector.detect(text)
+    assert len(matches) == 2
+    assert {m.text for m in matches} == {"alice@example.com", "bob@example.com"}
+
+
+async def test_long_whitespace_gap_blocks_person_merge(mock_load: MagicMock) -> None:
+    """PERSON's max_gap is 3 chars. A 4-space gap between two PERSON
+    spans exceeds the cap and the merge is refused — even though every
+    character in the gap is a valid connector. Caps complement the
+    connector-set check: a long whitespace run is more likely a
+    formatting boundary (column alignment, sentence break) than
+    intra-name spacing."""
+    from anonymizer_guardrail.detector.privacy_filter import PrivacyFilterDetector
+
+    text = "Hi Alice    Smith there"
+    mock_load.return_value = [
+        {"entity_group": "private_person", "score": 0.99, "word": "Alice",
+         "start": 3, "end": 8},
+        {"entity_group": "private_person", "score": 0.97, "word": "Smith",
+         "start": 12, "end": 17},
+    ]
+    detector = PrivacyFilterDetector()
+    matches = await detector.detect(text)
+    assert len(matches) == 2
+    assert {m.text for m in matches} == {"Alice", "Smith"}
+
+
 async def test_paragraph_break_blocks_merge(mock_load: MagicMock) -> None:
     """A pure `\\n\\n` between two same-type spans is a paragraph break,
     which is a stronger separator than the model's same-label call.

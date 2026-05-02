@@ -331,3 +331,173 @@ chat history with many short turns).
 - Don't batch the regex / denylist / privacy_filter detectors. They
   don't benefit from amortizing a system prompt because they don't
   have one.
+
+---
+
+## Shape-anchored regex override tier in privacy-filter
+
+**What:** add an explicit override layer to the privacy-filter
+post-processing (or to the regex detector's priority logic) so
+that strong-shape regex matches override conflicting model labels
+for a known set of prefixes:
+`AKIA…`, `ghp_…`, `gho_…`, `sk-…`, `pk-…`, `xoxb-…`, `xoxp-…`,
+`Bearer …`, plus URLs starting with `http://` / `https://`. Direct
+adaptation of
+[chiefautism/privacy-parser's](https://github.com/chiefautism/privacy-parser/blob/main/pii_parser/hybrid.py)
+`HybridPIIParser._apply_regex_backstop`.
+
+**Why:** the empirical findings on `engagement_notes.txt` showed:
+
+- GitHub PAT (`ghp_a1b2…`) — caught by gliner-pii at 1.000 as
+  `api_key`, missed by privacy-filter.
+- AWS access key (`AKIA…`) — caught by privacy-filter as part of a
+  multi-line CREDENTIAL block at moderate confidence; the bare
+  prefix would be a deterministic regex hit.
+- Phone-vs-account mislabels: privacy-parser specifically calls out
+  the case where a long digit string the model labels as PHONE is
+  actually an account number; their account-regex overrides the
+  phone label when the regex span fully contains the model span.
+
+These are exactly the failure modes a shape-anchored override
+list would close. Privacy-parser's strategy is: keep model output
+where it exists, but if a strong-shape regex match overlaps a
+model span with the *wrong* label, the regex wins.
+
+**Why deferred:** our regex detector already runs in parallel to
+privacy_filter and the pipeline's deduplication gives regex
+priority for matching strings, so most of this works in practice.
+The override tier is a refinement, not a fix for an active bug —
+worth landing once we've confirmed the post-merge probe output
+shows the override would catch real misses on real fixtures.
+
+**Sketch:**
+
+1. Decide where the override lives. Two options:
+   - **Inside the privacy-filter detector's post-processing.** A
+     small post-filter that runs after `_to_matches`: drop model
+     spans whose text starts with these prefixes, ceding to the
+     regex layer. No new regex pass; just span suppression.
+   - **In the regex detector's priority layer.** Higher-priority
+     "shape-anchored" rules that override existing regex matches
+     and signal to the dedup phase that they should win against
+     overlapping model spans.
+
+   Option A is more targeted (only touches privacy-filter). Option
+   B is more general (covers gliner-pii misses too) but bigger.
+2. Build the prefix list:
+   - Schemed URLs: `http://`, `https://`
+   - API key prefixes: `AKIA`, `ghp_`, `gho_`, `sk-`, `pk-`,
+     `xoxb-`, `xoxp-`
+   - Token-like: `Bearer ` (with trailing space — distinguishes
+     from prose mention of the word)
+3. Tests:
+   - Feed mock model output that mislabels `ghp_a1b2…` as `OTHER`
+     (or any wrong label), assert the override drops it.
+   - Same for `AKIA…`, `Bearer abc…`, `https://example.com/x`.
+   - Sanity: a `Bob Roberts` PERSON span doesn't get accidentally
+     overridden (no prefix matches).
+4. The phone-vs-account containment swap from privacy-parser is a
+   separate sub-task — defer until we observe the failure mode in
+   our fixtures (we haven't yet).
+
+**Non-goals:**
+
+- Don't replace the regex detector's existing rules — this is an
+  override *tier*, not a rewrite.
+- Don't add prefixes for `cryptocurrency_address` / `private_key`
+  shapes yet. The seven listed above are the empirically-needed
+  set; expand only with evidence.
+
+---
+
+## opf-based Viterbi decoding (root-cause fix for span-boundary bugs)
+
+**What:** replace the `transformers.pipeline("token-classification",
+aggregation_strategy="first")` in both
+`services/privacy_filter/main.py` and
+`src/anonymizer_guardrail/detector/privacy_filter.py` with the
+`opf` package's API (`OPF.redact()` with `decode_mode="viterbi"`
+and tuned `viterbi_biases`). Configure transition biases to
+discourage merging across paragraph boundaries — the inverse of
+what [chiefautism/privacy-parser](https://github.com/chiefautism/privacy-parser/blob/main/pii_parser/hybrid.py)
+tunes for (they tune to encourage merging "Quindle Testwick"
+together; we want the opposite — discourage merging across blank
+lines).
+
+The `opf` package is the inference wrapper from OpenAI's
+[privacy-filter](https://github.com/openai/privacy-filter) repo,
+not currently on PyPI. Privacy-parser installs it via
+`pip install -e ./privacy-filter` from a local checkout.
+
+**Why:** our `\n\n` over-merge bug was that HF's
+`aggregation_strategy="first"` collapses adjacent same-entity
+tokens regardless of whitespace gaps in the source. We patched it
+post-hoc with a split pass in `_to_matches` (step 3). A more
+principled fix is at the decoder layer: tune
+`transition_bias_end_to_background` positive and
+`transition_bias_inside_to_continue` negative so the BIOES Viterbi
+terminates spans where confidence drops, including at paragraph
+boundaries.
+
+The six biases the calibration JSON accepts:
+
+- `transition_bias_background_stay`
+- `transition_bias_background_to_start`
+- `transition_bias_inside_to_continue`
+- `transition_bias_inside_to_end`
+- `transition_bias_end_to_background`
+- `transition_bias_end_to_start`
+
+**Why deferred:** substantial work, dependency change, packaging
+question (opf isn't on PyPI). The split pass + per-label gap caps
+already cover the observed failure modes; this is an upgrade, not
+a fix. Worth a spike before committing.
+
+**Sketch:**
+
+1. **Spike** (~half a day): clone OpenAI's privacy-filter repo at
+   `https://github.com/openai/privacy-filter` alongside ours,
+   install `opf` editable into a dev venv, benchmark
+   `OPF.redact(text, decode_mode="viterbi")` against the current
+   HF wrapper on `services/privacy_filter/scripts/sample.txt`
+   and `services/gliner_pii/scripts/engagement_notes.txt`. Confirm
+   same model + same labels + measurable boundary-decision
+   improvements on the over-merge cases.
+2. **Packaging:** decide between
+   (a) vendoring a stripped-down version of opf into our repo,
+   (b) requiring a local checkout in dev (unsuitable for production
+       containers),
+   (c) building a tiny wheel and hosting it ourselves,
+   (d) waiting for OpenAI to publish opf on PyPI.
+   Most likely (a) for the inference glue + (d) long-term.
+3. **Calibrate** the six biases against our fixtures:
+   - Increase `transition_bias_end_to_background` to encourage span
+     termination at neutral context.
+   - Decrease `transition_bias_inside_to_continue` to discourage
+     running across uncertainty.
+   - Validate via the existing test suite + new fixture-based
+     regression tests that compare span boundaries against a known-
+     good baseline.
+4. **Migration:** apply in lockstep to both files (parity contract).
+   Update the Containerfile's pip-install step to pull `opf`.
+5. **Decide on the split pass:** keep as defense-in-depth
+   (recommended — Viterbi tuning reduces but doesn't guarantee zero
+   bad merges) or remove. Easier to keep until we have months of
+   production data showing it's never firing.
+6. **Update docs:** `services/privacy_filter/scripts/PROBE.md`'s
+   empirical findings section gets a new "post-Viterbi" run with
+   updated span numbers; `docs/detectors/privacy-filter.md` gets a
+   note about the decoding tuning.
+
+**Non-goals:**
+
+- Don't switch other detectors (gliner-pii uses a different model
+  with no equivalent tuning surface; would need a separate spike).
+- Don't expose the bias values as runtime env vars yet — calibrate
+  to good defaults first. Exposing too early invites operators to
+  twiddle without understanding the BIOES transition implications.
+- Don't try to get model predictions out of the HF pipeline and
+  re-decode them ourselves. The opf wrapper's whole point is that
+  it owns the decoder; reimplementing the Viterbi outside opf
+  would mean reproducing the calibration logic and is not
+  worth the maintenance burden.
