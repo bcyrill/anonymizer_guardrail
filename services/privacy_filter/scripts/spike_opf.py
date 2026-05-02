@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
-"""Phase-1 spike for the opf-based Viterbi decoding migration.
+"""Calibration-comparison utility for the opf Viterbi decoder.
 
-Runs the OpenAI Privacy Filter model via the `opf` package's API
-against the existing fixtures, with three different calibration
-profiles. Goal: decide whether tuned Viterbi terminates spans at
-paragraph boundaries cleanly enough to replace our post-hoc
-`_PARAGRAPH_BREAK` split pass in
-`services/privacy_filter/main.py`.
+Originally written as the Phase-1 spike that gated the
+`transformers.pipeline` → `opf.OPF` migration (see
+`services/privacy_filter/scripts/PROBE.md` → "After the opf
+migration" for the empirical findings that came out of it).
+The migration's now live; we keep this script as the runnable
+calibration-comparison tool — useful when:
 
-See TASKS.md → "opf-based Viterbi decoding" → Phase 1 for the
-full plan and the decision criteria this script informs.
+  * An opf upstream update lands and we want to re-verify span
+    boundaries against our fixtures.
+  * A new corpus surfaces a precision/recall gap that calibration
+    tuning might close (the in-process detector reads
+    `PRIVACY_FILTER_CALIBRATION` env, which points at a JSON in
+    the same format the profiles below produce).
+  * Someone wants to understand the bias dial empirically rather
+    than read the README.
+
+Three calibration profiles ship side-by-side:
+
+  1. `default` — opf with no bias tuning. The production decoder.
+  2. `anti-merge` — encourage span termination at neutral context;
+     discourage running across paragraph breaks. The setting we
+     considered shipping but didn't because `default` already wins.
+  3. `privacy-parser` — biases the chiefautism/privacy-parser repo
+     uses (pro-merge, glues fragmented person names back together).
+     Included as a contrast: confirms the dial moves behaviour in
+     the expected direction.
 
 Prerequisites:
 
@@ -40,33 +57,16 @@ Run from the repo root:
 
     python services/privacy_filter/scripts/spike_opf.py
 
-Output: for each fixture, three runs side by side:
+Output: for each fixture, the three profiles run side by side
+against `sample.txt` and `engagement_notes.txt`. Spans containing
+`\\n\\n` are flagged with a warning marker — those would be the
+paragraph-break over-merges the merge/split passes in
+`services/privacy_filter/main.py::_to_matches` exist to clean up,
+and they should be zero on every profile (the original spike
+finding that justified shipping `default` for production).
 
-  1. `default` — opf with no bias tuning. Establishes the baseline
-     and confirms the decoder works at all without calibration.
-  2. `anti-merge` — biases tuned for OUR use case: encourage span
-     termination at neutral context, discourage running across
-     paragraph breaks. If this profile produces clean spans on
-     `sample.txt` (no `Customer:` / `Resolution:` glued onto dates,
-     no `Issue` glued onto the address) and on `engagement_notes.txt`
-     (no `Spotted` / `SHA-256` glued onto the AWS-key block / JWT),
-     the migration is worth doing.
-  3. `privacy-parser` — biases the chiefautism/privacy-parser repo
-     uses (pro-merge, designed to glue fragmented person names back
-     together). Included as a contrast: confirms the bias dial
-     actually moves behaviour in the expected direction. If this
-     profile makes things *worse* than `default` on our fixtures
-     while `anti-merge` makes them better, the calibration surface
-     is doing what we expect.
-
-The compared "current behaviour" baseline lives in
-services/privacy_filter/scripts/PROBE.md → Empirical findings —
-the post-fix span tables there are what each profile here should
-match or beat.
-
-Spans containing `\\n\\n` are flagged in the output with a warning
-marker — those are the over-merges the migration needs to
-eliminate.
+The pinned post-migration span tables in PROBE.md are what each
+profile's output should match or beat.
 """
 
 from __future__ import annotations
@@ -183,8 +183,9 @@ def _run_one(opf_instance: OPF, text: str) -> list[dict[str, Any]]:
 
 def _format_table(spans: list[dict[str, Any]], source_text: str) -> str:
     """Render spans as a fixed-width table. Spans whose source-text
-    slice contains `\\n\\n` get a warning marker — those are the
-    over-merges Phase 1 is here to detect."""
+    slice contains `\\n\\n` get a warning marker — paragraph-break
+    over-merges, the failure mode the production merge/split passes
+    in `_to_matches` exist to clean up."""
     if not spans:
         return "  (no matches)"
     lines = []
@@ -254,21 +255,22 @@ def _summary(per_fixture: dict[Path, dict[str, list[dict[str, Any]]]]) -> None:
                 f"{len(spans):>5}  {with_paragraph_break:>10}"
             )
     print()
-    print("Decision criteria for proceeding to Phase 2 (TASKS.md):")
-    print("  * `anti-merge` profile: 0 spans with \\n\\n on both fixtures")
-    print("  * span counts roughly comparable to the post-fix output in")
-    print("    services/privacy_filter/scripts/PROBE.md → Empirical findings")
-    print("  * confidence scores look reasonable (no degraded recall)")
+    print("Health check — the production decoder (`default`) should:")
+    print("  * 0 spans containing \\n\\n on every fixture")
+    print("  * span counts and labels matching the post-migration tables")
+    print("    in services/privacy_filter/scripts/PROBE.md →")
+    print("    'After the opf migration'")
     print()
-    print("If `anti-merge` still shows over-merges that bias tuning can't")
-    print("eliminate, abandon the migration: the existing split pass + per-")
-    print("label gap caps are good enough and the remaining 5-6 days of")
-    print("Phase 2-6 work isn't justified.")
+    print("If the `default` profile drifts from the pinned numbers (e.g.")
+    print("after an opf upstream update), the deviation is the signal —")
+    print("either the model was retrained, the decoder semantics changed,")
+    print("or there's a regression worth bisecting.")
 
 
 def main() -> int:
-    print("opf Viterbi spike — comparing calibration profiles against the")
-    print("PROBE.md fixtures. See TASKS.md → 'opf-based Viterbi decoding'.")
+    print("opf Viterbi calibration comparison.")
+    print("See PROBE.md → 'After the opf migration' for the pinned post-")
+    print("migration span tables this run should match.")
     per_fixture: dict[Path, dict[str, list[dict[str, Any]]]] = {}
     for fixture in _FIXTURES:
         per_fixture[fixture] = _run_fixture(fixture)
