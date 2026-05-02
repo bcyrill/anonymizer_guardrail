@@ -36,7 +36,7 @@ from .detector import (
 )
 from .detector.base import CachingDetector, Detector, Match
 from .surrogate import SurrogateGenerator
-from .vault import Vault
+from .vault import VaultBackend, build_vault
 
 log = logging.getLogger("anonymizer.pipeline")
 
@@ -164,7 +164,11 @@ class Pipeline:
     def __init__(self) -> None:
         self._detectors: list[Detector] = _build_detectors()
         self._surrogates = SurrogateGenerator()
-        self._vault = Vault()
+        # Vault backend is config-driven (memory by default; redis when
+        # operators select multi-replica). Pipeline holds the Protocol
+        # type so callers don't depend on the concrete implementation —
+        # see `vault.build_vault()` for the dispatch.
+        self._vault: VaultBackend = build_vault()
 
         # Concurrency caps and in-flight counters live in dicts keyed
         # by spec name — one entry per detector that opted into a
@@ -275,7 +279,7 @@ class Pipeline:
         return out
 
     @property
-    def vault(self) -> Vault:
+    def vault(self) -> VaultBackend:
         return self._vault
 
     def _resolve_active_detectors(
@@ -519,8 +523,18 @@ class Pipeline:
         return still_merged, demoted
 
     async def aclose(self) -> None:
-        """Release per-detector resources (httpx connection pools, etc).
+        """Release per-detector resources (httpx connection pools, etc)
+        plus the vault backend (Redis connection pool when applicable).
         Wired to FastAPI's lifespan in main.py so shutdown is clean."""
+        # Vault first — its aclose is a no-op for MemoryVault and a
+        # connection-pool drain for RedisVault. Order doesn't matter
+        # for correctness; doing vault first surfaces Redis errors
+        # before we churn through detector clients.
+        try:
+            await self._vault.aclose()
+        except Exception as exc:  # noqa: BLE001 — never fail shutdown
+            log.warning("Vault aclose failed: %s", exc)
+
         for det in self._detectors:
             close = getattr(det, "aclose", None)
             if close is not None:
@@ -714,7 +728,7 @@ class Pipeline:
         modified = [replace(t) for t in texts]
 
         if reverse_mapping and call_id:
-            self._vault.put(call_id, reverse_mapping)
+            await self._vault.put(call_id, reverse_mapping)
         elif reverse_mapping and not call_id:
             log.warning(
                 "Anonymized %d entities but no call_id was provided — "
@@ -732,7 +746,7 @@ class Pipeline:
         """Reverse the substitution using the stored mapping for this call_id."""
         if not texts:
             return []
-        mapping = self._vault.pop(call_id) if call_id else {}
+        mapping = await self._vault.pop(call_id) if call_id else {}
         if not mapping:
             log.debug("deanonymize call_id=%s — nothing to restore", call_id)
             return texts

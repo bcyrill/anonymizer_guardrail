@@ -20,7 +20,9 @@ config instances via `model_copy(update={...})`.
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from typing import Literal
+
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -96,15 +98,36 @@ class Config(BaseSettings):
     surrogate_salt: str = ""
 
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
+    # Backend selection. "memory" (default) is process-local — fine
+    # for single-replica deployments. "redis" routes the vault through
+    # `RedisVault` (in `vault_redis.py`) for multi-replica deployments
+    # where pre_call and post_call may land on different replicas. The
+    # redis dependency is opt-in via the `vault-redis` extra; selecting
+    # "redis" without installing the extra fails loud at boot with a
+    # clear error.
+    vault_backend: Literal["memory", "redis"] = "memory"
+    # Redis connection URL. Required when vault_backend="redis"; ignored
+    # otherwise. Use a dedicated logical DB index (`/<n>`) per
+    # deployment so `DBSIZE` and key scans don't collide with other
+    # consumers of the same Redis instance.
+    vault_redis_url: str = ""
+    # Per-entry TTL. Applies to BOTH backends — MemoryVault checks it
+    # in `pop`; RedisVault sets it via `EXPIRE` so Redis evicts
+    # expired entries server-side. Drops mappings whose post_call
+    # never came (client errored out, timed out, etc.) so memory /
+    # Redis doesn't grow unbounded.
     vault_ttl_s: int = 600
-    # Hard cap on vault entries. TTL-only eviction fires lazily on put(), so a
-    # burst of unique call_ids without matching post_calls (client crashes,
-    # timeouts, malicious flood) can grow the vault to millions of entries
-    # before TTL clears them. The cap forces LRU eviction on overflow as a
-    # backstop. Each entry is a small dict of surrogate→original strings
-    # (~hundreds of bytes typical), so 10k entries ≈ a few MB worst case.
-    # Raise if your traffic legitimately holds many in-flight call_ids
-    # simultaneously (very chatty conversations, long-running streams).
+    # Hard cap on vault entries. Memory backend only — TTL-only
+    # eviction fires lazily on put(), so a burst of unique call_ids
+    # without matching post_calls (client crashes, timeouts, malicious
+    # flood) can grow the vault to millions of entries before TTL
+    # clears them. The cap forces LRU eviction on overflow as a
+    # backstop. Each entry is a small dict of surrogate→original
+    # strings (~hundreds of bytes typical), so 10k entries ≈ a few MB
+    # worst case. Raise if your traffic legitimately holds many
+    # in-flight call_ids simultaneously (very chatty conversations,
+    # long-running streams). Redis backend has no equivalent — operators
+    # bound Redis memory via `maxmemory` policy on the Redis side.
     vault_max_entries: int = 10_000
 
     @field_validator("detector_mode", mode="after")
@@ -115,6 +138,21 @@ class Config(BaseSettings):
         # `detector_mode` field readable in /health output regardless of
         # how the operator capitalised the env var.
         return v.lower()
+
+    @model_validator(mode="after")
+    def _vault_redis_url_required_for_redis_backend(self) -> "Config":
+        """Cross-field check: VAULT_BACKEND=redis demands VAULT_REDIS_URL.
+        Fail at boot rather than at first request — an unreachable URL is
+        an operator concern, but an *unset* URL is misconfiguration that
+        we can flag immediately."""
+        if self.vault_backend == "redis" and not self.vault_redis_url.strip():
+            raise ValueError(
+                "VAULT_BACKEND=redis requires VAULT_REDIS_URL to be set "
+                "(e.g. redis://localhost:6379/0). Either set the URL or "
+                "switch to VAULT_BACKEND=memory for single-replica "
+                "deployments."
+            )
+        return self
 
 
 config = Config()

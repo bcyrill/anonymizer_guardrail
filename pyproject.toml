@@ -28,6 +28,12 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
+    # In-process Redis substitute for `RedisVault` tests. Implements
+    # the redis-py asyncio interface against an in-memory store, so
+    # CI doesn't need a real Redis server. Pinned major version
+    # because fakeredis tracks redis-py's API shape and we want to
+    # know when the API drifts.
+    "fakeredis>=2.20",
     # Launcher (tools/launcher/) — Click for the flag-driven CLI,
     # Textual for the interactive menu (single-screen menuconfig-
     # style UI, mirrors what scripts/launcher.sh --ui did with the bash
@@ -48,6 +54,13 @@ dev = [
 # regex (pure stdlib) — install this extra only when DENYLIST_BACKEND=aho.
 denylist-aho = [
     "pyahocorasick>=2.0",
+]
+# Redis-backed vault for multi-replica deployments. Default backend
+# stays the in-memory `MemoryVault` (zero deps); install this extra
+# when setting `VAULT_BACKEND=redis`. The slim production image
+# stays unaffected when operators don't need Redis.
+vault-redis = [
+    "redis>=5.0",
 ]
 
 [project.scripts]

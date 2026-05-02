@@ -61,58 +61,6 @@ instrumentation.
 
 ---
 
-## Multi-replica support (Redis-backed Vault)
-
-**What:** make the call-id → mapping store pluggable, and add a Redis-backed
-implementation alongside the existing in-memory `Vault`. Selected via
-env var (e.g. `VAULT_BACKEND=memory|redis`).
-
-**Why:** today the vault is a process-local dict. The pre-call (anonymize)
-and post-call (deanonymize) hooks must land on the same replica or the
-mapping is lost — the response gets shipped back to the user with surrogates
-still in it. This works for a single-replica deployment; it breaks the
-moment anyone runs >1 replica behind a load balancer (the typical HA
-posture). README already calls this out as a known limitation.
-
-**Why deferred:** single-replica is fine for many deployments. Adding Redis
-pulls in operational complexity (deploy + monitor + secure another piece of
-infra) that's unwarranted until horizontal scaling is actually needed.
-
-**Sketch:**
-
-1. Extract a `VaultBackend` Protocol from the current `Vault` class — two
-   methods, `put(call_id, mapping)` and `pop(call_id) -> dict`. Move the
-   in-memory implementation to `MemoryVault` (or keep `Vault` as the
-   in-memory default).
-2. Add `RedisVault` using `redis-py` with `asyncio` support:
-   - Key: `f"vault:{call_id}"`, value: msgpack/JSON-encoded mapping.
-   - TTL via Redis `EXPIRE` (replaces the in-memory `_evict_expired` loop).
-   - `pop` = `GETDEL` (atomic).
-3. Add `VAULT_BACKEND` and `REDIS_URL` env vars; wire selection in
-   `Pipeline.__init__`.
-4. Tests via `fakeredis` so CI doesn't need a real Redis.
-5. Open question for the **surrogate cache**: stay per-replica (acceptable
-   inconsistency — same entity on different replicas may get different
-   surrogates) or also move to Redis (stronger consistency, extra round
-   trip per surrogate)? For the typical pre/post-call pair landing on
-   different replicas, only the *vault* needs to be shared — the
-   surrogate is built into the request, not re-derived on the response
-   side. So per-replica surrogate cache is fine; document it.
-6. The **detector result cache** is a separable concern with its own
-   triggers (multi-replica, restart persistence, cross-replica hit
-   rate) — see *Redis-backed detector result cache* below.
-7. Document the limitation that's now solved + the new env vars.
-
-**Concrete trigger:** the day someone adds a second replica.
-
-**Non-goals:**
-
-- Don't generalize to "any KV store" — one production-quality backend
-  (Redis) covers the use case. Cassandra/DynamoDB/etc. can be added
-  per-need.
-
----
-
 ## Redis-backed detector result cache
 
 **What:** add a `RedisDetectionCache` implementation alongside the
@@ -126,10 +74,10 @@ durable cache:
 
 - **Multi-replica.** A request routed to replica B can't reuse work
   done on replica A, so cache hit rate degrades inversely with the
-  number of replicas. Distinct from the *Multi-replica support
-  (Redis-backed Vault)* task above — that one is about correctness
-  (lost mappings ⇒ unredacted responses), this one is about
-  efficiency (cold caches per replica).
+  number of replicas. Distinct from the vault Redis path
+  (`VAULT_BACKEND=redis`, already shipped) which is about
+  *correctness* (lost mappings ⇒ unredacted responses); the
+  detector cache is about *efficiency* (cold caches per replica).
 - **Restart persistence.** Multi-turn conversations live for
   minutes-to-hours; a deploy mid-conversation drops every cached
   detection result and the next replayed history pays full LLM cost
@@ -217,9 +165,10 @@ a factory selector — no edits to detector code.
   hashable to `get_or_compute` either way — the backend decides
   what to do with it.
 - **Don't move the surrogate cache to Redis as part of this task.**
-  That's covered in *Multi-replica support* with a different set of
-  trade-offs (correctness vs. efficiency). Keep the scopes
-  separate.
+  Cross-replica surrogate consistency is handled by `SURROGATE_SALT`
+  (deterministic seeded BLAKE2b — every replica derives the same
+  surrogate without sharing state). A Redis-backed surrogate cache
+  would buy memoization speedup, not correctness; out of scope here.
 - **Don't add per-detector Redis URLs.** If operators want to
   shard, they can put a different DB number per detector
   (`redis://host/0` for LLM, `redis://host/1` for gliner) via

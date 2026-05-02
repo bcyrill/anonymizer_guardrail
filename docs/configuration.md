@@ -39,8 +39,10 @@ docs:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. See [vault](vault.md). |
-| `VAULT_MAX_ENTRIES` | `10000` | Hard cap on vault entries; LRU-evicted on overflow as a backstop against a flood of unique `call_id`s before TTL clears them. Raise for sustained high in-flight traffic; floor of 1 protects against typos. |
+| `VAULT_BACKEND` | `memory` | `memory` (default) or `redis`. Memory is process-local; Redis shares state across replicas. See [vault → Backends](vault.md#backends). |
+| `VAULT_REDIS_URL` | *(empty)* | Required when `VAULT_BACKEND=redis`. Format: `redis://[user:pass@]host:port/db`. Setting `redis` without this fails at boot. Install `pip install "anonymizer-guardrail[vault-redis]"` to get the redis dep. |
+| `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. Applies to both backends. See [vault](vault.md). |
+| `VAULT_MAX_ENTRIES` | `10000` | Memory backend only. Hard cap; LRU-evicted on overflow. Redis bounds via its own `maxmemory` policy. Floor of 1 protects against typos. |
 
 ## Capping detector concurrency
 

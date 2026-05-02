@@ -1,12 +1,33 @@
 """
-In-memory mapping store keyed by litellm_call_id.
+Mapping store keyed by `litellm_call_id`.
 
-A pre_call writes the surrogate→original mapping; the matching post_call reads
-and evicts it. Entries are TTL'd in case the post_call never arrives (request
-errored out, client disconnected, etc.) so memory doesn't grow unbounded.
+The pre_call writes the surrogate→original mapping; the matching
+post_call reads and evicts it. Entries are TTL'd in case the
+post_call never arrives (request errored out, client disconnected,
+etc.) so memory doesn't grow unbounded.
 
-For multi-replica deployments, swap this for Redis. The interface is small
-enough that the swap is a one-class change.
+# Backends
+
+`VaultBackend` is the Protocol the pipeline codes against; concrete
+implementations plug in below it. Two backends ship today:
+
+  * `MemoryVault` (default) — process-local, zero dependencies.
+    Suitable for single-replica deployments. The pre_call and
+    post_call MUST land on the same replica or the mapping is lost.
+  * `RedisVault` — shared store; suitable for multi-replica
+    deployments behind a load balancer. Lives in
+    `vault_redis.py` so the redis-py dependency only loads when
+    actually selected (operators install via `pip install
+    "anonymizer-guardrail[vault-redis]"`).
+
+Selection happens in `build_vault()` based on `VAULT_BACKEND`. The
+factory is the only place that imports a concrete backend; the
+pipeline references the Protocol type so swapping doesn't ripple
+across the codebase.
+
+`Vault` is kept as a name alias for `MemoryVault` so existing
+imports of `from anonymizer_guardrail.vault import Vault` keep
+working.
 """
 
 from __future__ import annotations
@@ -15,13 +36,75 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from typing import Protocol, runtime_checkable
 
 from .config import config
 
 log = logging.getLogger("anonymizer.vault")
 
 
-class Vault:
+@runtime_checkable
+class VaultBackend(Protocol):
+    """Round-trip mapping store contract.
+
+    Implementations: `MemoryVault` (in-process, default) and
+    `RedisVault` (in `vault_redis.py`, opt-in via
+    `VAULT_BACKEND=redis`).
+
+    `put` and `pop` are async because Redis I/O is fundamentally
+    async; bouncing through a thread pool would defeat the
+    event-loop architecture for what's a hot-path operation
+    (called twice per request: pre_call + post_call). MemoryVault
+    implements them as thin async wrappers around its sync body
+    so the contract is uniform.
+
+    `size` stays sync — it's a `/health` accessor, not on the
+    request hot path; for MemoryVault it's a `len()` call, for
+    RedisVault it's a documented placeholder (operators query
+    Redis directly for the actual count, e.g. `DBSIZE` on a
+    dedicated DB index).
+
+    `runtime_checkable` so a future test can `isinstance`-narrow a
+    backend if needed; costs nothing at runtime.
+    """
+
+    async def put(self, call_id: str, mapping: dict[str, str]) -> None:
+        """Store the surrogate→original mapping for one call. Empty
+        mapping or empty call_id is a no-op."""
+        ...
+
+    async def pop(self, call_id: str) -> dict[str, str]:
+        """Retrieve and remove the mapping. Returns `{}` if absent or
+        expired. Idempotent — second pop with the same call_id
+        returns `{}`."""
+        ...
+
+    def size(self) -> int:
+        """In-flight entry count, surfaced as `vault_size` on
+        `/health`. MemoryVault returns the exact length;
+        RedisVault returns 0 — operators read the actual count via
+        `DBSIZE` or `SCAN MATCH vault:*` against the configured
+        Redis DB."""
+        ...
+
+    async def aclose(self) -> None:
+        """Drain any open connections. Wired to `Pipeline.aclose`
+        so FastAPI shutdown closes Redis pools cleanly. No-op for
+        MemoryVault."""
+        ...
+
+
+class MemoryVault:
+    """Process-local mapping store backed by an OrderedDict + TTL +
+    LRU cap. Default backend; suitable for single-replica
+    deployments.
+
+    Multi-replica deployments need `RedisVault` (see
+    `vault_redis.py`) — the pre_call and post_call must land on the
+    same replica or the mapping is lost. See
+    `docs/limitations.md` for the broader story.
+    """
+
     def __init__(
         self, ttl_s: int | None = None, max_entries: int | None = None
     ) -> None:
@@ -42,8 +125,13 @@ class Vault:
         self._store: OrderedDict[str, tuple[float, dict[str, str]]] = OrderedDict()
         self._lock = threading.Lock()
 
-    def put(self, call_id: str, mapping: dict[str, str]) -> None:
-        """Store the surrogate→original mapping for one call."""
+    async def put(self, call_id: str, mapping: dict[str, str]) -> None:
+        """Store the surrogate→original mapping for one call.
+
+        Async-by-protocol; the body is fully synchronous (in-memory
+        dict + threading.Lock). The lock is sub-microsecond so the
+        coroutine doesn't yield — it returns to the caller immediately
+        after the dict update."""
         if not call_id or not mapping:
             return
         with self._lock:
@@ -70,7 +158,7 @@ class Vault:
                     self._max_entries, evicted,
                 )
 
-    def pop(self, call_id: str) -> dict[str, str]:
+    async def pop(self, call_id: str) -> dict[str, str]:
         """Retrieve and remove the mapping for a call. Returns {} if absent/expired.
 
         Expiry is logged at ERROR (not WARNING) because it means the
@@ -108,6 +196,12 @@ class Vault:
         with self._lock:
             return len(self._store)
 
+    async def aclose(self) -> None:
+        """No-op for the in-memory backend — no connections to drain.
+        Kept for Protocol compatibility so `Pipeline.aclose()` can call
+        it uniformly across backends."""
+        return None
+
     def _evict_expired_locked(self) -> None:
         """Remove expired entries from the start of the store.
 
@@ -129,12 +223,57 @@ class Vault:
                 to_del.append(cid)
             else:
                 break
-        
+
         for cid in to_del:
             del self._store[cid]
-        
+
         if to_del:
             log.debug("Evicted %d expired vault entries", len(to_del))
 
 
-__all__ = ["Vault"]
+# Backward-compatible name alias. Existing code that did
+# `from .vault import Vault` continues to work without an edit;
+# new code should reference `MemoryVault` (or, better, the
+# `VaultBackend` Protocol type for fields/properties).
+Vault = MemoryVault
+
+
+def build_vault() -> VaultBackend:
+    """Construct the configured vault backend.
+
+    Reads `VAULT_BACKEND` from the central config:
+      * `memory` (default) — `MemoryVault`. Zero deps.
+      * `redis` — `RedisVault`. Requires the `redis` package
+        (install via `pip install "anonymizer-guardrail[vault-redis]"`)
+        and a reachable Redis at `VAULT_REDIS_URL`.
+
+    The redis import is deferred to *inside* the redis branch so
+    operators on the memory backend never pay for the import — the
+    slim production image doesn't need redis-py loaded.
+    """
+    backend = config.vault_backend
+    if backend == "memory":
+        return MemoryVault()
+    if backend == "redis":
+        from .vault_redis import RedisVault  # local import — see docstring
+        return RedisVault(
+            url=config.vault_redis_url,
+            ttl_s=config.vault_ttl_s,
+        )
+    raise RuntimeError(
+        f"Unknown VAULT_BACKEND={backend!r}. Allowed: memory, redis."
+    )
+
+
+__all__ = ["MemoryVault", "RedisVault", "Vault", "VaultBackend", "build_vault"]
+
+
+# RedisVault is re-exported lazily so `from anonymizer_guardrail.vault
+# import RedisVault` works without the redis dep when nobody actually
+# touches RedisVault. The `__all__` above lists it for documentation;
+# attempting the import resolves it lazily here.
+def __getattr__(name: str):  # PEP 562 — module-level __getattr__
+    if name == "RedisVault":
+        from .vault_redis import RedisVault
+        return RedisVault
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

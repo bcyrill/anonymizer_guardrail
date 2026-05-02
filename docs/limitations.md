@@ -4,26 +4,30 @@ Known constraints of the current implementation. None of these are
 hard blockers for the typical single-replica deployment, but each is
 worth knowing about before you commit to a topology.
 
-## Single replica
+## Single replica (default; opt out with `VAULT_BACKEND=redis`)
 
-The [vault](vault.md) is in-memory; mappings written on one replica
-aren't visible from another. Two consequences:
+The default [vault](vault.md) backend (`MemoryVault`) is
+process-local; mappings written on one replica aren't visible from
+another. Two consequences when running this default:
 
-- **No horizontal scale-out.** A second replica can serve traffic, but
-  every `request` and the matching `response` MUST land on the same
-  replica — otherwise the response side has no mapping to restore from
-  and ships unredacted text upstream.
+- **No horizontal scale-out.** A second replica can serve traffic,
+  but every `request` and the matching `response` MUST land on the
+  same replica — otherwise the response side has no mapping to
+  restore from and ships unredacted text upstream.
 - **Restarts lose in-flight round-trips.** Pre-restart `request` →
   post-restart `response` won't deanonymize. The
-  [VAULT_TTL_S](vault.md#configuration) backstop bounds the leak from
-  the other direction (vault grows when responses don't arrive), but
-  there's nothing to do about a restart mid-round-trip beyond
-  accepting it as a small loss.
+  [VAULT_TTL_S](vault.md#configuration) backstop bounds the leak
+  from the other direction (vault grows when responses don't
+  arrive), but there's nothing to do about a restart
+  mid-round-trip beyond accepting it as a small loss.
 
-For multi-replica deployments, swap the in-memory `Vault` for a
-Redis-backed implementation — the interface is two methods (`put` and
-`pop`). Tracked in
-[`TASKS.md` → Multi-replica support](../TASKS.md#multi-replica-support-redis-backed-vault).
+**Solved for multi-replica deployments by `VAULT_BACKEND=redis`.**
+Selecting the Redis backend gives a shared store: pre_call and
+post_call can land on different replicas, and restart-mid-round-trip
+survives provided Redis stayed up. Install with
+`pip install "anonymizer-guardrail[vault-redis]"` and set
+`VAULT_REDIS_URL`; see [vault → Backends](vault.md#backends) for
+the wire format and failure modes.
 
 ## No streaming responses
 
@@ -61,9 +65,11 @@ requests) only holds within one process. A second replica generates
 its own surrogates from the same originals — same shape, but
 different values unless you set a stable
 [SURROGATE_SALT](surrogates.md#surrogate-salt-privacy-hardening).
-Whether to move the surrogate cache to a shared backend or accept
-per-replica inconsistency is an open question on
-[`TASKS.md` → Multi-replica support](../TASKS.md#multi-replica-support-redis-backed-vault).
+With a stable salt every replica derives the same surrogate
+deterministically (the cache is just a memoization layer over
+seeded BLAKE2b), so a shared Redis-backed surrogate cache is *not*
+required for multi-replica deployments — `SURROGATE_SALT` is the
+canonical answer. The cache stays per-replica.
 
 ## No `/metrics` endpoint
 
