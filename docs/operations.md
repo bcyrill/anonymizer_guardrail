@@ -175,13 +175,20 @@ LLM/gliner/PF can.
 
 ### Configuration
 
-Currently wired for the LLM detector. Per-detector knobs for
-gliner-pii and privacy-filter follow the same shape and would be
-opt-in extensions of this mechanism.
+Wired for all three slow detectors. Each has its own knob — the
+choice is per-detector because the trade-offs differ in practice
+(LLM benefits most from system-prompt amortization; PF / gliner
+benefit more from cross-segment context).
 
 | Variable | Default | Notes |
 |---|---|---|
 | `LLM_INPUT_MODE` | `per_text` | `per_text` keeps the existing fan-out; `merged` collapses to one call per request. |
+| `PRIVACY_FILTER_INPUT_MODE` | `per_text` | Same shape as `LLM_INPUT_MODE` for the privacy-filter detector. |
+| `GLINER_PII_INPUT_MODE` | `per_text` | Same shape as `LLM_INPUT_MODE` for the gliner-pii detector. |
+
+The fast detectors (`regex`, `denylist`) intentionally do not have
+this knob — they're shape-based and microseconds per call; merging
+adds boundary-spanning false positives without amortization upside.
 
 ### Two wins
 
@@ -212,11 +219,13 @@ opt-in extensions of this mechanism.
   or returning a span that crosses a boundary
   ("Alice<SEP>Smith" as PERSON). Operators don't see this; it's
   silent defense in depth.
-- **Size fallback.** If the merged blob exceeds the detector's
-  `LLM_MAX_CHARS` cap, that detector falls back to per_text
+- **Size fallback.** If the merged blob exceeds a detector's
+  `max_chars` cap (currently only the LLM detector declares one,
+  via `LLM_MAX_CHARS`), that detector falls back to per_text
   dispatch *for that one request* (debug log emitted). The
   optimization is opportunistic — a single oversized request
-  doesn't break detection coverage.
+  doesn't break detection coverage. Privacy-filter and gliner have
+  no `max_chars` and rely on the remote service's own size policy.
 
 ### When to enable
 

@@ -51,6 +51,7 @@ equally to both variants. Variant-specific notes are flagged inline.
 | `PRIVACY_FILTER_FAIL_CLOSED` | `true` | Block requests when the privacy_filter detector errors. Independent flag — operators can fail closed on one detector and open on another. |
 | `PRIVACY_FILTER_MAX_CONCURRENCY` | `10` | Semaphore on in-flight `privacy_filter` calls. Independent of `LLM_MAX_CONCURRENCY`. Surfaced as `pf_in_flight` / `pf_max_concurrency` on `/health`. |
 | `PRIVACY_FILTER_CACHE_MAX_SIZE` | `0` | LRU cap on the privacy-filter detector's result cache. `0` disables caching (default). When enabled, repeat calls with the same input text skip the remote PF round-trip. See [operations → Detector result caching](../operations.md#detector-result-caching) for the trade-offs. |
+| `PRIVACY_FILTER_INPUT_MODE` | `per_text` | How the pipeline dispatches `req.texts` to this detector. `per_text` (default) calls the detector once per text; `merged` concatenates all texts with a sentinel separator and makes one call per request. See [operations → Merged-input mode](../operations.md#merged-input-mode) for the trade-offs. Mutually exclusive with `PRIVACY_FILTER_CACHE_MAX_SIZE`: setting both logs a warning at boot and the cache is bypassed. |
 
 ## Configuration (service-side)
 

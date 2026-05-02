@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import field_validator
@@ -76,6 +76,22 @@ class PrivacyFilterConfig(BaseSettings):
     # overrides today, so the cache key is just (text,). See
     # detector/cache.py for the trade-offs.
     cache_max_size: int = 0
+    # How the pipeline dispatches `req.texts` to this detector:
+    #   "per_text" (default) — one detect() call per text, in
+    #     parallel under the PF concurrency cap. Compatible with the
+    #     result cache; preserves per-text failure isolation.
+    #   "merged"   — concatenate all texts with a sentinel separator
+    #     and make one detect() call against the blob. Useful when
+    #     PF's NER classification benefits from cross-segment context
+    #     (e.g. an ambiguous span in one text reads more clearly given
+    #     a related neighbouring text). Mutually exclusive with the
+    #     result cache: every blob is unique by construction, so a
+    #     non-zero `cache_max_size` paired with merged mode logs a
+    #     warning and the cache is silently bypassed.
+    # PF has no `max_chars` cap, so the merged blob is sent as-is —
+    # the privacy-filter-service decides its own size policy.
+    # See `pipeline.py` for the dispatch logic.
+    input_mode: Literal["per_text", "merged"] = "per_text"
 
     @field_validator("url", mode="after")
     @classmethod

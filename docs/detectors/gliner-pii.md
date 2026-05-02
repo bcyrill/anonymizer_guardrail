@@ -34,6 +34,7 @@ crashes loud at boot.
 | `GLINER_PII_THRESHOLD` | *(empty → server default)* | Confidence cutoff (0..1) sent with every request. Empty = use the gliner-pii-service's `DEFAULT_THRESHOLD`. |
 | `GLINER_PII_MAX_CONCURRENCY` | `10` | Semaphore on in-flight gliner-pii calls. Independent of `LLM_MAX_CONCURRENCY` and `PRIVACY_FILTER_MAX_CONCURRENCY`. Surfaced as `gliner_pii_in_flight`/`gliner_pii_max_concurrency` on `/health`. |
 | `GLINER_PII_CACHE_MAX_SIZE` | `0` | LRU cap on the gliner-pii detector's result cache. `0` disables caching (default). When enabled, repeat calls with the same `(text, labels, threshold)` skip the remote gliner round-trip. Per-call `labels` order is part of the cache key — different orderings get different slots. See [operations → Detector result caching](../operations.md#detector-result-caching) for the trade-offs. |
+| `GLINER_PII_INPUT_MODE` | `per_text` | How the pipeline dispatches `req.texts` to this detector. `per_text` (default) calls the detector once per text; `merged` concatenates all texts with a sentinel separator and makes one call per request. See [operations → Merged-input mode](../operations.md#merged-input-mode) for the trade-offs. Mutually exclusive with `GLINER_PII_CACHE_MAX_SIZE`: setting both logs a warning at boot and the cache is bypassed. |
 
 ## Per-request overrides
 

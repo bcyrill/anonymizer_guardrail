@@ -315,3 +315,208 @@ def test_no_warning_when_cache_or_merge_alone(
         r for r in caplog.records
         if "input_mode=merged" in r.message and "cache_max_size" in r.message
     ]
+
+
+# ── Privacy-filter detector merge mode ──────────────────────────────────
+# Same dispatch contract as the LLM tests above, just driving a different
+# detector. The pipeline dispatch is detector-agnostic (reads
+# `spec.config.input_mode` via getattr), so these tests mostly catch
+# config-wiring regressions: did the field land on PrivacyFilterConfig,
+# does the pipeline see it, etc.
+
+
+def _stub_pf_detector(detect_fn):
+    """A bare RemotePrivacyFilterDetector with custom detect()."""
+    from anonymizer_guardrail.detector.remote_privacy_filter import (
+        RemotePrivacyFilterDetector,
+    )
+    bad = RemotePrivacyFilterDetector.__new__(RemotePrivacyFilterDetector)
+    bad.name = "privacy_filter"
+    bad._cache = InMemoryDetectionCache(0)
+    bad.detect = detect_fn  # type: ignore[method-assign]
+    return bad
+
+
+def _patch_pf_config(monkeypatch: pytest.MonkeyPatch, **updates) -> None:
+    from anonymizer_guardrail.detector import remote_privacy_filter as pf_mod
+    monkeypatch.setattr(
+        pf_mod, "CONFIG", pf_mod.CONFIG.model_copy(update=updates),
+    )
+
+
+async def test_pf_merged_mode_calls_detector_once_with_joined_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_pf_config(monkeypatch, fail_closed=False, input_mode="merged")
+
+    seen: list[str] = []
+
+    async def detect(text, *_args, **_kwargs):
+        seen.append(text)
+        return []
+
+    p = Pipeline()
+    p._detectors = [_stub_pf_detector(detect)]
+
+    await p.anonymize(["alpha", "beta"], call_id="pf-merged")
+    assert seen == [_MERGE_SENTINEL.join(["alpha", "beta"])]
+
+
+async def test_pf_merged_filters_sentinel_spanning_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_pf_config(monkeypatch, fail_closed=False, input_mode="merged")
+
+    async def detect(_text, *_args, **_kwargs):
+        return [
+            Match(text="alice", entity_type="PERSON"),
+            Match(text=f"alice{_MERGE_SENTINEL}bob", entity_type="PERSON"),
+        ]
+
+    p = Pipeline()
+    p._detectors = [_stub_pf_detector(detect)]
+
+    _, mapping = await p.anonymize(["alice met bob"], call_id="pf-sentinel")
+    assert "alice" in mapping.values()
+    for original in mapping.values():
+        assert "ANONYMIZER-SEGMENT-BREAK" not in original
+
+
+def test_pf_cache_plus_merge_emits_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _patch_pf_config(monkeypatch, input_mode="merged", cache_max_size=100)
+    with caplog.at_level(logging.WARNING, logger="anonymizer.pipeline"):
+        Pipeline()
+    matched = [
+        r for r in caplog.records
+        if "input_mode=merged" in r.message
+        and "privacy_filter" in r.message.lower()
+    ]
+    assert matched, (
+        "expected WARNING about cache+merge for privacy_filter, "
+        f"got: {[r.message for r in caplog.records]}"
+    )
+
+
+# ── GLiNER-PII detector merge mode ──────────────────────────────────────
+
+
+def _stub_gliner_detector(detect_fn):
+    """A bare RemoteGlinerPIIDetector with custom detect()."""
+    from anonymizer_guardrail.detector.remote_gliner_pii import (
+        RemoteGlinerPIIDetector,
+    )
+    bad = RemoteGlinerPIIDetector.__new__(RemoteGlinerPIIDetector)
+    bad.name = "gliner_pii"
+    bad._cache = InMemoryDetectionCache(0)
+    bad.detect = detect_fn  # type: ignore[method-assign]
+    return bad
+
+
+def _patch_gliner_config(monkeypatch: pytest.MonkeyPatch, **updates) -> None:
+    from anonymizer_guardrail.detector import remote_gliner_pii as gp_mod
+    monkeypatch.setattr(
+        gp_mod, "CONFIG", gp_mod.CONFIG.model_copy(update=updates),
+    )
+
+
+async def test_gliner_merged_mode_calls_detector_once_with_joined_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gliner_config(monkeypatch, fail_closed=False, input_mode="merged")
+
+    seen: list[str] = []
+
+    async def detect(text, *_args, **_kwargs):
+        seen.append(text)
+        return []
+
+    p = Pipeline()
+    p._detectors = [_stub_gliner_detector(detect)]
+
+    await p.anonymize(["alpha", "beta"], call_id="gliner-merged")
+    assert seen == [_MERGE_SENTINEL.join(["alpha", "beta"])]
+
+
+async def test_gliner_merged_filters_sentinel_spanning_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gliner_config(monkeypatch, fail_closed=False, input_mode="merged")
+
+    async def detect(_text, *_args, **_kwargs):
+        return [
+            Match(text="alice", entity_type="PERSON"),
+            Match(text=f"alice{_MERGE_SENTINEL}bob", entity_type="PERSON"),
+        ]
+
+    p = Pipeline()
+    p._detectors = [_stub_gliner_detector(detect)]
+
+    _, mapping = await p.anonymize(["alice met bob"], call_id="gliner-sentinel")
+    assert "alice" in mapping.values()
+    for original in mapping.values():
+        assert "ANONYMIZER-SEGMENT-BREAK" not in original
+
+
+def test_gliner_cache_plus_merge_emits_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _patch_gliner_config(monkeypatch, input_mode="merged", cache_max_size=100)
+    with caplog.at_level(logging.WARNING, logger="anonymizer.pipeline"):
+        Pipeline()
+    matched = [
+        r for r in caplog.records
+        if "input_mode=merged" in r.message
+        and "gliner_pii" in r.message.lower()
+    ]
+    assert matched, (
+        "expected WARNING about cache+merge for gliner_pii, "
+        f"got: {[r.message for r in caplog.records]}"
+    )
+
+
+# ── Multi-detector merge mode ───────────────────────────────────────────
+
+
+async def test_all_three_detectors_in_merge_mode_each_get_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All three slow detectors in merge mode → each receives exactly
+    one call (with the same blob), regardless of how many texts are in
+    the request. The unified TaskGroup runs them in parallel."""
+    _patch_llm_config(monkeypatch, fail_closed=False, input_mode="merged")
+    _patch_pf_config(monkeypatch, fail_closed=False, input_mode="merged")
+    _patch_gliner_config(monkeypatch, fail_closed=False, input_mode="merged")
+
+    llm_seen: list[str] = []
+    pf_seen: list[str] = []
+    gliner_seen: list[str] = []
+
+    async def llm_detect(text, *_args, **_kwargs):
+        llm_seen.append(text)
+        return []
+
+    async def pf_detect(text, *_args, **_kwargs):
+        pf_seen.append(text)
+        return []
+
+    async def gliner_detect(text, *_args, **_kwargs):
+        gliner_seen.append(text)
+        return []
+
+    p = Pipeline()
+    p._detectors = [
+        _stub_llm_detector(llm_detect),
+        _stub_pf_detector(pf_detect),
+        _stub_gliner_detector(gliner_detect),
+    ]
+
+    await p.anonymize(
+        ["alpha", "beta", "gamma"], call_id="all-three-merged",
+    )
+
+    expected_blob = _MERGE_SENTINEL.join(["alpha", "beta", "gamma"])
+    assert llm_seen == [expected_blob]
+    assert pf_seen == [expected_blob]
+    assert gliner_seen == [expected_blob]

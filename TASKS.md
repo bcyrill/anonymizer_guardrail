@@ -326,145 +326,6 @@ log aggregator. Premature otherwise.
 
 ---
 
-## Per-detector merged-input mode
-
-**What:** a per-detector knob (`<DETECTOR>_INPUT_MODE=per_text|merged`)
-that controls whether the detector receives `req.texts` as N separate
-calls (the current behaviour) or as a single concatenated blob with
-sentinel separators. Detectors in `merged` mode trade the per-text
-result cache for one round-trip per request and stronger context.
-
-**Status:** Phase 1 (LLM detector) shipped. Pipeline-level dispatch
-is detector-agnostic — partitioning by `input_mode`, sentinel-
-joined merged blob, size fallback to per_text when the blob exceeds
-`max_chars`, sentinel filtering on returned matches, and the
-cache + merge mutual-exclusivity warning at Pipeline init. See
-`pipeline.py:_partition_by_input_mode` / `_apply_merge_size_fallback`
-and `tests/test_pipeline_merge_mode.py`. Operator surface:
-`LLM_INPUT_MODE=per_text|merged` (default `per_text`).
-
-Phase 2 (extending to `privacy_filter` and `gliner_pii`) is the
-mechanical follow-up: add `input_mode` to each detector's `*Config`,
-mirror the LLM tests with the detector-specific stub. The pipeline
-work is already done. Triggered when an operator wants merge mode
-for those detectors (the dispatch is ready; only the config field
-needs to land).
-
-The detector result cache landed (see
-`detector/cache.py` + `LLM_CACHE_MAX_SIZE`), which addresses the
-*repeat-history* dimension of multi-turn cost. Merge mode addresses
-the *fan-out per request* dimension, which the cache does not help
-with: a fresh first turn with N small `texts` still pays N LLM
-round-trips. The two optimizations are complementary but mutually
-exclusive *per detector*: a detector running in merged mode sees a
-unique blob each call, so caching is meaningless and the knob
-disables the cache for that detector's calls.
-
-**Why:** two distinct wins.
-
-1. **Token / latency amortization.** Each text in `req.texts`
-   produces its own `_detect_one` task in `Pipeline.anonymize`, each
-   of which fans out to its own LLM call. For a request with 10
-   short texts, that's 10 round-trips, each carrying the ~600-token
-   system prompt — ~6500 system-prompt tokens for ~500 user tokens
-   (13× overhead). One round-trip with the prompt sent once cuts
-   tokens and wall-clock latency (one TTFT + longer generation vs.
-   ten TTFTs serialized through a concurrency cap of 10).
-
-2. **Context quality** *(the new piece — wasn't in the original
-   "LLM batching" framing).* Context-aware detectors (LLM, gliner,
-   privacy_filter) classify better when they can see the surrounding
-   text. A bare username in one text might be ambiguous in
-   isolation but obviously a CREDENTIAL when a sibling text is
-   "password reset request for…". Per-text fan-out hides that
-   correlation; merged input restores it. Regex and denylist don't
-   care — they're shape-based — so the knob is per-detector by design.
-
-**Why deferred:** non-trivial, and the trade-offs intersect with
-the cache work in ways worth thinking through before committing:
-
-- **Cache vs. merge are mutually exclusive.** A merged blob is
-  unique per request, so `InMemoryDetectionCache` would 100% miss.
-  Operators choose one mode per detector, not both. The knob
-  documentation needs to make this explicit.
-- **Failure mode worsens.** Today one LLM call failing only loses
-  detection for one text; under `fail_closed=False` the others
-  still get coverage. Merged, a single bad response loses coverage
-  for the whole request.
-- **Hallucination guard needs care.** The existing guard in
-  `_parse_entities` (`detector/llm.py`) checks `text in source_text`.
-  With merged source, a hallucinated entity from text 2 could pass
-  the check via text 1 if it happens to appear there. Mitigation:
-  use a sentinel separator that's unlikely to appear in any
-  detected entity, and (optionally) per-segment hallucination
-  scoping if the response carries which-segment metadata.
-- **Cross-boundary entities.** A detector seeing the merged blob
-  might find an entity that *spans* a join (e.g. "Alice" at the end
-  of text 1, "Smith" at the start of text 2 → "Alice Smith" as
-  PERSON). The replacer pattern won't match anything in either
-  real text — cosmetic but confusing in logs. Sentinel choice
-  matters.
-- **Heterogeneous sizes.** A request with one 50k-char text and
-  nine 50-char texts shouldn't merge — the merged blob blows past
-  `LLM_MAX_CHARS`. Need a sizing heuristic (mode falls back to
-  per-text when the merged blob would exceed the cap).
-
-**Concrete trigger:** a deployment shows a meaningful share of LLM
-detection cost / latency tied to small-fragment fan-out, OR
-operators report context-quality regressions (entities the LLM
-catches in a contiguous prompt but misses when it's split into
-`req.texts` entries).
-
-**Sketch:**
-
-1. Add `cache_max_size` already in place in each slow detector's
-   `*Config`. Add a sibling `input_mode: Literal["per_text","merged"]`
-   field, default `"per_text"`. Validate the per-detector
-   "cache + merge are mutually exclusive" combination at boot
-   (warn-and-prefer-merged if both are configured non-trivially,
-   or fail loud — pick one and document it).
-2. Move the per-text fan-out from `Pipeline._detect_one` into a
-   per-detector dispatch: detectors in `per_text` mode run inside
-   the existing TaskGroup; detectors in `merged` mode run once per
-   request against the merged blob, and their matches join the
-   per-text matches at dedup.
-3. Sentinel separator: a token unlikely to occur in entities
-   (`\n\n--- BREAK ---\n\n` or similar). Document it; reserve it as
-   "do not emit as part of an entity" in the LLM prompt.
-4. Sizing fallback: if the merged blob exceeds `LLM_MAX_CHARS`,
-   degrade to `per_text` for that one request (with a debug log)
-   rather than raising — the optimization is opportunistic.
-5. Hallucination guard: still run `text in source_text` against the
-   merged blob. Consider a stricter guard once the prompt is
-   updated to return per-segment metadata.
-6. Cache integration: when `input_mode="merged"`, skip the cache
-   path entirely (the cache is bypassed regardless of
-   `cache_max_size`). Document this in the operator-facing knob.
-7. Bench: add a `docs/benchmark.md` section comparing per-text vs.
-   merged mode on (a) a many-small-texts request (token
-   amortization) and (b) a context-sensitive detection corpus
-   (quality).
-
-**Non-goals:**
-
-- **Don't batch across requests.** Cross-request batching needs a
-  coalescing window (extra latency for the first request in the
-  window) and undermines per-request `Overrides`. Out of scope.
-- **Don't merge for regex / denylist.** They're shape-based and
-  microsecond-fast per call; merging adds boundary-spanning false
-  positives without the LLM's amortization upside.
-- **Don't try to make the per-text cache and merge mode coexist
-  per detector.** A merged blob is unique per request by
-  construction; the per-text-keyed `InMemoryDetectionCache` 100%
-  misses against it. A *different* cache shape (prefix-keyed,
-  exploiting that turn N+1 extends turn N's blob) recovers most
-  of the benefit while keeping merge mode — see
-  *Prefix-based cache for merge mode* below. Don't try to bolt
-  the per-text cache onto merge-mode output; build the prefix
-  cache when the optimization is actually wanted.
-
----
-
 ## Prefix-based cache for merge mode
 
 **What:** a sibling cache type, `PrefixDetectionCache` (or similar),
@@ -474,8 +335,11 @@ current blob, reuse those matches, run detection only on the
 remaining suffix (with a leading-context window for context-aware
 detectors), and merge results.
 
-**Why:** in *Per-detector merged-input mode*, each turn's merged
-blob is unique by construction, so the existing per-text
+**Why:** under merge mode (now wired for LLM, privacy_filter, and
+gliner_pii via `<DETECTOR>_INPUT_MODE=merged`; see
+`pipeline.py:_partition_by_input_mode` and
+`tests/test_pipeline_merge_mode.py`), each turn's merged blob is
+unique by construction — so the existing per-text
 `InMemoryDetectionCache` 100% misses. But turn N+1's blob is
 byte-identical to turn N's blob up to the message boundary, plus
 new content appended:
@@ -578,10 +442,9 @@ per-text cache when `input_mode="merged"`.
   prefix walk), different eviction semantics, and different
   staleness trade-offs. One detector picks one cache type per
   `input_mode`, not both.
-- **Don't reimplement the LLM detector's batching.** This
-  optimization sits on top of merge mode; it doesn't replace or
-  duplicate the *Per-detector merged-input mode* task's prompt /
-  response-format work.
+- **Don't reimplement merge mode itself.** This optimization sits
+  on top of the existing merge dispatch (already wired in
+  `pipeline.py`); it doesn't replace or duplicate that mechanism.
 
 ---
 
