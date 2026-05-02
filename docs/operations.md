@@ -145,9 +145,14 @@ caching on, only newly-introduced text incurs the round-trip.
 Skip it for:
 
 - **Single-turn workloads** — there's nothing to reuse.
-- **Privacy-sensitive deployments where stable surrogates would be a
-  leak channel** — caching makes the detector's output stable across
-  turns, which by design makes the surrogate output stable too.
+- **Deployments that want fresh detection on every call** — caching
+  freezes a detector's verdict on a given input until LRU eviction
+  (the "Trade-off" subsection below explains why this is usually a
+  feature for chat). For one-shot scans where every call should run
+  full detection independently, leave the cache disabled. Note this
+  is distinct from *surrogate* stability across calls, which is
+  governed by [`SURROGATE_SALT`](surrogates.md#surrogate-salt-privacy-hardening),
+  not by the detector cache.
 
 ### Trade-off: stability vs. fresh detection
 

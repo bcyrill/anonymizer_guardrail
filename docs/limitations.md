@@ -36,6 +36,24 @@ Streaming-aware deanonymization is tracked in
 gated on a streaming use case actually showing up, since LiteLLM's
 streaming-guardrail contract may still evolve.
 
+## Hard cap on POST body size
+
+Request bodies above
+[`MAX_BODY_BYTES`](configuration.md#cross-cutting) (10 MiB by
+default) are rejected with HTTP 503 before Pydantic deserializes
+them — see `main.py:_BodySizeLimitMiddleware`. The cap exists as
+DoS protection (distinct from `LLM_MAX_CHARS`, which is an LLM-
+context-window concern that fires *after* parsing).
+
+503 — rather than the semantically-precise 413 — was chosen so
+LiteLLM's
+[`unreachable_fallback`](litellm-integration.md) setting governs
+the upstream call: under `fail_open` an oversized body lets the
+LLM call proceed, under `fail_closed` it blocks. LiteLLM hardcodes
+`is_unreachable in (502, 503, 504)`, so 413 would block
+unconditionally. Operators relying on `fail_open` for availability
+should know that an oversized body still respects that choice.
+
 ## Surrogate cache is process-local
 
 Cross-call consistency (same input → same surrogate across many

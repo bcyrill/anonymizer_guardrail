@@ -98,8 +98,14 @@ docs/                            # operator-facing documentation
                                  # detector vars live in detectors/<name>.md)
   litellm-integration.md         # LiteLLM wiring
   surrogates.md                  # surrogates / salt / Faker / locales
+  vault.md                       # round-trip mapping, TTL, size cap
   per-request-overrides.md       # additional_provider_specific_params
-  operations.md                  # vault, surrogate cache, /health
+  operations.md                  # /health, detector result caching,
+                                 # merged-input mode
+  limitations.md                 # known constraints (single replica,
+                                 # streaming, body-size cap, etc.)
+  design-decisions.md            # paths considered and declined
+  examples.md                    # curl recipes
   deployment.md                  # container images, build, run
   development.md                 # this file
   tools.md                       # implementation map for tools/launcher,

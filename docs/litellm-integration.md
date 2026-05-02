@@ -54,4 +54,4 @@ prompt, see [per-request overrides](per-request-overrides.md).
 
 For forwarding the caller's API key through to the detection LLM (so
 detection cost attributes back to the user's virtual key), see
-[configuration → Forwarding the caller's API key](configuration.md#forwarding-the-callers-api-key).
+[LLM detector → Forwarding the caller's API key](detectors/llm.md#forwarding-the-callers-api-key).
