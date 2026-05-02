@@ -1,8 +1,15 @@
 # `probe.py` — privacy-filter service probe
 
 `scripts/probe.py` hits a running privacy-filter service with a
-text input and prints the matches it returns, plus a count of
-matches per entity type.
+text input and prints the spans it returns, plus a count of spans
+per opf label.
+
+The probe deliberately shows raw opf labels (`private_email`,
+`private_person`, …) rather than the canonicalised names the
+guardrail emits — this is a window onto what the service does, not
+an end-to-end view. Existing tables further down this file still
+use the canonical names (`EMAIL_ADDRESS`, `PERSON`, …); they pre-
+date the wire-format change and are slated for a refresh.
 
 Stdlib-only — runs from any checkout without installing the
 service's Python deps. To start the service first, see the parent
@@ -18,22 +25,24 @@ If you've used [the gliner-pii probe](../../gliner_pii/scripts/PROBE.md),
 the practical contrasts when running this one:
 
 - **No `--labels`.** The privacy-filter model has a *fixed*
-  vocabulary baked in at training time. Entity types you can
-  expect: `PERSON`, `EMAIL_ADDRESS`, `PHONE`, `URL`, `ADDRESS`,
-  `DATE_OF_BIRTH`, `IDENTIFIER` (catch-all for IBAN / CC / SSN-
-  shaped strings), `CREDENTIAL`. Anything that doesn't fit a
-  trained label is dropped or routed through `OTHER`. To detect
-  custom categories like `vehicle_registration`, use gliner-pii
-  (zero-shot) or a regex.
+  vocabulary baked in at training time. Labels you can expect:
+  `private_person`, `private_email`, `private_phone_number`,
+  `private_url`, `private_address`, `private_date_of_birth`,
+  `private_identifier` (catch-all for IBAN / CC / SSN-shaped
+  strings), `private_credential`. To detect custom categories like
+  `vehicle_registration`, use gliner-pii (zero-shot) or a regex.
 - **No `--threshold`.** Different reason than gliner-pii: opf's
   `DetectedSpan` doesn't expose a per-span confidence at all, so
   there's no score to threshold on. The wire format omits the
   `score` field for that reason — for confidence-sensitive routing,
   layer the regex detector with stable shape anchors on top.
-- **Span merging happens server-side.** Adjacent same-type tokens
-  are combined into one match (so "Alice Smith" comes back as one
-  `PERSON` span, not two). See `_to_matches` in
-  `services/privacy_filter/main.py` for the rules.
+- **Span merging happens client-side.** The service emits raw
+  `DetectedSpan` records straight from opf's Viterbi decoder. Label
+  canonicalisation, paragraph-break split, and per-label gap-cap
+  merging all run in the guardrail-side
+  `RemotePrivacyFilterDetector._to_matches`. The probe shows opf's
+  raw output — same tokens you'd see if you called `OPF.redact()`
+  directly.
 - **Default port 8001** (gliner-pii is on 8002, so both can run
   side-by-side on the same docker network).
 
@@ -63,10 +72,12 @@ python services/privacy_filter/scripts/probe.py \
     --url http://privacy.internal:8001 \
     --text-file services/privacy_filter/scripts/sample.txt
 
-# Raw JSON for scripting — e.g. just the EMAIL_ADDRESS matches:
+# Raw JSON for scripting — e.g. just the email spans (opf labels
+# are emitted raw; the guardrail-side detector is what canonicalises
+# `private_email` → `EMAIL_ADDRESS`):
 python services/privacy_filter/scripts/probe.py \
     --text-file services/privacy_filter/scripts/sample.txt \
-    --json | jq '.matches[] | select(.entity_type == "EMAIL_ADDRESS")'
+    --json | jq '.spans[] | select(.label == "private_email")'
 ```
 
 ## Comparing detectors on the same fixture
@@ -291,7 +302,8 @@ inputs (support tickets, ticketing notes, conversational
 transcripts) for the standard PII set, but loses recall when the
 text layout fragments local context. Layer the regex detector on
 top — that's what `_to_matches` and the merge logic in the
-in-process detector are designed to compose with.
+guardrail-side `RemotePrivacyFilterDetector` are designed to
+compose with.
 
 ## After the opf migration
 

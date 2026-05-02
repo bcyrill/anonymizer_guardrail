@@ -6,7 +6,7 @@ fixtures so operators can:
 
   * Re-verify span boundaries after an opf upstream update.
   * Tune bias values when a new corpus surfaces a precision/recall
-    gap. The in-process detector reads `PRIVACY_FILTER_CALIBRATION`,
+    gap. The privacy-filter-service reads `PRIVACY_FILTER_CALIBRATION`,
     which points at a JSON in the same format the profiles below
     produce.
   * Understand the bias dial empirically rather than read the README.

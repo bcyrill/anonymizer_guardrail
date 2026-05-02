@@ -21,7 +21,7 @@ scripts/launcher.sh --ui
 
 # Or flag-driven with a preset:
 scripts/launcher.sh --preset uuid-debug      # slim + regex,llm + fake-llm
-scripts/launcher.sh --preset pentest         # pf + privacy_filter,llm + pentest config
+scripts/launcher.sh --preset pentest         # slim + regex,privacy_filter,llm + pf-service + fake-llm + pentest config
 scripts/launcher.sh --preset regex-only      # slim + regex only — no LLM creds needed
 ```
 
@@ -36,8 +36,8 @@ Five detection layers, all optional, controlled by `DETECTOR_MODE`:
 - **[denylist](docs/detectors/denylist.md)** — literal-string match
   against an operator-supplied YAML list (employee names, project
   codenames, customer IDs).
-- **[privacy_filter](docs/detectors/privacy-filter.md)** — local NER
-  (`openai/privacy-filter`), in-process or via a remote HTTP service.
+- **[privacy_filter](docs/detectors/privacy-filter.md)** — NER
+  (`openai/privacy-filter`) via a standalone HTTP service container.
   8 PII categories.
 - **[gliner_pii](docs/detectors/gliner-pii.md)** — remote zero-shot
   NER (`nvidia/gliner-pii`). Caller-supplied label set per request.

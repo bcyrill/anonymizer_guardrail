@@ -31,7 +31,7 @@ container (builds + runs + asserts via `launcher.sh --preset`):
 
 ```bash
 scripts/test-examples.sh --preset uuid-debug   # slim + regex,llm + fake-llm
-scripts/test-examples.sh --preset pentest      # pf + privacy_filter + pentest config
+scripts/test-examples.sh --preset pentest      # slim + regex,privacy_filter,llm + pf-service + fake-llm + pentest config
 scripts/test-examples.sh                       # connect to BASE_URL (already-running guardrail)
 ```
 
@@ -46,7 +46,6 @@ src/anonymizer_guardrail/        # the importable package — what ships
     regex.py                     # Each detector module owns its
     denylist.py                  # CONFIG + SPEC + (optionally)
     llm.py                       # Unavailable error class.
-    privacy_filter.py
     remote_privacy_filter.py
     remote_gliner_pii.py
   pipeline.py                    # Iterates REGISTERED_SPECS to build

@@ -2,13 +2,13 @@
 
 HTTP wrapper around the
 [openai/privacy-filter](https://huggingface.co/openai/privacy-filter)
-token-classification model. Pair with the guardrail's
-`RemotePrivacyFilterDetector` (set `PRIVACY_FILTER_URL` on the
-guardrail container, or `--privacy-filter-backend service` /
-`external` from the launcher) so the heavy ML deps live in their own
-container instead of inflating the guardrail image. See
+token-classification model. The guardrail's
+`RemotePrivacyFilterDetector` is the only consumer — there is no
+in-process variant. Set `PRIVACY_FILTER_URL` on the guardrail
+container, or use `--privacy-filter-backend service` / `external`
+from the launcher. See
 [docs/detectors/privacy-filter.md](../../docs/detectors/privacy-filter.md)
-for when to pick the in-process vs the remote variant.
+for the configuration knobs and image flavours.
 
 ## API
 
@@ -20,30 +20,29 @@ for when to pick the in-process vs the remote variant.
 
 // response
 {
-  "matches": [
+  "spans": [
     {
-      "text": "alice@example.com",
-      "entity_type": "EMAIL_ADDRESS",
+      "label": "private_email",
       "start": 6,
-      "end": 23
+      "end": 23,
+      "text": "alice@example.com"
     }
   ]
 }
 ```
 
-No per-span `score` field — opf's `DetectedSpan` doesn't expose
-confidence, and a synthetic constant would be worse than its
-absence (operators reading it would assume real signal). For
-confidence-sensitive routing, layer the regex detector with stable
-shape anchors on top.
-
-`entity_type` uses the same canonical names as the guardrail
-(`PERSON`, `EMAIL_ADDRESS`, `PHONE`, `URL`, `ADDRESS`, `DATE_OF_BIRTH`,
-`IDENTIFIER`, `CREDENTIAL`). Unknown labels fall back to `OTHER`.
-
-The post-processing — span extraction and same-type merge across
-whitespace gaps — is identical to the in-process detector, so output
-is byte-equivalent for the same input.
+The wire format is opf's raw `DetectedSpan` shape — `label` is the
+opf label verbatim (`private_person`, `private_email`,
+`private_phone_number`, `private_url`, `private_address`,
+`private_date_of_birth`, `private_identifier`, `private_credential`).
+Label canonicalisation, paragraph-break split, and per-label
+gap-cap post-processing all run client-side in the guardrail's
+[`RemotePrivacyFilterDetector`](../../src/anonymizer_guardrail/detector/remote_privacy_filter.py).
+This mirrors gliner-pii-service: the service is a thin model
+wrapper, the guardrail-side detector handles vocabulary mapping and
+heuristics. Per-span `score` isn't included — opf's `DetectedSpan`
+doesn't expose confidence, and a synthetic constant would be worse
+than its absence.
 
 ### `GET /health`
 
@@ -51,33 +50,50 @@ is byte-equivalent for the same input.
 { "status": "ok", "model": "openai/privacy-filter" }
 ```
 
-Status is `loading` until the model finishes loading at startup. The
-container `HEALTHCHECK` treats anything other than `ok` as unhealthy.
+Status is `loading` until the model finishes loading at startup
+(including a one-shot warmup `redact()` call to amortise lazy-init
+ahead of the first real request). The container `HEALTHCHECK`
+treats anything other than `ok` as unhealthy.
 
 ## Build
 
-Two flavours, both built from this directory:
+Four flavours, all built from this directory:
 
 ```bash
-# Runtime download — model downloads on first container start.
-podman build -t privacy-filter-service:latest \
+# CPU, runtime download
+podman build -t privacy-filter-service:cpu \
     -f Containerfile .
 
-# Baked — model shipped in the image, works air-gapped.
-podman build -t privacy-filter-service:baked \
+# CPU, model baked into the image (air-gapped runs)
+podman build -t privacy-filter-service:baked-cpu \
     --build-arg BAKE_MODEL=true \
+    -f Containerfile .
+
+# CUDA 13.0, runtime download — TARGET_DEVICE=cuda makes the
+# service default to GPU inference inside the container.
+podman build -t privacy-filter-service:cu130 \
+    --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 \
+    --build-arg TARGET_DEVICE=cuda \
+    -f Containerfile .
+
+# CUDA 13.0 + baked model
+podman build -t privacy-filter-service:baked-cu130 \
+    --build-arg BAKE_MODEL=true \
+    --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 \
+    --build-arg TARGET_DEVICE=cuda \
     -f Containerfile .
 ```
 
-Or use `scripts/image_builder.sh` from the repo root: types `pf-service`
-and `pf-service-baked`. See
+Or use `scripts/image_builder.sh` from the repo root: flavour names
+`pf-service`, `pf-service-baked`, `pf-service-cu130`,
+`pf-service-baked-cu130`. See
 [docs/deployment.md → Container images](../../docs/deployment.md#container-images)
 for the size/runtime trade-off across all flavours.
 
 ## Run
 
 ```bash
-# With a persistent cache so the model survives container recreates.
+# Persistent cache so the model survives container recreates.
 # opf writes its checkpoint into `/app/.opf/privacy_filter` (its
 # default model path), so that's where the volume mounts. HF_HOME
 # isn't involved — opf uses huggingface_hub for the download stage
@@ -85,7 +101,13 @@ for the size/runtime trade-off across all flavours.
 podman volume create privacy-filter-opf-cache
 podman run --rm -p 8001:8001 \
     -v privacy-filter-opf-cache:/app/.opf \
-    privacy-filter-service:latest
+    privacy-filter-service:cpu
+
+# CUDA flavour — host needs nvidia-container-toolkit installed.
+podman run --rm -p 8001:8001 \
+    --device nvidia.com/gpu=all \
+    -v privacy-filter-opf-cache:/app/.opf \
+    privacy-filter-service:cu130
 ```
 
 ## Probing
@@ -106,14 +128,12 @@ See [scripts/PROBE.md](scripts/PROBE.md) for runnable examples
 
 ## Configuration
 
-| Variable     | Default                  | Notes                                  |
-|--------------|--------------------------|----------------------------------------|
-| `HOST`       | `0.0.0.0`                |                                        |
-| `PORT`       | `8001`                   |                                        |
-| `MODEL_NAME` | `openai/privacy-filter`  | HuggingFace model id loaded at startup |
-| `LOG_LEVEL`  | `info`                   |                                        |
-
-GPU build: pass `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121`
-to the `podman build` (default is the CPU wheel index, since most
-deployments don't have a GPU and the CUDA `torch` wheel adds the
-nvidia runtime libraries on top).
+| Variable | Default | Notes |
+|---|---|---|
+| `HOST` | `0.0.0.0` | |
+| `PORT` | `8001` | |
+| `MODEL_NAME` | `openai/privacy-filter` | The default sentinel maps to opf's auto-download path; anything else is treated as a filesystem path to a local checkpoint directory. |
+| `PRIVACY_FILTER_DEVICE` | `cpu` (cpu image) / `cuda` (cu130 image) | Inference device. The Containerfile bakes the per-image default via `TARGET_DEVICE` build-arg. Override at run time only when you know the host has the right hardware/runtime for it. |
+| `PRIVACY_FILTER_CALIBRATION` | *(unset)* | Optional path *inside the container* to a Viterbi operating-points JSON. Empty / missing → opf's stock decoder. See [`scripts/spike_opf.py`](scripts/spike_opf.py) for the JSON shape and three pre-built profiles. |
+| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop `huggingface_hub` (used by opf during the model download) from pinging the Hub on every container start. The baked images set this automatically. |
+| `LOG_LEVEL` | `info` | |

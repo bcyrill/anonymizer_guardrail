@@ -281,18 +281,13 @@ fast up to low thousands of entries) and `aho` (Aho-Corasick via
 
 ## Privacy-filter NER — addresses and names
 
-Requires `DETECTOR_MODE` to include `privacy_filter`. Two
-deployment options work:
-
-- **In-process** — pick the `pf` or `pf-baked` guardrail image; the
-  model loads inside the guardrail container.
-- **Remote** — pick the `slim` image, set `PRIVACY_FILTER_URL` to a
-  running `privacy-filter-service` (or pass
-  `--privacy-filter-backend service` to auto-start one).
-
-Both produce byte-equivalent output; pick by deployment topology, not
-detection behaviour. See the README's *Privacy-filter detector*
-section for the trade-offs.
+Requires `DETECTOR_MODE` to include `privacy_filter`. The detector
+talks HTTP to a standalone `privacy-filter-service` sidecar — set
+`PRIVACY_FILTER_URL` on the slim guardrail (or pass
+`--privacy-filter-backend service` to auto-start one). See
+[docs/detectors/privacy-filter.md](detectors/privacy-filter.md) for
+image flavours (cpu / cu130, with optional baked-in weights) and
+the device / calibration knobs.
 
 Catches contextual entities the regex layer misses — full names,
 street addresses, free-text dates.

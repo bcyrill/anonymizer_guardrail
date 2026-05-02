@@ -135,8 +135,7 @@ class LauncherSpec:
 
     service: ServiceSpec | None = None
     """Optional auto-startable service. None for in-process detectors
-    (regex, denylist) and for the in-process privacy_filter on
-    pf/pf-baked images."""
+    (regex, denylist)."""
 
 
 # ── Per-detector metadata ─────────────────────────────────────────────────

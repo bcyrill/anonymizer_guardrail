@@ -3,10 +3,19 @@
 
 Use this to see how openai/privacy-filter classifies entities in
 your data before wiring it into the guardrail. Hit a running
-service (default http://localhost:8001) and read back the matches
-grouped by entity type. (No per-span confidence: the service's
-opf-based decoder doesn't expose one — see PROBE.md for the
-migration context.)
+service (default http://localhost:8001) and read back the spans it
+returns, grouped by opf label. (No per-span confidence: opf's
+DetectedSpan doesn't expose one — see PROBE.md for the migration
+context.)
+
+Labels are emitted **raw** — `private_person`, `private_email`,
+`private_phone_number`, `private_url`, `private_address`,
+`private_date_of_birth`, `private_identifier`, `private_credential`
+— the same shape opf returns. The guardrail-side
+`RemotePrivacyFilterDetector` is what canonicalises these into
+`PERSON` / `EMAIL_ADDRESS` / etc. Showing raw labels here keeps
+this script a thin window onto what the service does, separate
+from how the guardrail interprets it.
 
 Stdlib-only on purpose — runs from any checkout without installing
 the service's Python deps. To start the service first, see
@@ -14,11 +23,9 @@ the service's Python deps. To start the service first, see
 `scripts/launcher.sh -d privacy_filter --privacy-filter-backend service`.
 
 Unlike the gliner-pii probe, privacy-filter is *not* zero-shot:
-the entity-type vocabulary is baked into the model at training time
-(PERSON, EMAIL_ADDRESS, PHONE, URL, ADDRESS, DATE_OF_BIRTH,
-IDENTIFIER, CREDENTIAL — see _LABEL_MAP in services/privacy_filter/
-main.py). There's no `--labels` flag for that reason; you take the
-vocabulary the model knows and see what it finds.
+the label vocabulary is baked into the model at training time.
+There's no `--labels` flag for that reason; you take the vocabulary
+the model knows and see what it finds.
 
 For runnable examples (input shapes, comparing against gliner-pii)
 see `services/privacy_filter/scripts/PROBE.md`.
@@ -58,27 +65,24 @@ def _post_detect(url: str, text: str, timeout: float) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _format_table(matches: list[dict]) -> str:
-    """Render matches as a fixed-width table plus a per-entity-type
-    count summary.
+def _format_table(spans: list[dict]) -> str:
+    """Render spans as a fixed-width table plus a per-label count summary.
 
     The summary is the point of this script for privacy-filter: with
     no zero-shot label dial to turn, the operator's question becomes
     "what does the model actually find on my data, and how often?"
-    A type histogram answers that at a glance.
+    A label histogram answers that at a glance.
     """
-    # No `score` column: the wire format dropped that field when the
-    # service migrated from `transformers.pipeline` to opf. opf's
-    # DetectedSpan doesn't expose a per-span confidence, and a
-    # synthetic constant (we briefly shipped 1.0) was worse than
-    # nothing — operators reading it would assume real signal.
-    header = ("entity_type", "span", "text")
+    # No `score` column: opf's DetectedSpan doesn't expose a per-span
+    # confidence, and a synthetic constant would be worse than its
+    # absence — operators reading it would assume real signal.
+    header = ("label", "span", "text")
     rows: list[tuple[str, str, str]] = [header]
-    for m in matches:
+    for s in spans:
         rows.append((
-            m.get("entity_type", ""),
-            f"[{m.get('start')}:{m.get('end')}]",
-            m.get("text", ""),
+            s.get("label", ""),
+            f"[{s.get('start')}:{s.get('end')}]",
+            s.get("text", ""),
         ))
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(header))]
@@ -88,22 +92,25 @@ def _format_table(matches: list[dict]) -> str:
     for r in rows[1:]:
         lines.append(fmt.format(*r))
     if len(rows) == 1:
-        lines.append("(no matches)")
+        lines.append("(no spans)")
 
     counts: dict[str, int] = {}
-    for m in matches:
-        t = m.get("entity_type", "")
-        if t:
-            counts[t] = counts.get(t, 0) + 1
+    for s in spans:
+        label = s.get("label", "")
+        if label:
+            counts[label] = counts.get(label, 0) + 1
     lines.append("")
     if counts:
-        lines.append("Matches by type:")
-        # Sorted by count desc, then type asc — most common first
-        # is what an operator skims for.
-        for t, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            lines.append(f"  {t:<16} {n}")
+        lines.append("Spans by label:")
+        # Sorted by count desc, then label asc — most common first
+        # is what an operator skims for. Widen the label column
+        # because opf labels (`private_phone_number`, …) are longer
+        # than the canonical names the script used to print.
+        label_w = max(len(t) for t in counts)
+        for label, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"  {label:<{label_w}}  {n}")
     else:
-        lines.append("Matches by type: (none)")
+        lines.append("Spans by label: (none)")
     return "\n".join(lines)
 
 
@@ -166,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
         return 0
 
-    print(_format_table(result.get("matches", [])))
+    print(_format_table(result.get("spans", [])))
     return 0
 
 

@@ -32,25 +32,11 @@ _console = Console(stderr=True)
 
 
 # ── Per-flavour image map ─────────────────────────────────────────────────
-# Mirrors the bash _lib.sh `resolve_flavour` switch. Tag overrides come
-# from env vars (TAG_SLIM / TAG_PF / TAG_PF_BAKED) so image_builder.sh and
-# the launcher agree on naming.
-_FLAVOUR_TAG_DEFAULTS = {
-    "slim":     "anonymizer-guardrail:latest",
-    "pf":       "anonymizer-guardrail:privacy-filter",
-    "pf-baked": "anonymizer-guardrail:privacy-filter-baked",
-}
-_FLAVOUR_TAG_ENVS = {
-    "slim":     "TAG_SLIM",
-    "pf":       "TAG_PF",
-    "pf-baked": "TAG_PF_BAKED",
-}
-# Whether the flavour mounts the HF cache volume (only the runtime-
-# download `pf` image, since pf-baked has the model in-image and slim
-# doesn't ship the model at all).
-_FLAVOUR_USES_HF_VOLUME = {"slim": False, "pf": True, "pf-baked": False}
-
-HF_VOLUME = "anonymizer-hf-cache"
+# Slim is the only guardrail flavour — privacy-filter and gliner-pii
+# ship as standalone services. Tag override comes from `TAG_SLIM` so
+# image_builder.sh and the launcher agree on naming.
+_FLAVOUR_TAG_DEFAULTS = {"slim": "anonymizer-guardrail:latest"}
+_FLAVOUR_TAG_ENVS = {"slim": "TAG_SLIM"}
 
 
 def resolve_image(flavour: str) -> str:
@@ -58,9 +44,7 @@ def resolve_image(flavour: str) -> str:
     `TAG_<FLAVOUR>` env wins; otherwise the bundled default."""
     env = _FLAVOUR_TAG_ENVS.get(flavour)
     if env is None:
-        raise RuntimeError(
-            f"Unknown flavour {flavour!r}. Valid: slim, pf, pf-baked."
-        )
+        raise RuntimeError(f"Unknown flavour {flavour!r}. Valid: slim.")
     return os.environ.get(env) or _FLAVOUR_TAG_DEFAULTS[flavour]
 
 
@@ -87,9 +71,6 @@ class LaunchConfig:
     use_faker: bool = False
     faker_locale: str = ""
     surrogate_salt: str = ""
-
-    # HF Hub revalidation behaviour for the `pf` flavour.
-    hf_offline: bool = False
 
     # Per-detector env vars — operator can pre-populate any of these
     # via flags / interactive prompts. Each detector's launcher spec
@@ -125,7 +106,6 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
     image = resolve_image(cfg.flavour)
     network_args: list[str] = []
     env_args: list[str] = []
-    volume_args: list[str] = []
 
     # Network: join the shared net whenever any auto-started service
     # is in play (the guardrail dials services by container name).
@@ -179,14 +159,6 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
     if cfg.surrogate_salt:
         env_args.extend(["-e", f"SURROGATE_SALT={cfg.surrogate_salt}"])
 
-    # HF cache volume — only the runtime-download `pf` flavour needs
-    # it (slim ships no model; pf-baked has the model in-image).
-    if _FLAVOUR_USES_HF_VOLUME.get(cfg.flavour, False):
-        volume_args.extend(["-v", f"{HF_VOLUME}:/app/.cache/huggingface"])
-
-    if cfg.hf_offline:
-        env_args.extend(["-e", "HF_HUB_OFFLINE=1"])
-
     return [
         engine.name, "run", "--rm",
         "--name", cfg.name,
@@ -195,7 +167,6 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
         "-e", f"DETECTOR_MODE={cfg.detector_mode}",
         "-e", f"LOG_LEVEL={cfg.log_level}",
         *env_args,
-        *volume_args,
         *cfg.extra_run_args,
         image,
     ]
@@ -245,14 +216,6 @@ def print_plan(engine: Engine, cfg: LaunchConfig) -> None:
                 "",
             )
             table.add_row(det_name, f"[green]external[/green] [dim]({url})[/dim]")
-        elif det_name == "privacy_filter" and backend == "":
-            if cfg.flavour in ("pf", "pf-baked"):
-                table.add_row(det_name, "[green]in-process[/green]")
-            else:
-                table.add_row(
-                    det_name,
-                    "[yellow]unset[/yellow] [dim](slim needs a remote backend)[/dim]",
-                )
 
     # Surrogate / Faker summary.
     if cfg.surrogate_salt:
@@ -269,13 +232,6 @@ def print_plan(engine: Engine, cfg: LaunchConfig) -> None:
             "[green]disabled[/green] [dim](opaque [TYPE_HEX] surrogates)[/dim]",
         )
 
-    if _FLAVOUR_USES_HF_VOLUME.get(cfg.flavour, False):
-        table.add_row("Volume", f"[green]{HF_VOLUME}[/green] → /app/.cache/huggingface")
-    if cfg.hf_offline:
-        table.add_row(
-            "HF Hub",
-            "[green]offline[/green] [dim](reusing cached model, no revalidation)[/dim]",
-        )
     if cfg.extra_run_args:
         table.add_row("Passthrough", f"[dim]{' '.join(cfg.extra_run_args)}[/dim]")
 

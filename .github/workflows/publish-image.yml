@@ -1,45 +1,25 @@
 name: Publish container image
 
 # Triggers:
-#   - push of vX.Y.Z        → slim image, tagged :vX.Y.Z (+ semver siblings)
-#   - push of vX.Y.Z+pf     → pf image, tagged :vX.Y.Z-pf
-#   - workflow_dispatch     → operator picks the flavour from a dropdown
+#   - push of vX.Y.Z        → slim guardrail image, tagged :vX.Y.Z (+ semver siblings)
+#   - workflow_dispatch     → manual rebuild against HEAD of the default branch
 #
-# pf-baked is deliberately NOT published from CI — the image is multi-GB
-# and stores indefinitely on GHCR, but most operators never need it.
-# Anyone who does can build it locally with
-# `scripts/image_builder.sh -f pf-baked`. Same rationale for the
-# privacy-filter-service baked variant in publish-pf-service-image.yml.
-#
-# vX.Y.Z+pf-service tags are handled by publish-pf-service-image.yml,
-# and vX.Y.Z+gliner-service tags by publish-gliner-service-image.yml,
-# each of which publishes a SEPARATE GHCR package
-# (privacy-filter-service / gliner-pii-service). This workflow
-# short-circuits on those tags so a single tag push only fires the
-# matching workflow.
+# Slim is the only guardrail flavour. Privacy-filter and gliner-pii
+# ship as standalone services published by sibling workflows
+# (publish-pf-service-image.yml / publish-gliner-service-image.yml).
+# Their `+pf-service` / `+gliner-service` tag suffixes are handled
+# there; this workflow short-circuits on them so a single tag push
+# only fires the matching workflow.
 #
 # Branch pushes do NOT trigger image builds — most testing happens
-# locally via scripts/image_builder.sh and scripts/run_container.sh, and
+# locally via scripts/image_builder.sh and scripts/launcher.sh, and
 # building a fresh image on every commit was producing too much registry
 # churn. Use workflow_dispatch if you need an ad-hoc build off a branch.
-#
-# Each tag publishes ONE flavour. To publish slim + pf for a given
-# version, push two tags pointing at the same commit
-# (`scripts/release.sh` walks operators through this).
 
 on:
   push:
-    tags: ['v*.*.*']  # also matches v*.*.*+pf, v*.*.*+pf-service, v*.*.*+gliner-service
-  workflow_dispatch:
-    inputs:
-      flavor:
-        description: 'Image flavour to build'
-        required: true
-        default: 'slim'
-        type: choice
-        options:
-          - slim
-          - pf
+    tags: ['v*.*.*']  # also matches v*.*.*+pf-service, v*.*.*+gliner-service
+  workflow_dispatch: {}
 
 env:
   REGISTRY: ghcr.io
@@ -63,56 +43,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Decide which flavour to build based on the trigger:
-      #   - workflow_dispatch  → operator's `flavor` input
-      #   - tag with +pf       → pf
-      #   - any other tag / branch push → slim
-      # Also emits the matching --build-args and the image-tag suffix
-      # so subsequent steps don't need to repeat the case statement.
-      - name: Decide flavor + build-args + image-tag suffix
-        id: flavor
+      # Reject any unknown tag suffix so accidental `+foo` tags don't
+      # silently fall through to a slim build.
+      - name: Validate tag suffix
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
         run: |
           set -eu
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            FLAVOR='${{ inputs.flavor }}'
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            case '${{ github.ref_name }}' in
-              *+pf)       FLAVOR=pf ;;
-              *+pf-baked|*+pf-service-baked)
-                echo "::error::Tag suffix '${{ github.ref_name }}' refers to a baked flavour."
-                echo "::error::Baked images are not published from CI — they're multi-GB."
-                echo "::error::Build locally with: scripts/image_builder.sh -f pf-baked (or -f pf-service-baked)."
-                exit 1
-                ;;
-              *+*)
-                echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf, +pf-service, or +gliner-service."
-                exit 1
-                ;;
-              *)          FLAVOR=slim ;;
-            esac
-          else
-            FLAVOR=slim
-          fi
-          echo "name=$FLAVOR" >> "$GITHUB_OUTPUT"
-
-          case "$FLAVOR" in
-            slim)
-              echo "suffix=" >> "$GITHUB_OUTPUT"
-              {
-                echo "build_args<<EOF"
-                echo "EOF"
-              } >> "$GITHUB_OUTPUT"
-              ;;
-            pf)
-              echo "suffix=-pf" >> "$GITHUB_OUTPUT"
-              {
-                echo "build_args<<EOF"
-                echo "WITH_PRIVACY_FILTER=true"
-                echo "EOF"
-              } >> "$GITHUB_OUTPUT"
+          case '${{ github.ref_name }}' in
+            *+*)
+              echo "::error::Unknown tag suffix in '${{ github.ref_name }}'. Expected +pf-service or +gliner-service."
+              exit 1
               ;;
           esac
-          echo "Building flavour: $FLAVOR"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -127,11 +69,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The flavour suffix is applied to every generated tag, including
-      # `latest`, via docker/metadata-action's `flavor: suffix=…,onlatest=true`.
-      # That gives us :v1.0.0-pf, :latest-pf, :sha-…-pf etc. for the pf
-      # flavour, while slim (suffix="") keeps the original :v1.0.0, :latest, …
-      #
       # `latest=auto` (metadata-action's default) only tags :latest when
       # the ref is a stable semver — pre-release tags like v1.0.0-rc1
       # still get :v1.0.0-rc1 but not :latest. Branch refs don't apply
@@ -141,8 +78,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            suffix=${{ steps.flavor.outputs.suffix }},onlatest=true
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -151,24 +86,17 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.flavor=${{ steps.flavor.outputs.name }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
-          # Skip arm64 for the heavy flavours — torch wheels and the
-          # model weights make a multi-arch build painfully slow on
-          # GitHub-hosted runners. Slim is cheap and stays multi-arch.
-          platforms: ${{ steps.flavor.outputs.name == 'slim' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          platforms: linux/amd64,linux/arm64
           push: true
-          build-args: ${{ steps.flavor.outputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Per-flavour cache scope so a slim build doesn't invalidate
-          # the privacy-filter cache or vice-versa.
-          cache-from: type=gha,scope=${{ steps.flavor.outputs.name }}
-          cache-to: type=gha,mode=max,scope=${{ steps.flavor.outputs.name }}
+          cache-from: type=gha,scope=slim
+          cache-to: type=gha,mode=max,scope=slim
           provenance: true
           sbom: true

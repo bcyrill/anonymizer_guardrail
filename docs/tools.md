@@ -49,13 +49,12 @@ shipped in the wheel; one bash wrapper, two interlocking modes
 
 The catalog of build targets lives in
 `tools/image_builder/specs.py` as `FLAVOURS` (one `Flavour` per
-buildable image — guardrail slim/pf/pf-baked, the privacy-filter and
-gliner-pii sidecars across CPU/CUDA/baked variants, the fake-llm
-companion) and `PRESETS` (named subsets — `all`, `guardrail`,
-`privacy-filter`, `gliner-pii`, `minimal`, `minimal-fakellm`). Adding
-an image flavour is one entry in `_build_catalog()`; the CLI's
-`--flavour` validation, the menu's checkbox grid, and `--list` all
-read `FLAVOURS` directly.
+buildable image — slim guardrail, the privacy-filter and gliner-pii
+sidecars across CPU/CUDA/baked variants, the fake-llm companion) and
+`PRESETS` (named subsets — `all`, `guardrail`, `privacy-filter`,
+`gliner-pii`, `minimal`, `minimal-fakellm`). Adding an image flavour
+is one entry in `_build_catalog()`; the CLI's `--flavour` validation,
+the menu's checkbox grid, and `--list` all read `FLAVOURS` directly.
 
 - **CLI** — `--flavour/-f NAME` (repeatable), `--preset NAME`,
   `--list`, `--tag/-T`, `--engine podman|docker`, `--yes/-y`, plus

@@ -52,7 +52,7 @@ detector tuning without restarting:
 
 ```bash
 # Terminal 1 — running guardrail with your preferred config
-scripts/launcher.sh -t pf --detector-mode regex,denylist,privacy_filter
+scripts/launcher.sh -t slim --detector-mode regex,denylist,privacy_filter --privacy-filter-backend service
 
 # Terminal 2 — score it
 scripts/detector_bench.sh --config bundled:pentest
@@ -92,8 +92,8 @@ compare and pass `--compare`:
 
 ```bash
 # Terminal 1 — guardrail with everything switched on
-scripts/launcher.sh -t pf --detector-mode regex,denylist,privacy_filter,llm \
-    --llm-backend service
+scripts/launcher.sh -t slim --detector-mode regex,denylist,privacy_filter,llm \
+    --privacy-filter-backend service --llm-backend service
 
 # Terminal 2 — score each detector individually + the full mix
 scripts/detector_bench.sh --config bundled:pentest --compare

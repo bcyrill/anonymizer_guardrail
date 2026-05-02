@@ -14,16 +14,15 @@
 #
 # After the canonical vX.Y.Z tag, the script optionally also pushes
 # flavour-variant tags pointing at the same commit:
-#   vX.Y.Z+pf             → publishes the guardrail pf image
 #   vX.Y.Z+pf-service     → publishes the standalone privacy-filter-service
 #   vX.Y.Z+gliner-service → publishes the standalone gliner-pii-service
 # Each one triggers its matching workflow separately. release.yml only
 # creates a GitHub Release for the canonical tag (variants reuse it).
 #
-# Baked variants (`+pf-baked`, `+pf-service-baked`, `+gliner-service-baked`)
-# are NOT published from CI — the images are multi-GB. Build them
-# locally with `scripts/image_builder.sh -f pf-baked` (or
-# `-f pf-service-baked` / `-f gliner-service-baked`).
+# Baked variants (`+pf-service-baked`, `+gliner-service-baked`) are
+# NOT published from CI — the images are multi-GB. Build them locally
+# with `scripts/image_builder.sh -f pf-service-baked` (or
+# `-f gliner-service-baked`).
 
 set -euo pipefail
 
@@ -152,34 +151,19 @@ git push "$remote" "$new_tag"
 ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create the release."
 
 # ── Flavour variants ─────────────────────────────────────────────────────────
-# Three independent axes, each prompted separately so an operator can
+# Two independent axes, each prompted separately so an operator can
 # decide per-axis instead of navigating a combined menu.
 #
-# Axis 1 — guardrail privacy-filter flavour (publish-image.yml):
-#   vX.Y.Z+pf → guardrail image with privacy-filter built-in
-#
-# Axis 2 — standalone privacy-filter-service (publish-pf-service-image.yml):
+# Axis 1 — standalone privacy-filter-service (publish-pf-service-image.yml):
 #   vX.Y.Z+pf-service → separate ghcr package: privacy-filter-service
 #
-# Axis 3 — standalone gliner-pii-service (publish-gliner-service-image.yml):
+# Axis 2 — standalone gliner-pii-service (publish-gliner-service-image.yml):
 #   vX.Y.Z+gliner-service → separate ghcr package: gliner-pii-service
 #
 # Baked variants of any axis are intentionally absent — they're
-# local-build only (`scripts/image_builder.sh -f pf-baked` /
-# `-f pf-service-baked` / `-f gliner-service-baked`).
+# local-build only (`scripts/image_builder.sh -f pf-service-baked` /
+# `-f gliner-service-baked`).
 variants=()
-
-say ""
-say "Also publish the guardrail privacy-filter image?"
-say ""
-say "  ${c_grn}1)${c_rst} no, slim only"
-say "  ${c_grn}2)${c_rst} +pf — guardrail with privacy-filter built-in"
-read -r -p "Choose [1-2, default 1]: " gv_choice || true
-case "${gv_choice:-1}" in
-  1) ;;
-  2) variants+=("pf") ;;
-  *) err "Invalid choice."; exit 1 ;;
-esac
 
 say ""
 say "Also publish the standalone privacy-filter-service image?"

@@ -278,11 +278,6 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
     is_flag=True, default=False, group=_S_CONTAINER,
     help="Remove a stale container of the same name before starting.",
 )
-@grouped_option(
-    "--hf-offline",
-    is_flag=True, default=False, group=_S_CONTAINER,
-    help="Pass HF_HUB_OFFLINE=1 to the guardrail (pf flavour only).",
-)
 # ── Logging & surrogates ──────────────────────────────────────────────────
 @grouped_option(
     "--log-level", "-l",
@@ -418,7 +413,6 @@ def cli(
     name: str | None,
     port: int,
     replace: bool,
-    hf_offline: bool,
     log_level: str,
     faker: bool | None,
     locale: str | None,
@@ -479,7 +473,6 @@ def cli(
         cfg.use_faker = True
     if surrogate_salt is not None:
         cfg.surrogate_salt = surrogate_salt
-    cfg.hf_offline = hf_offline
     if rules:
         cfg.fake_llm_rules_file = rules
     if extra:
