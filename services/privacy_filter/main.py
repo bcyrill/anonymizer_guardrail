@@ -55,6 +55,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -70,6 +72,98 @@ log = logging.getLogger("privacy-filter-service")
 
 # ── Configuration ──────────────────────────────────────────────────────────
 DEFAULT_MODEL = os.environ.get("MODEL_NAME", "openai/privacy-filter")
+
+# Per-request perf breakdown. Off by default (no overhead). Set
+# PRIVACY_FILTER_PROFILE=1 in the container env to log forward /
+# Viterbi / overhead times after each /detect call. Diagnostic
+# tool — not for production logging.
+_PROFILE_ENABLED = os.environ.get("PRIVACY_FILTER_PROFILE") == "1"
+
+# Worker-thread accumulators. The hooks run in the same thread as
+# `model.redact()` (asyncio.to_thread worker), so we use a
+# threading.local so concurrent requests on different worker threads
+# don't cross-pollute. The collect-and-return happens inside the
+# same thread before we hand the result back to the asyncio caller.
+_PROFILE_STATE = threading.local()
+
+
+def _profile_reset() -> None:
+    _PROFILE_STATE.forward_ms = []
+    _PROFILE_STATE.forward_seq_lens = []
+    _PROFILE_STATE.decode_ms = []
+    _PROFILE_STATE.decode_seq_lens = []
+
+
+def _profile_snapshot() -> dict[str, Any]:
+    return {
+        "forward_ms": list(getattr(_PROFILE_STATE, "forward_ms", [])),
+        "forward_seq_lens": list(getattr(_PROFILE_STATE, "forward_seq_lens", [])),
+        "decode_ms": list(getattr(_PROFILE_STATE, "decode_ms", [])),
+        "decode_seq_lens": list(getattr(_PROFILE_STATE, "decode_seq_lens", [])),
+    }
+
+
+def _install_profiling_hooks(model: Any) -> None:
+    """Hook the runtime's forward + the decoder's decode method so we
+    can attribute per-request time to model forward (per-window) vs
+    Viterbi decode vs everything else.
+
+    Uses a forward pre-hook + post-hook on the nn.Module (no source
+    edits to opf), and monkeypatches the decoder's `decode` method
+    (the decoder is a plain Python object, no hooks). Both stash
+    timings on _PROFILE_STATE.
+    """
+    runtime, decoder = model.get_prediction_components()
+
+    def _pre(_module: Any, args: Any) -> None:
+        _PROFILE_STATE._fwd_t0 = time.perf_counter()
+        # args[0] is window_tokens of shape [1, seq_len]
+        try:
+            _PROFILE_STATE._fwd_seq_len = int(args[0].shape[1])
+        except Exception:
+            _PROFILE_STATE._fwd_seq_len = -1
+
+    def _post(_module: Any, _args: Any, _output: Any) -> None:
+        elapsed_ms = (time.perf_counter() - _PROFILE_STATE._fwd_t0) * 1000
+        if not hasattr(_PROFILE_STATE, "forward_ms"):
+            _profile_reset()
+        _PROFILE_STATE.forward_ms.append(elapsed_ms)
+        _PROFILE_STATE.forward_seq_lens.append(_PROFILE_STATE._fwd_seq_len)
+
+    runtime.model.register_forward_pre_hook(_pre)
+    runtime.model.register_forward_hook(_post)
+
+    if decoder is not None:
+        orig_decode = decoder.decode
+
+        def _timed_decode(token_logprobs: Any) -> Any:
+            t0 = time.perf_counter()
+            out = orig_decode(token_logprobs)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if not hasattr(_PROFILE_STATE, "decode_ms"):
+                _profile_reset()
+            _PROFILE_STATE.decode_ms.append(elapsed_ms)
+            try:
+                _PROFILE_STATE.decode_seq_lens.append(int(token_logprobs.shape[0]))
+            except Exception:
+                _PROFILE_STATE.decode_seq_lens.append(-1)
+            return out
+
+        decoder.decode = _timed_decode  # type: ignore[method-assign]
+
+
+def _redact_with_profile(model: Any, text: str) -> tuple[Any, dict[str, Any]]:
+    """Run redact in the worker thread; reset + snapshot the per-thread
+    profile state in the same thread so the hooks (which fire in this
+    thread) see a fresh accumulator and we capture their writes
+    before returning to the asyncio caller."""
+    _profile_reset()
+    redact_t0 = time.perf_counter()
+    result = model.redact(text)
+    redact_ms = (time.perf_counter() - redact_t0) * 1000
+    snap = _profile_snapshot()
+    snap["redact_ms"] = redact_ms
+    return result, snap
 
 
 # ── Model loading ──────────────────────────────────────────────────────────
@@ -120,6 +214,11 @@ async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
     # operator timeouts on the first probe don't fire spuriously.
     log.info("Warming up runtime (loading model into memory)…")
     await asyncio.to_thread(model.redact, "warmup")
+    if _PROFILE_ENABLED:
+        # Install hooks AFTER warmup — `runtime`/`decoder` are
+        # lazy-built on first redact, so they don't exist before then.
+        _install_profiling_hooks(model)
+        log.info("PRIVACY_FILTER_PROFILE=1 — per-request phase timings will be logged")
     _state["model"] = model
     log.info("privacy-filter ready")
     yield
@@ -181,7 +280,26 @@ async def detect(req: DetectRequest) -> DetectResponse:
 
     # Inference is CPU/GPU-bound and synchronous; offload so the loop
     # stays responsive.
-    result = await asyncio.to_thread(model.redact, text)
+    if _PROFILE_ENABLED:
+        result, snap = await asyncio.to_thread(_redact_with_profile, model, text)
+        forward_total = sum(snap["forward_ms"])
+        decode_total = sum(snap["decode_ms"])
+        overhead = snap["redact_ms"] - forward_total - decode_total
+        log.info(
+            "profile text=%dB redact=%.0fms = forward=%.0fms (%d windows, lens=%s) "
+            "+ viterbi=%.0fms (%d sequences, lens=%s) + overhead=%.0fms",
+            len(text),
+            snap["redact_ms"],
+            forward_total,
+            len(snap["forward_ms"]),
+            snap["forward_seq_lens"],
+            decode_total,
+            len(snap["decode_ms"]),
+            snap["decode_seq_lens"],
+            overhead,
+        )
+    else:
+        result = await asyncio.to_thread(model.redact, text)
     # Emit opf's raw DetectedSpans verbatim — no label translation or
     # span-merging on this side. The guardrail's
     # `RemotePrivacyFilterDetector` runs `_to_matches` to produce

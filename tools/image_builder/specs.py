@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 # ── Display groups (menu section headers) ─────────────────────────────────
 GROUP_GUARDRAIL = "anonymizer_guardrail"
 GROUP_PF = "privacy-filter"
+GROUP_PF_HF = "privacy-filter (HF variant)"
 GROUP_GLINER = "gliner-pii"
 GROUP_COMPANION = "companion"
 
@@ -125,6 +126,34 @@ def _build_catalog() -> tuple[Flavour, ...]:
             default_tag=_resolve_default_tag("TAG_PF_SERVICE_BAKED_CU130", "privacy-filter-service:baked-cu130"),
             bakes_model=True,
         ),
+        # ── Privacy-filter (HF variant — experimental) ──────────────────
+        # Pairs HF Transformers' forward pass with opf's Viterbi
+        # decoder. Same wire format as the opf-only pf-service, so
+        # the guardrail talks to either with no client changes. See
+        # services/privacy_filter_hf/README.md and COMPARE.md for the
+        # rationale and measurements.
+        Flavour(
+            name="pf-hf-service",
+            group=GROUP_PF_HF,
+            label="cpu (HF forward + opf decode)",
+            containerfile="services/privacy_filter_hf/Containerfile",
+            context="services/privacy_filter_hf",
+            default_tag=_resolve_default_tag(
+                "TAG_PF_HF_SERVICE", "privacy-filter-hf-service:cpu"
+            ),
+        ),
+        Flavour(
+            name="pf-hf-service-baked",
+            group=GROUP_PF_HF,
+            label="cpu + model (baked)",
+            containerfile="services/privacy_filter_hf/Containerfile",
+            context="services/privacy_filter_hf",
+            build_args={"BAKE_MODEL": "true"},
+            default_tag=_resolve_default_tag(
+                "TAG_PF_HF_SERVICE_BAKED", "privacy-filter-hf-service:baked-cpu"
+            ),
+            bakes_model=True,
+        ),
         # ── GLiNER-PII standalone service ───────────────────────────────
         Flavour(
             name="gliner-service",
@@ -200,6 +229,7 @@ PRESETS: dict[str, tuple[str, ...]] = {
     "all": tuple(f.name for f in FLAVOURS),
     "guardrail": tuple(f.name for f in flavours_in_group(GROUP_GUARDRAIL)),
     "privacy-filter": tuple(f.name for f in flavours_in_group(GROUP_PF)),
+    "privacy-filter-hf": tuple(f.name for f in flavours_in_group(GROUP_PF_HF)),
     "gliner-pii": tuple(f.name for f in flavours_in_group(GROUP_GLINER)),
     "minimal": ("slim", "pf-service", "gliner-service"),
     "minimal-fakellm": ("slim", "pf-service", "gliner-service", "fake-llm"),

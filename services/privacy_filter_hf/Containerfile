@@ -1,0 +1,154 @@
+# syntax=docker/dockerfile:1.7
+# Privacy-filter-HF inference service (experimental).
+#
+# A second variant of services/privacy_filter/ that pairs HuggingFace's
+# AutoModelForTokenClassification (forward pass) with opf's
+# ViterbiCRFDecoder (constrained BIOES decode). The hypothesis under
+# test: HF Transformers' loader gets us better-tuned CPU inference
+# kernels than opf's from-scratch Transformer reimplementation, while
+# opf's Viterbi keeps span-quality parity (tight boundaries, no
+# over-merges across `\n\n`). See COMPARE.md for the measurement
+# context.
+#
+# Wire-format-compatible with services/privacy_filter/: same /detect
+# request and response shapes (raw opf-vocabulary labels —
+# `private_email`, `private_person`, etc.), so the guardrail's
+# RemotePrivacyFilterDetector talks to either with no client changes.
+#
+# Default port 8003. The original opf-only service is on 8001. Both can
+# run side-by-side on the same docker network for A/B benchmarks.
+#
+# Two flavours, controlled by one build-arg (mirrors the opf-only
+# Containerfile):
+#
+#   BAKE_MODEL=false (default)   Image is small (~1 GB); model + tokenizer
+#                                download from HF Hub on first container
+#                                start. Mount a NAMED VOLUME at
+#                                /app/.cache/huggingface so the download
+#                                survives container recreation.
+#   BAKE_MODEL=true              Image carries weights + tokenizer
+#                                (~6 GB total); no runtime download,
+#                                works air-gapped. HF_HUB_OFFLINE=1
+#                                defaults to on so transformers doesn't
+#                                ping the Hub on every container start.
+#
+# Build:
+#   podman build -t privacy-filter-hf-service:cpu \
+#       -f services/privacy_filter_hf/Containerfile services/privacy_filter_hf/
+#   podman build -t privacy-filter-hf-service:baked-cpu \
+#       --build-arg BAKE_MODEL=true \
+#       -f services/privacy_filter_hf/Containerfile services/privacy_filter_hf/
+#
+# Run (runtime download from HF Hub on first call):
+#   podman volume create privacy-filter-hf-cache
+#   podman run --rm -p 8003:8003 \
+#       -v privacy-filter-hf-cache:/app/.cache/huggingface \
+#       privacy-filter-hf-service:cpu
+#
+# Run (baked):
+#   podman run --rm -p 8003:8003 privacy-filter-hf-service:baked-cpu
+
+FROM docker.io/library/python:3.12-slim
+
+LABEL org.opencontainers.image.title="privacy-filter-hf-service" \
+      org.opencontainers.image.description="HF-pipeline-based forward + opf Viterbi decoder for openai/privacy-filter" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# curl for HEALTHCHECK; git for the opf install (same rationale as the
+# opf-only service: opf isn't on PyPI, only on GitHub).
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends curl git
+
+# Non-root user.
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN groupadd --system --gid ${APP_GID} app \
+ && useradd  --system --uid ${APP_UID} --gid ${APP_GID} \
+             --home-dir /app --shell /usr/sbin/nologin app
+
+WORKDIR /app
+
+ARG BAKE_MODEL=false
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+# Pinned opf commit — same as services/privacy_filter/Containerfile so
+# both variants decode against identical Viterbi logic + transition
+# constraints. Bump this in lockstep with the opf-only image.
+ARG OPF_GIT_REF=f7f00ca7fb86
+
+# transformers must be 5.7.0+ — that's the first stable release with
+# `OpenAIPrivacyFilterForTokenClassification` registered in the model
+# zoo. Earlier versions can't load the architecture and fall back to
+# `trust_remote_code=True`, which the model card doesn't ship.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url "$TORCH_INDEX_URL" torch \
+ && pip install \
+        'transformers>=5.7.0' \
+        'safetensors' \
+        "git+https://github.com/openai/privacy-filter@${OPF_GIT_REF}" \
+        'fastapi>=0.110' \
+        'uvicorn[standard]>=0.27' \
+        'pydantic>=2.6'
+
+COPY main.py /app/main.py
+
+# HuggingFace's snapshot_download writes to ~/.cache/huggingface/hub/
+# by default. Mount the persistent cache here so the model survives
+# container recreation. Different mount path from the opf-only service
+# (which uses /app/.opf/) — these caches are NOT interchangeable;
+# different file layouts.
+RUN mkdir -p /app/.cache/huggingface \
+ && chown -R app:app /app/.cache
+
+# Optional: pre-download the model + tokenizer into the image. When
+# baked, also default `HF_HUB_OFFLINE=1` as deployment-intent
+# documentation ("this image is meant to run air-gapped") — operators
+# can override with `-e HF_HUB_OFFLINE=0` to refresh weights at
+# runtime. Non-baked flavour gets an empty `_runtime-env` so the
+# source statement in CMD is a no-op.
+#
+# HOME=/app for the bake step: huggingface_hub resolves the cache via
+# HF_HOME or `Path.home() / ".cache/huggingface"`. This RUN executes
+# as root (the USER app directive comes later); without HOME=/app
+# huggingface_hub writes to /root/.cache/huggingface, which the
+# runtime user (whose home is /app) wouldn't find.
+#
+# We use `snapshot_download` instead of `from_pretrained()` so the
+# bake doesn't load the model into RAM during the build — the goal
+# is just to populate the cache with the safetensors + tokenizer
+# files. transformers picks them up at runtime via the standard
+# cache lookup.
+RUN if [ "$BAKE_MODEL" = "true" ]; then \
+        HOME=/app python -c "from huggingface_hub import snapshot_download; snapshot_download('openai/privacy-filter')" \
+     && echo 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' > /app/_runtime-env; \
+    else \
+        : > /app/_runtime-env; \
+    fi
+
+RUN chown -R app:app /app
+
+ENV HOST=0.0.0.0 \
+    PORT=8003 \
+    LOG_LEVEL=info \
+    MODEL_NAME=openai/privacy-filter
+
+EXPOSE 8003
+
+USER app
+
+# Generous start-period to accommodate the runtime-download case
+# (~3 GB safetensors plus the 28 MB tokenizer.json). On a slow
+# network the first start can take several minutes.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=300s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health" | grep -q '"status":"ok"' || exit 1
+
+# Sourcing /app/_runtime-env applies any flavour-specific defaults
+# (e.g. HF_HUB_OFFLINE=1 for the baked image). The file is empty for
+# flavours that don't need it, so the source is a cheap no-op.
+CMD ["sh", "-c", ". /app/_runtime-env && exec uvicorn main:app --host ${HOST} --port ${PORT} --log-level $(echo ${LOG_LEVEL} | tr A-Z a-z)"]

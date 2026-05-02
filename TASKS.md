@@ -353,6 +353,12 @@ isn't enough to justify pinning corpus-specific values.
 Calibration is ammunition for when a real deployment surfaces a
 recall/precision gap default doesn't close.
 
+**The gate is signal, not effort.** Implementation is small (see
+estimate below); what's missing is a fixture that justifies
+tuning. Pinning biases against the single NTDS-hash delta would be
+cargo-culting, not tuning. Stay parked until one of the triggers
+below fires.
+
 **Trigger:** any of these is sufficient evidence to start tuning.
 
   * A production corpus shows recall regressions vs the bundled
@@ -367,27 +373,16 @@ recall/precision gap default doesn't close.
     `spike_opf.py` after every `OPF_GIT_REF` bump in
     `services/privacy_filter/Containerfile`).
 
-**Sketch:**
+**Sketch + effort** (when triggered, ~1 person-day total):
 
-1. Run `python services/privacy_filter/scripts/spike_opf.py`
-   against whatever fixture motivates the work. Confirm `default`
-   underperforms and one of the alternative profiles (or a
-   freshly-tuned one) closes the gap.
-2. If a fresh tune is needed, iterate on a calibration JSON in
-   `/tmp/`, then re-run the script with that JSON injected as a
-   fourth profile (small edit in `_PROFILES`).
-3. Pin the chosen biases at
-   `services/privacy_filter/calibration.json` and have the
-   `services/privacy_filter/Containerfile` `COPY` it into
-   `/app/calibration.json`. Both the in-process detector
-   (`PrivacyFilterConfig.calibration` field) and the service
-   (`PRIVACY_FILTER_CALIBRATION` env, default `/app/calibration.json`)
-   load it automatically.
-4. Add the new fixture to `spike_opf.py`'s `_FIXTURES` tuple so
-   regressions are caught on every future spike run.
-5. Update `services/privacy_filter/scripts/PROBE.md` "After the
-   opf migration" with a calibration-comparison row showing
-   default vs pinned on the new fixture.
+| Phase | Effort | What |
+|---|---|---|
+| 1. Reproduce the gap | ~1 hr | Run `python services/privacy_filter/scripts/spike_opf.py` against the motivating fixture. Confirm `default` underperforms and identify which biases need to move. The 3 baseline profiles (`default` / `anti-merge` / `privacy-parser`) bracket most of the practical tuning space. |
+| 2. Tune | ~2-4 hrs | Iterate on the 6 transition biases. Edit `_PROFILES` in spike_opf.py to inject a fourth candidate; each spike run is ~1 min on CPU so the loop is fast. Start from `privacy-parser` if the gap is over-fragmentation, `anti-merge` if it's over-merging. |
+| 3. Plumb | ~1 hr | Pin chosen biases at `services/privacy_filter/calibration.json`. In `services/privacy_filter/Containerfile`: `COPY calibration.json /app/calibration.json` and add `PRIVACY_FILTER_CALIBRATION=/app/calibration.json` to the `ENV` block. Operators override with a bind-mounted JSON at run time. |
+| 4. Lock the regression test | ~30 min | Add the new fixture to `_FIXTURES` in spike_opf.py so future spike runs catch drift on it automatically. |
+| 5. Document | ~30 min | Add a row to PROBE.md *After the opf migration* showing default-vs-pinned spans on the new fixture. |
+| 6. Rebuild + verify | ~30 min | Rebuild the image, run probe against the new fixture, confirm the calibration is loaded (spike_opf.py output now matches the pinned profile). |
 
 **Non-goals:**
 
