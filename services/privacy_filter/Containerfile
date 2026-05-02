@@ -118,8 +118,23 @@ RUN mkdir -p /app/.opf \
 # `-e HF_HUB_OFFLINE=0` to refresh weights at runtime. Non-baked
 # flavour gets an empty `_runtime-env` so the source statement in
 # CMD is a no-op.
+#
+# HOME=/app for the bake step: opf resolves the checkpoint path via
+# `Path.home() / ".opf" / "privacy_filter"`. This RUN executes as
+# root (the USER app directive comes later), so without this
+# override opf writes to /root/.opf/privacy_filter, while the
+# runtime user's home is /app and looks in /app/.opf/privacy_filter
+# — empty, and HF_HUB_OFFLINE=1 then blocks the fallback fetch.
+#
+# We call `ensure_default_checkpoint()` directly rather than
+# instantiating `OPF()` for the bake. The bake's only purpose is to
+# populate /app/.opf/ with the checkpoint files; OPF.__init__ would
+# additionally load the model into the build container's RAM (~3 GB)
+# and pin a device, neither of which is useful at build time. The
+# function is private (underscore module), but opf is pinned to
+# OPF_GIT_REF above so the API surface is fixed for this image.
 RUN if [ "$BAKE_MODEL" = "true" ]; then \
-        python -c "from opf._api import OPF; OPF(device='cpu', decode_mode='viterbi')" \
+        HOME=/app python -c "from opf._common.checkpoint_download import ensure_default_checkpoint; ensure_default_checkpoint()" \
      && echo 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' > /app/_runtime-env; \
     else \
         : > /app/_runtime-env; \
