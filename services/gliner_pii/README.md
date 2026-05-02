@@ -128,6 +128,25 @@ For the CUDA variants, add `--device nvidia.com/gpu=all` (podman) or
 [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
 is set up on the host.
 
+## Probing labels (dev helper)
+
+`scripts/probe.py` is a stdlib-only Python script that hits a running
+service with a text + label list and prints the matches plus a
+coverage summary (which labels found something, which didn't). Use it
+to figure out which zero-shot labels work on your data before wiring
+them into the guardrail's `GLINER_PII_LABELS`.
+
+```bash
+python services/gliner_pii/scripts/probe.py \
+    --text "Email alice@example.com about her SSN 123-45-6789." \
+    --labels email,ssn,person
+```
+
+`--text-file path.txt` (or `--text-file -` for stdin) accepts longer
+inputs; `--threshold` overrides the confidence cutoff; `--url` points
+at a non-default service host; `--json` emits the raw response for
+piping into `jq` / scripts. See `--help` for the full flag list.
+
 ## Configuration
 
 | Variable             | Default                                 | Notes                                                                                                |
