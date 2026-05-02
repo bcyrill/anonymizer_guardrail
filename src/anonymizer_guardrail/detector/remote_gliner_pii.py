@@ -47,6 +47,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .base import Detector, Match
+from .launcher import LauncherSpec, ServiceSpec
 from .remote_base import BaseRemoteDetector
 from .spec import DetectorSpec
 
@@ -471,4 +472,41 @@ SPEC = DetectorSpec(
 )
 
 
-__all__ = ["RemoteGlinerPIIDetector", "GlinerPIIUnavailableError", "SPEC"]
+# Auto-startable backing service: `gliner-pii-service`. Selected via
+# `--gliner-pii-backend service`. No variant — only one backing service.
+LAUNCHER_SPEC = LauncherSpec(
+    guardrail_env_passthroughs=[
+        "GLINER_PII_URL",
+        "GLINER_PII_TIMEOUT_S",
+        "GLINER_PII_LABELS",
+        "GLINER_PII_THRESHOLD",
+        "GLINER_PII_FAIL_CLOSED",
+        "GLINER_PII_MAX_CONCURRENCY",
+    ],
+    service=ServiceSpec(
+        container_name="gliner-pii-service",
+        image_tag_envs=("TAG_GLINER_SERVICE_BAKED", "TAG_GLINER_SERVICE"),
+        image_tag_defaults=(
+            "gliner-pii-service:baked-cpu",
+            "gliner-pii-service:cpu",
+        ),
+        port=8002,
+        readiness_timeout_s=300,
+        # Separate cache from PF so wiping one doesn't break the
+        # other (different model, different download).
+        hf_cache_volume="gliner-hf-cache",
+        guardrail_env_when_started={
+            "GLINER_PII_URL": "http://gliner-pii-service:8002",
+        },
+        # Forward the operator's GLINER_PII_LABELS / _THRESHOLD into
+        # the SERVICE's DEFAULT_LABELS / DEFAULT_THRESHOLD so a
+        # single env var configures both ends.
+        service_env_passthroughs={
+            "DEFAULT_LABELS": "GLINER_PII_LABELS",
+            "DEFAULT_THRESHOLD": "GLINER_PII_THRESHOLD",
+        },
+    ),
+)
+
+
+__all__ = ["RemoteGlinerPIIDetector", "GlinerPIIUnavailableError", "SPEC", "LAUNCHER_SPEC"]

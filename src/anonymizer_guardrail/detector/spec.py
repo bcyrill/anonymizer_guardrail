@@ -9,11 +9,16 @@ handler), tests, plus the bash launchers.
 `DetectorSpec` collapses the Python-side fan-out into one constant per
 detector, AND each detector module owns its own `CONFIG` BaseSettings
 model so the env-var fields live alongside the code that reads them.
-Adding a new detector is now: write the Detector class, define
-`CONFIG = …`, define `SPEC = DetectorSpec(...)`, append the SPEC to
-`REGISTERED_SPECS` in `detector/__init__.py`. Pipeline iterates the
-registry to build all the wiring above; `main.py` iterates to build
-the typed-error → BLOCKED response map.
+Each module also owns a `LAUNCHER_SPEC` (`LauncherSpec`) so the dev-only
+launcher's per-detector wiring (env passthroughs, optional auto-startable
+service) lives next to the rest of the detector definition rather than
+in a separate table. Adding a new detector is now: write the Detector
+class, define `CONFIG = …`, define `SPEC = DetectorSpec(...)`, define
+`LAUNCHER_SPEC = LauncherSpec(...)`, append both to `detector/__init__.py`.
+Pipeline iterates `REGISTERED_SPECS` to build all the runtime wiring;
+`main.py` iterates to build the typed-error → BLOCKED response map; the
+launcher iterates `LAUNCHER_METADATA` to build CLI flags / menu rows /
+service-lifecycle calls.
 
 What the registry deliberately does NOT cover:
 

@@ -40,12 +40,14 @@ scripts/test-examples.sh                       # connect to BASE_URL (already-ru
 ```
 src/anonymizer_guardrail/        # the importable package — what ships
   detector/
-    __init__.py                  # REGISTERED_SPECS + lookup tables
+    __init__.py                  # REGISTERED_SPECS + LAUNCHER_METADATA
+                                 # + lookup tables
     spec.py                      # DetectorSpec dataclass
+    launcher.py                  # LauncherSpec / ServiceSpec dataclasses
     base.py                      # Detector Protocol, Match, ENTITY_TYPES
     regex.py                     # Each detector module owns its
-    denylist.py                  # CONFIG + SPEC + (optionally)
-    llm.py                       # Unavailable error class.
+    denylist.py                  # CONFIG + SPEC + LAUNCHER_SPEC +
+    llm.py                       # (optionally) Unavailable error class.
     remote_privacy_filter.py
     remote_gliner_pii.py
   pipeline.py                    # Iterates REGISTERED_SPECS to build
@@ -56,8 +58,11 @@ src/anonymizer_guardrail/        # the importable package — what ships
 
 tools/launcher/                  # dev-only, NOT in the wheel
   __main__.py                    # `python -m tools.launcher` entry
-  spec_extras.py                 # LAUNCHER_METADATA (per-detector
-                                 # service / env-passthrough metadata)
+  spec_extras.py                 # cross-cutting constants
+                                 # (SHARED_NETWORK, …) + re-exports
+                                 # LAUNCHER_METADATA from the prod
+                                 # package (per-detector metadata is
+                                 # colocated with each detector module)
   engine.py                      # podman/docker dispatch
   services.py                    # auto-start lifecycle
   runner.py                      # build run argv + exec engine
@@ -158,10 +163,15 @@ central `Config` in `config.py`.
 error in one `except` clause; the matching `spec.blocked_reason`
 becomes the operator-facing message.
 
-**`tools/launcher/spec_extras.LAUNCHER_METADATA`** — separately, the
-launcher carries per-detector launcher metadata (auto-startable
-service, env passthroughs, container/port). Lives outside the main
-package because the launcher is dev-only.
+**`detector.LAUNCHER_METADATA`** — parallel mapping
+(`{spec.name: LauncherSpec}`) the dev-only launcher reads for
+auto-startable services, env passthroughs, container/port. Aggregated
+in `detector/__init__.py` from each module's `LAUNCHER_SPEC`
+constant — colocated with `CONFIG` and `SPEC` so adding a detector is
+a single-file edit. The dataclasses (`LauncherSpec`, `ServiceSpec`)
+are pure stdlib so shipping them in the wheel costs nothing
+operationally; `tools/launcher/spec_extras.py` is just a re-export shim
+plus a few cross-cutting constants (`SHARED_NETWORK`, …).
 
 ## Dev tools
 
@@ -291,16 +301,58 @@ overrides from the `Overrides` dataclass — see
 `detector/llm.py` for the shape (LLM passes `api_key`, `model`,
 `prompt_name`).
 
-### 4. Register the spec
+### 4. Define a `LAUNCHER_SPEC` constant
+
+Same module — colocated with `SPEC` so adding a detector is a
+single-file edit. The launcher reads this to know which env vars to
+forward onto the guardrail container and (optionally) which sidecar
+service to auto-start. The dataclasses are pure stdlib, so they ship
+in the wheel without dragging launcher deps in.
+
+```python
+from .launcher import LauncherSpec, ServiceSpec
+
+
+LAUNCHER_SPEC = LauncherSpec(
+    guardrail_env_passthroughs=[
+        # Every <DETECTOR>_* env var the operator might set in their
+        # shell. The launcher emits `-e <var>=<value>` only when the
+        # var is non-empty, so this list can be exhaustive without
+        # noise at default settings.
+        "MY_DETECTOR_URL",
+        "MY_DETECTOR_TIMEOUT_S",
+        "MY_DETECTOR_FAIL_CLOSED",
+        "MY_DETECTOR_MAX_CONCURRENCY",
+    ],
+    # Omit `service=` for in-process detectors (regex, denylist).
+    service=ServiceSpec(
+        container_name="my-service",
+        image_tag_envs=("TAG_MY_SERVICE_BAKED", "TAG_MY_SERVICE"),
+        image_tag_defaults=("my-service:baked", "my-service:cpu"),
+        port=8003,
+        readiness_timeout_s=300,            # generous for ML services
+        hf_cache_volume="my-hf-cache",      # if it pulls weights
+        guardrail_env_when_started={
+            "MY_DETECTOR_URL": "http://my-service:8003",
+        },
+    ),
+)
+```
+
+### 5. Register the spec
 
 `src/anonymizer_guardrail/detector/__init__.py` — append to
 `REGISTERED_SPECS` in canonical priority order (regex → denylist →
 privacy_filter → … → llm). Position matters: `_dedup` keeps the
 first-seen entity_type for duplicate text matches, so the detector
-listed first wins type-resolution conflicts.
+listed first wins type-resolution conflicts. Add the matching
+`LAUNCHER_SPEC` import + `LAUNCHER_METADATA` entry in the same edit.
 
 ```python
-from .my_detector import SPEC as _MY_DETECTOR_SPEC
+from .my_detector import (
+    LAUNCHER_SPEC as _MY_DETECTOR_LAUNCHER_SPEC,
+    SPEC as _MY_DETECTOR_SPEC,
+)
 
 REGISTERED_SPECS = (
     _REGEX_SPEC,
@@ -310,6 +362,15 @@ REGISTERED_SPECS = (
     _MY_DETECTOR_SPEC,            # ← here
     _LLM_SPEC,
 )
+
+LAUNCHER_METADATA = {
+    _REGEX_SPEC.name: _REGEX_LAUNCHER_SPEC,
+    _DENYLIST_SPEC.name: _DENYLIST_LAUNCHER_SPEC,
+    _PRIVACY_FILTER_SPEC.name: _PRIVACY_FILTER_LAUNCHER_SPEC,
+    _GLINER_PII_SPEC.name: _GLINER_PII_LAUNCHER_SPEC,
+    _MY_DETECTOR_SPEC.name: _MY_DETECTOR_LAUNCHER_SPEC,    # ← here
+    _LLM_SPEC.name: _LLM_LAUNCHER_SPEC,
+}
 ```
 
 **That's it for the runtime.** `Pipeline.__init__` picks up the new
@@ -320,12 +381,13 @@ typed error via `TYPED_UNAVAILABLE_ERRORS`. `/health` gains
 `<stats_prefix>_in_flight` / `<stats_prefix>_max_concurrency` keys
 (when `has_semaphore=True`) and
 `<stats_prefix>_cache_size` / `_cache_max` / `_cache_hits` /
-`_cache_misses` (when `has_cache=True`).
+`_cache_misses` (when `has_cache=True`). The launcher picks up the new
+`LAUNCHER_METADATA` entry automatically too.
 The per-request `detector_mode` length cap in `api.py` is also
 derived from `len(REGISTERED_SPECS)`, so callers can pass the new
 detector in their override list without bumping a constant.
 
-### 5. Tests
+### 6. Tests
 
 Two files:
 
@@ -353,9 +415,12 @@ propagation, fail-open swallowing, and in-flight counter increments.
 Mirror the existing `_pf_detector_that_raises` /
 `_gliner_detector_that_raises` helpers.
 
-### 6. (If your detector has an auto-startable service container)
+### 7. (If your detector has an auto-startable service container)
 
-Two required touches plus one optional convenience:
+The `LAUNCHER_SPEC` you added in step 4 already wires the launcher's
+side of the lifecycle (auto-start, env-var forwarding, /health probe,
+atexit cleanup). What's left is the service itself, plus an optional
+image-builder catalog entry.
 
 **a. `services/my_service/`** — new directory:
 
@@ -364,34 +429,7 @@ Two required touches plus one optional convenience:
   `services/privacy_filter/Containerfile` for shape.
 - `README.md` — service-specific docs.
 
-**b. `tools/launcher/spec_extras.py`** — add a `LauncherSpec(...)`
-entry to `LAUNCHER_METADATA`:
-
-```python
-"my_detector": LauncherSpec(
-    guardrail_env_passthroughs=[
-        "MY_DETECTOR_URL", "MY_DETECTOR_TIMEOUT_S",
-        "MY_DETECTOR_FAIL_CLOSED", "MY_DETECTOR_MAX_CONCURRENCY",
-    ],
-    service=ServiceSpec(
-        container_name="my-service",
-        image_tag_envs=("TAG_MY_SERVICE_BAKED", "TAG_MY_SERVICE"),
-        image_tag_defaults=("my-service:baked", "my-service:cpu"),
-        port=8003,
-        readiness_timeout_s=300,            # generous for ML services
-        hf_cache_volume="my-hf-cache",      # if it pulls weights
-        guardrail_env_when_started={
-            "MY_DETECTOR_URL": "http://my-service:8003",
-        },
-    ),
-),
-```
-
-This single entry powers: launcher service auto-start, env-var
-forwarding to the guardrail container, network setup, /health probe,
-atexit cleanup. No further bash/Python wiring for the lifecycle.
-
-**c. `tools/image_builder/specs.py`** *(optional — convenience for
+**b. `tools/image_builder/specs.py`** *(optional — convenience for
 local-dev builds via `scripts/image_builder.sh`)*. The image builder
 is a dev-loop wrapper around `<engine> build`; its catalog has no
 runtime effect on the launcher or the service. Operators can always
@@ -416,7 +454,7 @@ builder's TUI / `--preset` / `--list`:
 The CLI's `--flavour` validation, the menu's checkbox grid, and
 `--list` all read `FLAVOURS` directly, so nothing else needs touching.
 
-### 7. (If you want CLI / menu support)
+### 8. (If you want CLI / menu support)
 
 **`tools/launcher/main.py`** — for each operator-facing knob, one
 `@grouped_option(...)` decorator on `cli()` plus one line in the
@@ -445,7 +483,7 @@ if my_detector_url is not None:
 - Add `"my_detector"` to the `canonical` list in `_detector_order()`
   so it shows up in the enable+order picker.
 
-### 8. (If you want documentation)
+### 9. (If you want documentation)
 
 **`docs/detectors/my-detector.md`** — when to use it, the full
 `MY_DETECTOR_*` env-var reference (under a `## Configuration`
@@ -461,9 +499,9 @@ build, run).
 
 | Scope | Files |
 |---|---|
-| **In-process detector only** | 2 — new detector module + `detector/__init__.py` |
+| **In-process detector only** | 2 — new detector module (CONFIG + SPEC + LAUNCHER_SPEC, all colocated) + `detector/__init__.py` (REGISTERED_SPECS + LAUNCHER_METADATA entries) |
 | **+ tests** | +1 to +2 — `tests/test_my_detector.py`, optional `tests/test_pipeline.py` |
-| **+ service container** | +4 — `services/my_service/{main.py,Containerfile,README.md}`, `tools/launcher/spec_extras.py`. Optionally +1 (`tools/image_builder/specs.py`) so the new image shows up in the local-dev image-builder catalog. |
+| **+ service container** | +3 — `services/my_service/{main.py,Containerfile,README.md}`. The launcher already picks up the auto-start metadata from your detector module's `LAUNCHER_SPEC`. Optionally +1 (`tools/image_builder/specs.py`) so the new image shows up in the local-dev image-builder catalog. |
 | **+ launcher CLI** | +1 — `tools/launcher/main.py` |
 | **+ launcher menu** | +1 — `tools/launcher/menu.py` |
 | **+ docs** | +1 — `docs/detectors/<name>.md` (per-detector env vars live there, not in `docs/configuration.md`) |

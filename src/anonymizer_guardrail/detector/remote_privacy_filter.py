@@ -39,6 +39,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .base import Detector, Match
+from .launcher import LauncherSpec, ServiceSpec
 from .remote_base import BaseRemoteDetector
 from .spec import DetectorSpec
 
@@ -522,10 +523,101 @@ SPEC = DetectorSpec(
 )
 
 
+# Auto-startable backing service — default `privacy-filter-service`
+# (opf-only) plus an experimental `hf` variant. Selected via
+# `--privacy-filter-backend service` and `--privacy-filter-variant {opf,hf}`.
+LAUNCHER_SPEC = LauncherSpec(
+    guardrail_env_passthroughs=[
+        "PRIVACY_FILTER_URL",
+        "PRIVACY_FILTER_TIMEOUT_S",
+        "PRIVACY_FILTER_FAIL_CLOSED",
+        "PRIVACY_FILTER_MAX_CONCURRENCY",
+    ],
+    service=ServiceSpec(
+        container_name="privacy-filter-service",
+        # Prefer baked (model in image) over runtime-download —
+        # avoids the multi-minute first-start fetch.
+        image_tag_envs=("TAG_PF_SERVICE_BAKED", "TAG_PF_SERVICE"),
+        image_tag_defaults=(
+            "privacy-filter-service:baked-cpu",
+            "privacy-filter-service:cpu",
+        ),
+        port=8001,
+        # Cold runtime-download fetches a ~6 GB model; 5-minute
+        # ceiling is generous but still fails loud if the network
+        # is genuinely broken.
+        readiness_timeout_s=300,
+        hf_cache_volume="anonymizer-hf-cache",
+        # opf writes its checkpoint into `~/.opf/privacy_filter`
+        # (= `/app/.opf/privacy_filter` for the app user) and
+        # ignores HF_HOME — so we mount the cache volume there
+        # rather than at the conventional HF cache path. Mounting
+        # at `/app/.cache/huggingface` and using a symlink
+        # doesn't work: pathlib's mkdir(parents=True, exist_ok=True)
+        # chokes on a dangling symlink in the parent chain when
+        # the volume is empty.
+        cache_mount_path="/app/.opf",
+        guardrail_env_when_started={
+            "PRIVACY_FILTER_URL": "http://privacy-filter-service:8001",
+        },
+        # Forward operator-side env vars onto the SERVICE container
+        # so a single shell-side variable configures both ends of
+        # the privacy-filter wiring. PRIVACY_FILTER_DEVICE flips
+        # opf's CPU/CUDA selection inside the container — useful
+        # for ad-hoc GPU experiments on the cu130 image without
+        # rebuilding. PRIVACY_FILTER_CALIBRATION points at a
+        # Viterbi calibration JSON inside the container (operator
+        # mounts the JSON via -v if needed; default unset → opf's
+        # stock decoder).
+        service_env_passthroughs={
+            "PRIVACY_FILTER_DEVICE": "PRIVACY_FILTER_DEVICE",
+            "PRIVACY_FILTER_CALIBRATION": "PRIVACY_FILTER_CALIBRATION",
+        },
+    ),
+    # Experimental HF-pipeline variant. Same wire format, separate
+    # ghcr package, port 8003, distinct cache volume so the two
+    # variants don't fight over HF cache layout. Selected via
+    # `--privacy-filter-variant hf` (CLI) or the variant prompt in
+    # the launcher menu. See services/privacy_filter_hf/COMPARE.md
+    # for the speed/quality measurements.
+    service_variants={
+        "hf": ServiceSpec(
+            container_name="privacy-filter-hf-service",
+            image_tag_envs=("TAG_PF_HF_SERVICE",),
+            image_tag_defaults=("privacy-filter-hf-service:cpu",),
+            port=8003,
+            readiness_timeout_s=300,
+            # HF Transformers writes to ~/.cache/huggingface/hub.
+            # Distinct volume name from the opf-only variant: the
+            # cache layouts are NOT interchangeable (opf writes to
+            # ~/.opf with a flat snapshot dir; HF uses the standard
+            # Hub blob/snapshot/refs tree).
+            hf_cache_volume="privacy-filter-hf-cache",
+            cache_mount_path="/app/.cache/huggingface",
+            guardrail_env_when_started={
+                "PRIVACY_FILTER_URL": "http://privacy-filter-hf-service:8003",
+            },
+            # PRIVACY_FILTER_DEVICE works the same way on both
+            # variants — same env var name, same semantics. The HF
+            # variant doesn't read PRIVACY_FILTER_CALIBRATION
+            # (calibration applies to opf's Viterbi decoder, which
+            # the HF variant also reuses, so we forward it here too
+            # for forward-compat — current main.py doesn't read
+            # it but a future rev might).
+            service_env_passthroughs={
+                "PRIVACY_FILTER_DEVICE": "PRIVACY_FILTER_DEVICE",
+                "PRIVACY_FILTER_CALIBRATION": "PRIVACY_FILTER_CALIBRATION",
+            },
+        ),
+    },
+)
+
+
 __all__ = [
     "PrivacyFilterConfig",
     "PrivacyFilterUnavailableError",
     "RemotePrivacyFilterDetector",
     "CONFIG",
     "SPEC",
+    "LAUNCHER_SPEC",
 ]

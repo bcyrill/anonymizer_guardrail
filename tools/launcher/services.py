@@ -2,8 +2,11 @@
 
 Generic dispatcher driven by `LAUNCHER_METADATA[name].service` —
 no per-detector special cases. Adding a new detector with a service:
-populate its `ServiceSpec` in `spec_extras.py` and the lifecycle
-helpers below pick it up automatically.
+populate its `LAUNCHER_SPEC = LauncherSpec(service=ServiceSpec(...))`
+in the detector module (alongside `CONFIG` and `SPEC`) and the
+lifecycle helpers below pick it up automatically. `LAUNCHER_METADATA`
+is aggregated in `anonymizer_guardrail.detector.__init__` and
+re-exported via `tools/launcher/spec_extras.py` for in-package use.
 
 Three responsibilities:
 
@@ -127,7 +130,8 @@ def start_service(
     if spec is None or spec.service is None:
         raise RuntimeError(
             f"Detector {name!r} has no service to auto-start. "
-            f"Check LAUNCHER_METADATA in tools/launcher/spec_extras.py."
+            f"Check the detector module's LAUNCHER_SPEC "
+            f"(in src/anonymizer_guardrail/detector/<name>.py)."
         )
     service = spec.resolve_service(variant)
     assert service is not None  # spec.service was non-None above

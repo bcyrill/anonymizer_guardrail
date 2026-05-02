@@ -32,6 +32,7 @@ from ..bundled_resource import (
 )
 from ..registry import parse_named_path_registry
 from .base import Match
+from .launcher import LauncherSpec
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.regex")
@@ -592,4 +593,16 @@ SPEC = DetectorSpec(
 )
 
 
-__all__ = ["RegexDetector", "SPEC"]
+# In-process detector — no service to auto-start. Only env passthroughs
+# matter, so the launcher forwards the operator's REGEX_* vars onto the
+# guardrail container without a flag.
+LAUNCHER_SPEC = LauncherSpec(
+    guardrail_env_passthroughs=[
+        "REGEX_PATTERNS_PATH",
+        "REGEX_PATTERNS_REGISTRY",
+        "REGEX_OVERLAP_STRATEGY",
+    ],
+)
+
+
+__all__ = ["RegexDetector", "SPEC", "LAUNCHER_SPEC"]

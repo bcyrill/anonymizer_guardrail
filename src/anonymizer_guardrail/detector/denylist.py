@@ -33,6 +33,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ..bundled_resource import resolve_spec
 from ..registry import parse_named_path_registry
 from .base import Match
+from .launcher import LauncherSpec
 from .spec import DetectorSpec
 
 log = logging.getLogger("anonymizer.denylist")
@@ -534,4 +535,14 @@ SPEC = DetectorSpec(
 )
 
 
-__all__ = ["DenylistDetector", "SPEC"]
+# In-process detector — no service to auto-start. Only env passthroughs.
+LAUNCHER_SPEC = LauncherSpec(
+    guardrail_env_passthroughs=[
+        "DENYLIST_PATH",
+        "DENYLIST_REGISTRY",
+        "DENYLIST_BACKEND",
+    ],
+)
+
+
+__all__ = ["DenylistDetector", "SPEC", "LAUNCHER_SPEC"]

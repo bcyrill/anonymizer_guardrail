@@ -24,6 +24,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ..bundled_resource import read_bundled_default, resolve_spec
 from ..registry import parse_named_path_registry
 from .base import Match
+from .launcher import LauncherSpec, ServiceSpec
 from .remote_base import BaseRemoteDetector
 from .spec import DetectorSpec
 
@@ -453,4 +454,39 @@ SPEC = DetectorSpec(
 )
 
 
-__all__ = ["LLMDetector", "LLMUnavailableError", "SPEC"]
+# Auto-startable backing service: `fake-llm` (rule-driven OpenAI-compatible
+# stub). Selected via `--llm-backend service` on the launcher.
+LAUNCHER_SPEC = LauncherSpec(
+    guardrail_env_passthroughs=[
+        "LLM_API_BASE",
+        "LLM_API_KEY",
+        "LLM_MODEL",
+        "LLM_TIMEOUT_S",
+        "LLM_USE_FORWARDED_KEY",
+        "LLM_SYSTEM_PROMPT_PATH",
+        "LLM_SYSTEM_PROMPT_REGISTRY",
+        "LLM_MAX_CHARS",
+        "LLM_MAX_CONCURRENCY",
+        "LLM_FAIL_CLOSED",
+    ],
+    service=ServiceSpec(
+        container_name="fake-llm",
+        image_tag_envs=("TAG_FAKE_LLM",),
+        image_tag_defaults=("fake-llm:latest",),
+        port=4000,
+        readiness_timeout_s=30,
+        # No HF cache — fake-llm is rule-driven, no model.
+        hf_cache_volume=None,
+        guardrail_env_when_started={
+            "LLM_API_BASE": "http://fake-llm:4000/v1",
+            # fake-llm doesn't actually validate the key but the
+            # detector refuses to send the Authorization header
+            # when the key is empty — set a non-empty placeholder.
+            "LLM_API_KEY": "any-non-empty",
+            "LLM_MODEL": "fake",
+        },
+    ),
+)
+
+
+__all__ = ["LLMDetector", "LLMUnavailableError", "SPEC", "LAUNCHER_SPEC"]
