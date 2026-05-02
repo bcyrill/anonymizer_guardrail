@@ -102,6 +102,52 @@ What to look for:
   card doesn't. For finer types, lean on the regex detector
   (or gliner-pii's specific labels).
 
+### What we observed (engagement_notes.txt run)
+
+The two detectors had **near-orthogonal** coverage on this
+red-team fixture:
+
+| Class | privacy-filter | gliner-pii |
+|---|---|---|
+| Full-name persons (`Sarah Chen`, `Mike Hernandez`) | ✓ at 1.000 | ✓ at 0.998–0.999 |
+| Bare-first-name persons (`Mike;`) | ✓ at 0.557 (weak) | ✓ at 0.577 (weak) |
+| Bare FQDNs (`dc01.acmecorp.local`, `siem.acmecorp.local`) | ✓ as `URL` (~0.95) | ✗ (`url` needs a scheme) |
+| AWS access key + secret block (`.env`-style `KEY = VALUE`) | ✓ as `CREDENTIAL` at 0.968 (merged span) | ✗ |
+| JWT bearer token | ✓ as `CREDENTIAL` at 1.000 | ✗ |
+| GitHub PAT (`ghp_…` in parenthetical prose) | ✗ | ✓ as `api_key` at 1.000 |
+| MAC address (`04:7c:16:a2:f3:9b`) | ✗ (no label) | ✓ as `mac_address` at 1.000 |
+| IPv4 addresses | ✗ (no label) | partial — 2 of 5 unique IPs (`10.0.7.18`, `10.0.7.42` at 0.8–0.99); missed `10.0.5.10`, `10.0.7.55`, `10.0.12.4` |
+| Org names | ✗ (no label) | partial — `Globex Industries` at 0.998; **`AcmeCorp` missed** despite many mentions |
+| License plate (`7XKR492, CA`) | ✓ as `IDENTIFIER` at 0.489 (weak) | ✓ as `license_plate` at 0.972 |
+| NTLM hashes (NTDS dump line) | partial as `IDENTIFIER` at 0.361 | ✗ |
+| Plaintext passwords (`Summer2024!`, `jenkinsCI123`) in dumps/configs | ✗ | ✗ (with `password` in the label list and `--threshold 0.05` retried — not a threshold issue) |
+
+**Three takeaways:**
+
+1. **They don't substitute for each other.** Privacy-filter's
+   `CREDENTIAL` catches the multi-line AWS key block and the JWT
+   that gliner-pii misses; gliner-pii's `mac_address`, `ipv4`,
+   `company_name`, and `api_key` cover entities privacy-filter
+   has no label for. On a pentest-style transcript, run **both**
+   and compose — neither alone hits the majority of entities.
+
+2. **The `\n\n` over-merge bug surfaces here too.** The AWS-key
+   `CREDENTIAL` span at `[991:1088]` swallowed the next line *and*
+   a `Spotted` heading; the JWT span at `[2079:2154]` trailed
+   into the `SHA-256` heading on the following line. Same root
+   cause as the over-merge on `sample.txt` —
+   `services/privacy_filter/main.py:82`'s `_DEFAULT_GAP_PATTERN`
+   matches `\n\n`, so adjacent same-type spans get merged across
+   paragraph breaks.
+
+3. **Plaintext passwords and NTLM hashes are a regex job.** Both
+   detectors miss or weakly hit shape-stable secrets embedded in
+   structured contexts (NTDS dumps, `KEY = VALUE` blocks,
+   `postgres://user:pw@host` strings). The regex detector with
+   credential patterns is the right layer for those — see
+   `docs/detectors/regex.md` and the bundled
+   `regex_pentest.yaml`.
+
 ## Empirical findings
 
 Numbers below come from running the example commands above against
