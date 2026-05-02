@@ -41,6 +41,38 @@ from .vault import Vault
 log = logging.getLogger("anonymizer.pipeline")
 
 
+# Sentinel separator inserted between texts when a detector runs in
+# `input_mode="merged"`. Properties we need:
+#
+#   1. **Implausibly part of any real document or entity.** The
+#      "ANONYMIZER-SEGMENT-BREAK" tag is unique enough that real
+#      content shouldn't contain it; the surrounding `\n\n` and
+#      `---` give a visual paragraph break the LLM is likely to
+#      treat as a section divider rather than as content to
+#      classify.
+#   2. **Stable as a literal string.** We filter detected matches
+#      whose text contains the sentinel — that's how we guard
+#      against the model classifying the separator itself as an
+#      entity, or returning a span that crosses a boundary
+#      ("Alice<SEP>Smith" as PERSON). Both filtered out by the
+#      contains-check.
+#
+# Don't change the literal without updating the contains-check
+# logic below. Don't put it in operator-controllable config — the
+# point is that it's a known, stable, non-content marker; making
+# it tunable just opens a footgun where two operators pick
+# different sentinels and wonder why detections drift.
+_MERGE_SENTINEL = "\n\n--- ANONYMIZER-SEGMENT-BREAK ---\n\n"
+# Distinctive substring used to filter sentinel-bearing matches. We
+# could check for the full sentinel, but a hallucinated match might
+# contain only the trimmed core (e.g. "--- ANONYMIZER-SEGMENT-BREAK ---"
+# or just "ANONYMIZER-SEGMENT-BREAK") rather than the surrounding
+# newlines. Checking the distinctive tag catches all such cases —
+# cross-boundary spans, classifications of the separator itself, and
+# any partial match the model invents around the marker.
+_MERGE_SENTINEL_MARKER = "ANONYMIZER-SEGMENT-BREAK"
+
+
 def _build_detectors() -> list[Detector]:
     """Parse DETECTOR_MODE as a comma-separated list of detector names.
 
@@ -171,6 +203,26 @@ class Pipeline:
             ", ".join(cap_parts),
         )
 
+        # Surface mutually-exclusive (cache + merge) configurations as
+        # a startup warning. The cache is process-wide and only
+        # consulted by the per_text dispatch path; a detector running
+        # in merged mode never reaches the cache, so any non-zero
+        # `cache_max_size` is dead weight in that mode. Warn but don't
+        # fail — a typo in env vars shouldn't crash the service, and
+        # the detector still runs correctly (just without the cache).
+        for spec in REGISTERED_SPECS:
+            mode = getattr(spec.config, "input_mode", "per_text")
+            cache_max = getattr(spec.config, "cache_max_size", 0)
+            if mode == "merged" and cache_max > 0:
+                log.warning(
+                    "%s detector configured with input_mode=merged AND "
+                    "cache_max_size=%d. The cache is bypassed in merged "
+                    "mode — every blob is unique by construction. Set "
+                    "%s_CACHE_MAX_SIZE=0 to silence this warning, or "
+                    "switch back to input_mode=per_text to use the cache.",
+                    spec.name, cache_max, spec.name.upper(),
+                )
+
     def stats(self) -> dict[str, int]:
         """Snapshot of pipeline-internal counters for the /health probe.
         All reads are cheap and lock-free."""
@@ -254,14 +306,92 @@ class Pipeline:
             return self._detectors
         return active
 
+    async def _run_detector(
+        self,
+        det: Detector,
+        text: str,
+        *,
+        api_key: str | None,
+        overrides: Overrides,
+    ) -> list[Match]:
+        """Run a single detector against `text` with the per-spec semaphore
+        + error-policy wrapper. Used by both per-text and merged dispatch
+        paths so the policy lives in exactly one place.
+
+        Per-detector exceptions are handled here so one detector crashing
+        doesn't tear down the surrounding TaskGroup. Typed unavailable
+        errors still propagate under fail-closed — the TaskGroup then
+        cancels the in-flight siblings (saving wasted work since the
+        request is about to BLOCK) and re-raises the typed error so
+        main.py's BLOCKED handler matches.
+        """
+        spec = SPECS_BY_NAME[det.name]
+        kwargs = spec.prepare_call_kwargs(overrides, api_key)
+        try:
+            if spec.has_semaphore:
+                # Gate the call behind the per-spec semaphore. The
+                # in-flight counter increment is the first statement
+                # after acquisition — no statement between acquire
+                # and `try` can raise, so the finally always fires.
+                async with self._semaphores[spec.name]:
+                    self._inflight_counters[spec.name] += 1
+                    try:
+                        return await det.detect(text, **kwargs)
+                    finally:
+                        self._inflight_counters[spec.name] -= 1
+            return await det.detect(text, **kwargs)
+        except Exception as exc:
+            # Single error path. Two cases:
+            #   1. Typed unavailable error → fail-closed re-raises
+            #      so main.py BLOCKs; fail-open logs + degrades to [].
+            #   2. Anything else (programmer error, transient bug)
+            #      under fail-closed → re-wrap as the typed error so
+            #      the BLOCKED path fires. The asymmetry is on
+            #      purpose: an operator who set fail-closed wanted
+            #      to BLOCK on any problem from this detector, not
+            #      just availability ones.
+            if (
+                spec.unavailable_error is not None
+                and isinstance(exc, spec.unavailable_error)
+            ):
+                if spec.config.fail_closed:
+                    raise
+                log.warning(
+                    "%s detector unavailable, proceeding fail-open: %s",
+                    spec.name, exc,
+                )
+                return []
+
+            log.exception("Detector %s crashed: %s", det.name, exc)
+            if (
+                spec.unavailable_error is not None
+                and spec.config.fail_closed
+            ):
+                raise spec.unavailable_error(
+                    f"Unexpected failure in {spec.name} detector "
+                    f"({type(exc).__name__}): {exc}"
+                ) from exc
+            # Detectors with no availability concept (regex,
+            # denylist) just degrade to []. A buggy regex pattern
+            # shouldn't take the request down — the LLM/PF/etc.
+            # layers still run and provide coverage.
+            return []
+
     async def _detect_one(
         self,
         text: str,
         *,
         api_key: str | None = None,
         overrides: Overrides = Overrides.empty(),
+        detectors: list[Detector] | None = None,
     ) -> list[Match]:
-        """Run all configured detectors against one text in parallel and dedup.
+        """Run a per-text fan-out: every detector in `detectors` against
+        the same text in parallel, then dedup.
+
+        `detectors=None` → resolve from `overrides.detector_mode` (the
+        default behaviour for direct callers). The merged-dispatch path
+        in `anonymize` passes an explicit subset so it doesn't double-
+        count detectors that already ran in merged mode.
 
         Regex is CPU-bound and fast; the LLM call dominates total latency.
         Running them concurrently means the per-text floor is `max(regex,
@@ -272,68 +402,13 @@ class Pipeline:
         per-detector semaphores keyed by spec name; throttling one doesn't
         starve the others. CPU-cheap detectors (regex, denylist) skip
         gating entirely.
-
-        Per-detector exceptions are handled inside the inner runner so
-        one detector crashing doesn't tear down the TaskGroup. Typed
-        unavailable errors still propagate under fail-closed — the
-        TaskGroup then cancels the in-flight siblings (saving wasted
-        work since the request is about to BLOCK) and re-raises the
-        typed error so main.py's BLOCKED handler matches.
         """
-        active = self._resolve_active_detectors(overrides)
-
-        async def _run(det: Detector) -> list[Match]:
-            spec = SPECS_BY_NAME[det.name]
-            kwargs = spec.prepare_call_kwargs(overrides, api_key)
-            try:
-                if spec.has_semaphore:
-                    # Gate the call behind the per-spec semaphore. The
-                    # in-flight counter increment is the first statement
-                    # after acquisition — no statement between acquire
-                    # and `try` can raise, so the finally always fires.
-                    async with self._semaphores[spec.name]:
-                        self._inflight_counters[spec.name] += 1
-                        try:
-                            return await det.detect(text, **kwargs)
-                        finally:
-                            self._inflight_counters[spec.name] -= 1
-                return await det.detect(text, **kwargs)
-            except Exception as exc:
-                # Single error path. Two cases:
-                #   1. Typed unavailable error → fail-closed re-raises
-                #      so main.py BLOCKs; fail-open logs + degrades to [].
-                #   2. Anything else (programmer error, transient bug)
-                #      under fail-closed → re-wrap as the typed error so
-                #      the BLOCKED path fires. The asymmetry is on
-                #      purpose: an operator who set fail-closed wanted
-                #      to BLOCK on any problem from this detector, not
-                #      just availability ones.
-                if (
-                    spec.unavailable_error is not None
-                    and isinstance(exc, spec.unavailable_error)
-                ):
-                    if spec.config.fail_closed:
-                        raise
-                    log.warning(
-                        "%s detector unavailable, proceeding fail-open: %s",
-                        spec.name, exc,
-                    )
-                    return []
-
-                log.exception("Detector %s crashed: %s", det.name, exc)
-                if (
-                    spec.unavailable_error is not None
-                    and spec.config.fail_closed
-                ):
-                    raise spec.unavailable_error(
-                        f"Unexpected failure in {spec.name} detector "
-                        f"({type(exc).__name__}): {exc}"
-                    ) from exc
-                # Detectors with no availability concept (regex,
-                # denylist) just degrade to []. A buggy regex pattern
-                # shouldn't take the request down — the LLM/PF/etc.
-                # layers still run and provide coverage.
-                return []
+        active = (
+            self._resolve_active_detectors(overrides)
+            if detectors is None else detectors
+        )
+        if not active:
+            return []
 
         # TaskGroup (vs asyncio.gather) cancels in-flight sibling tasks
         # the moment one detector raises a fail-closed error. Matters
@@ -349,7 +424,12 @@ class Pipeline:
         # own typed error doesn't require an edit here.
         try:
             async with asyncio.TaskGroup() as tg:
-                tasks = [tg.create_task(_run(d)) for d in active]
+                tasks = [
+                    tg.create_task(
+                        self._run_detector(d, text, api_key=api_key, overrides=overrides)
+                    )
+                    for d in active
+                ]
         except* TYPED_UNAVAILABLE_ERRORS as eg:
             raise eg.exceptions[0] from None
 
@@ -370,6 +450,57 @@ class Pipeline:
                 [(m.text, m.entity_type) for m in deduped],
             )
         return deduped
+
+    @staticmethod
+    def _partition_by_input_mode(
+        detectors: list[Detector],
+    ) -> tuple[list[Detector], list[Detector]]:
+        """Split active detectors into (per_text, merged) by their
+        configured `input_mode`. A detector whose CONFIG has no
+        `input_mode` field defaults to `per_text` — the per-text
+        fan-out is the safe default that every detector supports."""
+        per_text: list[Detector] = []
+        merged: list[Detector] = []
+        for det in detectors:
+            spec = SPECS_BY_NAME[det.name]
+            mode = getattr(spec.config, "input_mode", "per_text")
+            if mode == "merged":
+                merged.append(det)
+            else:
+                per_text.append(det)
+        return per_text, merged
+
+    def _apply_merge_size_fallback(
+        self,
+        merged_detectors: list[Detector],
+        merged_blob: str,
+    ) -> tuple[list[Detector], list[Detector]]:
+        """For merged-mode detectors that declare a `max_chars` cap on
+        their config, demote to per_text dispatch when the merged blob
+        exceeds that cap. Returns (still_merged, demoted_to_per_text).
+
+        Opportunistic: the optimisation degrades gracefully rather than
+        raising. An operator's merged-mode preference is honoured when
+        the blob fits and silently falls back when it doesn't, so a
+        single oversized request doesn't break detection coverage.
+        Detectors without a `max_chars` field are passed through
+        unchanged — the remote service decides its own size policy.
+        """
+        still_merged: list[Detector] = []
+        demoted: list[Detector] = []
+        for det in merged_detectors:
+            spec = SPECS_BY_NAME[det.name]
+            max_chars = getattr(spec.config, "max_chars", None)
+            if max_chars is not None and len(merged_blob) > max_chars:
+                log.debug(
+                    "Merged blob (%d chars) exceeds %s.max_chars (%d); "
+                    "falling back to per_text dispatch for this request.",
+                    len(merged_blob), det.name, max_chars,
+                )
+                demoted.append(det)
+            else:
+                still_merged.append(det)
+        return still_merged, demoted
 
     async def aclose(self) -> None:
         """Release per-detector resources (httpx connection pools, etc).
@@ -407,6 +538,39 @@ class Pipeline:
         if not texts:
             return [], {}
 
+        # Resolve the active set once, then partition by input_mode so
+        # we can dispatch per-text and merged detectors in a single
+        # TaskGroup. Doing both in one group is what gives us unified
+        # cancellation: a fail-closed error in either mode tears down
+        # ALL in-flight detector calls (per-text and merged), which
+        # would otherwise burn LLM/PF/gliner concurrency slots on a
+        # request that's about to BLOCK.
+        active = self._resolve_active_detectors(overrides)
+        per_text_dets, merged_dets = self._partition_by_input_mode(active)
+
+        # Build the merged blob once (and only if any detector wants
+        # merged mode). Size fallback runs against this blob: any
+        # merged detector whose `max_chars` cap is exceeded is demoted
+        # to per_text dispatch for THIS request only — no permanent
+        # mode change on the detector instance.
+        merged_blob: str | None = None
+        if merged_dets:
+            merged_blob = _MERGE_SENTINEL.join(texts)
+            merged_dets, demoted = self._apply_merge_size_fallback(
+                merged_dets, merged_blob,
+            )
+            if demoted:
+                # Demoted detectors join the per_text fan-out for this
+                # request. The original per_text_dets list comes first
+                # so detector-mode order (which governs _dedup type
+                # priority) is preserved — a detector configured as
+                # merged but demoted today still ranks where it would
+                # have ranked under DETECTOR_MODE order.
+                per_text_dets = per_text_dets + demoted
+            if not merged_dets:
+                # Every merged detector fell back; no need for the blob.
+                merged_blob = None
+
         # Same TaskGroup-not-gather rationale as `_detect_one` one level
         # down: when one text trips fail-closed (e.g. the LLM detector
         # times out), TaskGroup cancels the in-flight sibling text-tasks
@@ -419,16 +583,50 @@ class Pipeline:
         # BaseExceptionGroup TaskGroup raises by default.
         try:
             async with asyncio.TaskGroup() as tg:
-                tasks = [
+                per_text_tasks = [
                     tg.create_task(
-                        self._detect_one(t, api_key=api_key, overrides=overrides)
+                        self._detect_one(
+                            t,
+                            api_key=api_key,
+                            overrides=overrides,
+                            detectors=per_text_dets,
+                        )
                     )
                     for t in texts
                 ]
+                merged_tasks = [
+                    tg.create_task(
+                        self._run_detector(
+                            d, merged_blob, api_key=api_key, overrides=overrides,
+                        )
+                    )
+                    for d in merged_dets
+                ] if merged_blob is not None else []
         except* TYPED_UNAVAILABLE_ERRORS as eg:
             raise eg.exceptions[0] from None
 
-        per_text_matches = [t.result() for t in tasks]
+        per_text_matches = [t.result() for t in per_text_tasks]
+
+        # Filter sentinel-spanning matches from each merged detector's
+        # output. This guards against (a) the model classifying the
+        # sentinel literal as an entity, and (b) returning a span that
+        # crosses a segment boundary ("Alice<SEP>Smith" as PERSON) —
+        # both filtered out by the contains-check. Done before
+        # mapping construction so the surrogate generator never sees
+        # a sentinel-bearing match.
+        merged_matches: list[list[Match]] = []
+        for det, task in zip(merged_dets, merged_tasks):
+            kept = [
+                m for m in task.result() if _MERGE_SENTINEL_MARKER not in m.text
+            ]
+            if log.isEnabledFor(logging.DEBUG):
+                dropped = len(task.result()) - len(kept)
+                if dropped:
+                    log.debug(
+                        "merged dispatch: dropped %d sentinel-spanning matches "
+                        "from %s output", dropped, det.name,
+                    )
+            merged_matches.append(kept)
 
         # Build one process-wide mapping (original → surrogate) so the same
         # entity gets the same surrogate across all texts in this request.
@@ -436,7 +634,11 @@ class Pipeline:
         # to for_match — the cache key includes them so different combos
         # coexist with their own consistency.
         original_to_surrogate: dict[str, str] = {}
-        for matches in per_text_matches:
+        # Iterate per-text first, then merged, so cross-source dedup
+        # follows DETECTOR_MODE priority (per-text-first detectors win
+        # type-resolution over later merged-only detectors when the same
+        # value is matched by both).
+        for matches in (*per_text_matches, *merged_matches):
             for m in matches:
                 if m.text not in original_to_surrogate:
                     original_to_surrogate[m.text] = self._surrogates.for_match(

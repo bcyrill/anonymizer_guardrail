@@ -334,9 +334,25 @@ calls (the current behaviour) or as a single concatenated blob with
 sentinel separators. Detectors in `merged` mode trade the per-text
 result cache for one round-trip per request and stronger context.
 
-**Status:** the detector result cache landed (see
+**Status:** Phase 1 (LLM detector) shipped. Pipeline-level dispatch
+is detector-agnostic — partitioning by `input_mode`, sentinel-
+joined merged blob, size fallback to per_text when the blob exceeds
+`max_chars`, sentinel filtering on returned matches, and the
+cache + merge mutual-exclusivity warning at Pipeline init. See
+`pipeline.py:_partition_by_input_mode` / `_apply_merge_size_fallback`
+and `tests/test_pipeline_merge_mode.py`. Operator surface:
+`LLM_INPUT_MODE=per_text|merged` (default `per_text`).
+
+Phase 2 (extending to `privacy_filter` and `gliner_pii`) is the
+mechanical follow-up: add `input_mode` to each detector's `*Config`,
+mirror the LLM tests with the detector-specific stub. The pipeline
+work is already done. Triggered when an operator wants merge mode
+for those detectors (the dispatch is ready; only the config field
+needs to land).
+
+The detector result cache landed (see
 `detector/cache.py` + `LLM_CACHE_MAX_SIZE`), which addresses the
-*repeat-history* dimension of multi-turn cost. This task addresses
+*repeat-history* dimension of multi-turn cost. Merge mode addresses
 the *fan-out per request* dimension, which the cache does not help
 with: a fresh first turn with N small `texts` still pays N LLM
 round-trips. The two optimizations are complementary but mutually

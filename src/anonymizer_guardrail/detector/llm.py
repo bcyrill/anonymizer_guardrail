@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import sys
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import field_validator
@@ -71,6 +71,21 @@ class LLMConfig(BaseSettings):
     # in `texts`. See detector/cache.py for the trade-offs (notably
     # that it freezes the first-seen result for a given input).
     cache_max_size: int = 0
+    # How the pipeline dispatches `req.texts` to the LLM detector:
+    #   "per_text" (default) — one detect() call per text, in
+    #     parallel under the LLM concurrency cap. Compatible with the
+    #     result cache; preserves per-text failure isolation.
+    #   "merged"   — concatenate all texts with a sentinel separator
+    #     and make one detect() call against the blob. Amortises the
+    #     system prompt across short fragments and gives the model
+    #     cross-segment context (a username from text 1 next to a
+    #     "password reset for ..." in text 2 reads as CREDENTIAL more
+    #     reliably than each in isolation). Mutually exclusive with the
+    #     result cache: every blob is unique by construction, so a
+    #     non-zero `cache_max_size` paired with merged mode logs a
+    #     warning and the cache is silently bypassed.
+    # See `pipeline.py` for the dispatch logic and the sentinel choice.
+    input_mode: Literal["per_text", "merged"] = "per_text"
 
     @field_validator("api_base", mode="after")
     @classmethod

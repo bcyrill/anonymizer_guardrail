@@ -26,6 +26,7 @@ config pattern.
 | `LLM_SYSTEM_PROMPT_PATH` | *(empty → bundled `llm_default.md`)* | Override the bundled detection prompt. Accepts `bundled:NAME` or a filesystem path. See [Customising the prompt](#customising-the-detection-prompt) below. |
 | `LLM_SYSTEM_PROMPT_REGISTRY` | *(empty)* | Comma-separated `name=path` list of NAMED alternative prompts callers can opt into per-request via `llm_prompt`. See [per-request overrides → Named alternatives](../per-request-overrides.md#named-alternatives). |
 | `LLM_CACHE_MAX_SIZE` | `0` | LRU cap on the LLM detector's result cache. `0` disables caching (default). When enabled, repeat calls with the same `(text, llm_model, llm_prompt)` skip the LLM round-trip. See [operations → Detector result caching](../operations.md#detector-result-caching) for the trade-offs. |
+| `LLM_INPUT_MODE` | `per_text` | How the pipeline dispatches `req.texts` to this detector. `per_text` (default) calls the detector once per text; `merged` concatenates all texts with a sentinel separator and makes one call per request. See [operations → Merged-input mode](../operations.md#merged-input-mode) for the trade-offs. Mutually exclusive with `LLM_CACHE_MAX_SIZE`: setting both logs a warning at boot and the cache is bypassed. |
 
 ## Per-request overrides
 

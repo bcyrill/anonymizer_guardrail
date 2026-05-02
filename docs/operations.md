@@ -157,3 +157,80 @@ cache is cold and the first occurrence of each input pays the full
 detection cost again. There's no on-disk persistence and no
 replication across replicas — see [limitations](limitations.md) for
 the broader single-replica story.
+
+## Merged-input mode
+
+Today, every text in `req.texts` triggers its own detector call —
+the pipeline fans out N texts × M detectors = N×M calls. For LLM
+detection, this means ten short texts cost ten separate LLM
+round-trips, each carrying the ~600-token system prompt
+(`prompts/llm_default.md`) for ~50 user tokens of payload —
+roughly 13× system-prompt overhead.
+
+Merged mode collapses the per-detector fan-out: the pipeline
+joins all texts into a single sentinel-separated blob and the
+detector makes ONE call per request. Configurable per detector
+because regex and denylist are shape-based and don't benefit;
+LLM/gliner/PF can.
+
+### Configuration
+
+Currently wired for the LLM detector. Per-detector knobs for
+gliner-pii and privacy-filter follow the same shape and would be
+opt-in extensions of this mechanism.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_INPUT_MODE` | `per_text` | `per_text` keeps the existing fan-out; `merged` collapses to one call per request. |
+
+### Two wins
+
+1. **Token / latency amortization.** One round-trip carries the
+   system prompt once instead of once per text. For a request
+   with 10 short texts this is roughly 13× fewer system-prompt
+   tokens and fewer time-to-first-token waits.
+2. **Cross-segment context.** A detector seeing all texts at
+   once can correlate signals across them — a bare username in
+   text 1 next to "password reset request for ..." in text 2
+   reads as `CREDENTIAL` more reliably than each in isolation.
+
+### Trade-offs (read before enabling)
+
+- **Mutually exclusive with the result cache.** A merged blob is
+  unique per request by construction (the new user message is
+  always different), so `InMemoryDetectionCache` would 100% miss.
+  Setting both `LLM_INPUT_MODE=merged` AND `LLM_CACHE_MAX_SIZE>0`
+  logs a warning at boot; the cache is bypassed. Pick one
+  optimization per detector.
+- **Failure mode worsens.** Today one LLM call failing only
+  loses detection for one text; under `fail_closed=False` the
+  others still get coverage. Merged, a single bad response loses
+  coverage for the *whole request*.
+- **Sentinel filtering.** Pipeline drops any match whose text
+  contains the segment marker (`ANONYMIZER-SEGMENT-BREAK`),
+  defending against the model classifying the separator itself
+  or returning a span that crosses a boundary
+  ("Alice<SEP>Smith" as PERSON). Operators don't see this; it's
+  silent defense in depth.
+- **Size fallback.** If the merged blob exceeds the detector's
+  `LLM_MAX_CHARS` cap, that detector falls back to per_text
+  dispatch *for that one request* (debug log emitted). The
+  optimization is opportunistic — a single oversized request
+  doesn't break detection coverage.
+
+### When to enable
+
+Worth turning on when:
+
+- Conversations carry many short texts per request (chat history,
+  tool-call arguments) and LLM token cost dominates.
+- The detector's classification quality regresses when texts are
+  isolated — operators report entities the LLM catches in a
+  contiguous prompt but misses when split.
+
+Skip it when:
+
+- The detector cache's hit rate is high (visible on `/health`).
+  Caching saves the call entirely; merged mode just makes a
+  single call cheaper.
+- Failure isolation per text matters more than amortization.
