@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 # Canonical entity types. Detectors should use these where possible so the
@@ -92,3 +92,24 @@ class Detector(Protocol):
     name: str
 
     async def detect(self, text: str) -> list[Match]: ...
+
+
+@runtime_checkable
+class CachingDetector(Detector, Protocol):
+    """A detector that opts into result caching via `SPEC.has_cache=True`.
+
+    Pipeline.stats() calls `cache_stats()` on every active detector
+    whose spec has `has_cache=True`. The contract: if your
+    `DetectorSpec` sets `has_cache=True`, your detector class MUST
+    implement `cache_stats()` returning the four required keys
+    (`size`, `max`, `hits`, `misses`) — see
+    `detector/cache.py:DetectorResultCache.stats()` for the canonical
+    shape. `DetectorSpec.__post_init__` validates the CONFIG side
+    (cache_max_size + stats_prefix); the type-side contract lives
+    here so Pipeline.stats can `isinstance`-narrow the dispatch.
+
+    `runtime_checkable` so the narrowing actually fires at runtime —
+    Protocol checks only verify method names (no signature checks),
+    which is exactly the cheap structural check we want."""
+
+    def cache_stats(self) -> dict[str, int]: ...

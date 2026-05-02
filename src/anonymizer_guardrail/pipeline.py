@@ -34,7 +34,7 @@ from .detector import (
     SPECS_WITH_SEMAPHORE,
     TYPED_UNAVAILABLE_ERRORS,
 )
-from .detector.base import Detector, Match
+from .detector.base import CachingDetector, Detector, Match
 from .surrogate import SurrogateGenerator
 from .vault import Vault
 
@@ -249,9 +249,19 @@ class Pipeline:
         active_by_name = {d.name: d for d in self._detectors}
         for spec in SPECS_WITH_CACHE:
             det = active_by_name.get(spec.name)
-            if det is not None:
+            # Type-side contract: SPECS_WITH_CACHE membership means the
+            # detector class implements `cache_stats()` (see
+            # `detector/base.py:CachingDetector`). The runtime-checkable
+            # isinstance narrowing both satisfies type checkers AND
+            # acts as a defensive guard if a future detector sets
+            # has_cache=True on its spec but forgets the method.
+            if det is not None and isinstance(det, CachingDetector):
                 cs = det.cache_stats()
             else:
+                # Inactive (DETECTOR_MODE narrowed it out) OR — under
+                # the defensive guard — a misconfigured detector. Emit
+                # the configured cap with zero counters so /health key
+                # sets stay stable.
                 cs = {
                     "size": 0,
                     "max": int(spec.config.cache_max_size),
@@ -513,31 +523,34 @@ class Pipeline:
                 except Exception as exc:  # noqa: BLE001 — never fail shutdown
                     log.warning("Detector %s aclose failed: %s", det.name, exc)
 
-    async def anonymize(
+    async def _run_detection(
         self,
         texts: list[str],
-        call_id: str | None,
         *,
-        api_key: str | None = None,
-        overrides: Overrides = Overrides.empty(),
-    ) -> tuple[list[str], dict[str, str]]:
-        """Anonymize a batch of texts, persist the reverse mapping, return modified texts.
+        api_key: str | None,
+        overrides: Overrides,
+    ) -> tuple[list[list[Match]], list[list[Match]]]:
+        """Dispatch detection across all active detectors and return
+        their match lists, partitioned by dispatch mode.
 
-        Returns (modified_texts, mapping) so the API layer can include the
-        mapping size in logs/responses without re-reading the vault.
+        Returns `(per_text_matches, merged_matches)` where:
 
-        `api_key`, if given, overrides config.llm_api_key for the LLM detector
-        on this call only — used to forward the caller's own key per-request.
+          * `per_text_matches[i]` is the deduped matches for `texts[i]`
+            from the per_text-mode detectors (one inner list per text).
+          * `merged_matches[j]` is the sentinel-filtered matches from
+            the j-th merged-mode detector (one inner list per detector,
+            *not* per text — each merged detector ran once against the
+            sentinel-joined blob).
 
-        `overrides` carries the `additional_provider_specific_params`
-        knobs (use_faker, faker_locale, detector_mode,
-        regex_overlap_strategy, llm_model). Each is None by default;
-        the detectors and the surrogate generator pick up only the
-        ones relevant to them.
+        Both lists are consumed by the caller for mapping construction;
+        cross-source dedup happens at that layer (by value, first-seen
+        wins on entity type).
+
+        Why this lives in its own method: `anonymize` was getting long
+        and doing five jobs. The dispatch concern (partition → blob →
+        size fallback → unified TaskGroup → sentinel filter) is one
+        cohesive concern; mapping/replacement/vault is another.
         """
-        if not texts:
-            return [], {}
-
         # Resolve the active set once, then partition by input_mode so
         # we can dispatch per-text and merged detectors in a single
         # TaskGroup. Doing both in one group is what gives us unified
@@ -611,9 +624,9 @@ class Pipeline:
         # output. This guards against (a) the model classifying the
         # sentinel literal as an entity, and (b) returning a span that
         # crosses a segment boundary ("Alice<SEP>Smith" as PERSON) —
-        # both filtered out by the contains-check. Done before
-        # mapping construction so the surrogate generator never sees
-        # a sentinel-bearing match.
+        # both filtered out by the contains-check. Done before the
+        # caller builds the surrogate mapping so the generator never
+        # sees a sentinel-bearing match.
         merged_matches: list[list[Match]] = []
         for det, task in zip(merged_dets, merged_tasks):
             results = task.result()
@@ -626,6 +639,47 @@ class Pipeline:
                         "from %s output", dropped, det.name,
                     )
             merged_matches.append(kept)
+
+        return per_text_matches, merged_matches
+
+    async def anonymize(
+        self,
+        texts: list[str],
+        call_id: str | None,
+        *,
+        api_key: str | None = None,
+        overrides: Overrides = Overrides.empty(),
+    ) -> tuple[list[str], dict[str, str]]:
+        """Anonymize a batch of texts, persist the reverse mapping, return modified texts.
+
+        Returns (modified_texts, mapping) so the API layer can include the
+        mapping size in logs/responses without re-reading the vault.
+
+        `api_key`, if given, overrides config.llm_api_key for the LLM detector
+        on this call only — used to forward the caller's own key per-request.
+
+        `overrides` carries the `additional_provider_specific_params`
+        knobs (use_faker, faker_locale, detector_mode,
+        regex_overlap_strategy, llm_model). Each is None by default;
+        the detectors and the surrogate generator pick up only the
+        ones relevant to them.
+
+        High-level shape:
+
+          1. `_run_detection` → dispatch all active detectors and
+             collect their match lists (per-text + merged).
+          2. Build the process-wide `original → surrogate` mapping by
+             walking both match lists in DETECTOR_MODE order. Same
+             entity in multiple sources collapses to one surrogate.
+          3. Apply replacements, persist the reverse mapping under
+             `call_id` for the post-call deanonymize lookup.
+        """
+        if not texts:
+            return [], {}
+
+        per_text_matches, merged_matches = await self._run_detection(
+            texts, api_key=api_key, overrides=overrides,
+        )
 
         # Build one process-wide mapping (original → surrogate) so the same
         # entity gets the same surrogate across all texts in this request.
