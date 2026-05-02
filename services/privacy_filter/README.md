@@ -79,7 +79,23 @@ podman run --rm -p 8001:8001 \
     privacy-filter-service:latest
 ```
 
-Configuration:
+## Probing
+
+`scripts/probe.py` is a stdlib-only Python script that hits a
+running service with a text input and prints the matches plus a
+per-entity-type count. Use it to see how the model classifies your
+data (and to compare against gliner-pii on the same fixture).
+
+```bash
+python services/privacy_filter/scripts/probe.py \
+    --text "Alice Smith (alice@acme.com) lives at 123 Main St."
+```
+
+See [scripts/PROBE.md](scripts/PROBE.md) for runnable examples
+(file / stdin input, side-by-side comparison with gliner-pii) and
+`--help` for the full flag list.
+
+## Configuration
 
 | Variable     | Default                  | Notes                                  |
 |--------------|--------------------------|----------------------------------------|
