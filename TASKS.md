@@ -478,3 +478,115 @@ infrastructure landed):
   detector is shape-stable across both variants today; promoting
   without preserving that guarantee defeats the rollback story.
 
+---
+
+## Co-locate launcher metadata with each detector module
+
+**What:** today the launcher-side metadata for a detector
+(`LauncherSpec` with `ServiceSpec`, env passthroughs, container
+name, ports, cache mount paths, GPU flags) lives in
+[`tools/launcher/spec_extras.py`](tools/launcher/spec_extras.py),
+separate from the detector module itself. A contributor adding a
+new detector has to remember to update *two* files: the detector
+module (with `CONFIG`, `SPEC`, the `Detector` class) and
+`spec_extras.py` (with the launcher-side metadata).
+
+The proposal: move each detector's launcher metadata into its own
+sibling file (`detector/llm_launcher.py`,
+`detector/remote_privacy_filter_launcher.py`, etc.) and have
+`tools/launcher/spec_extras.py` build `LAUNCHER_METADATA` by
+importing those siblings. The physical separation that keeps
+`tools/` out of the wheel is preserved (the `_launcher.py` files
+sit next to the detector modules but are imported lazily by the
+launcher, never by the package's `__init__`).
+
+**Why deferred:** structural refactor with no current operator
+pain. Adding a new detector is the natural moment — at that point
+the cohesion improvement has a concrete use-site, and you're
+already in the right files.
+
+**Trigger:** the next detector lands.
+
+---
+
+## README.md deployment-topology diagram
+
+**What:** add a small ASCII diagram (or link one in
+`docs/deployment.md`) showing the request flow:
+
+```
+  client ─→ LiteLLM ─→ guardrail (slim) ─┬→ pf-service / pf-hf-service
+                                          ├→ gliner-pii-service
+                                          └→ LLM detector → LiteLLM (alias)
+                            ↓
+                       upstream LLM
+```
+
+**Why:** today a new reader can find the Quick Start (one
+`scripts/launcher.sh --preset uuid-debug` line) and the per-detector
+docs, but the *shape* of a deployment — what talks to what — takes
+three documents to assemble. A 10-line diagram in README.md
+compresses that comprehension cost.
+
+**Effort:** ~30 min including a sanity check that the diagram
+matches the launcher's actual topology.
+
+---
+
+## Cross-reference TASKS.md from limitations.md and operations.md
+
+**What:** several entries in `docs/limitations.md` document
+*current limitations* with corresponding planned fixes in
+TASKS.md. Without cross-references, a reader hitting one document
+doesn't know about the planned work in the other.
+
+Concrete cross-references worth adding:
+
+* `docs/limitations.md` → "Vault is in-memory" → link to TASKS.md
+  *Multi-replica support (Redis-backed Vault)*.
+* `docs/operations.md` Vault section → same link.
+* `docs/limitations.md` → "no streaming responses" → link to
+  TASKS.md *Streaming response support*.
+* `docs/limitations.md` → "no /metrics endpoint" → link to
+  TASKS.md *Prometheus-style /metrics endpoint*.
+
+**Why:** prevents readers from re-discovering known limitations
+or filing duplicate issues for already-tracked work.
+
+**Effort:** ~20 min, mechanical scan + a few one-line additions.
+
+---
+
+## Split `tests/test_pipeline.py` by feature
+
+**What:** `tests/test_pipeline.py` is 618 lines with tests covering
+anonymise, deanonymise, override resolution, fail-closed semantics,
+TaskGroup behaviour, and dedup. Splitting into a few focused files
+(`test_pipeline_anonymize.py`, `test_pipeline_overrides.py`,
+`test_pipeline_failure.py`, etc.) would let a contributor working on
+one area run a focused subset and produce shorter `pytest -v` output.
+
+**Why deferred:** ergonomics, not correctness — no bugs hide because
+of file size. Worth doing the next time the file gets a substantial
+addition.
+
+**Effort:** ~1 hr (tests pass through a `git mv` + import-fix flow,
+no logic changes).
+
+---
+
+## Move `litellm.config.example.yaml` to `examples/`
+
+**What:** the LiteLLM example config sits at the repo root
+(`litellm.config.example.yaml`). Discoverability suffers: a reader
+looking for examples checks `examples/` first.
+
+**Why deferred:** trivial bikeshed; would invalidate any external
+links to the current path. Worth bundling into a broader examples
+reorganisation rather than a one-file move. If the project ever
+grows more example configs (different LiteLLM topologies,
+docker-compose variants, k8s manifests), do all of them at once
+into a freshly-created `examples/` directory.
+
+**Trigger:** the second example file lands.
+
