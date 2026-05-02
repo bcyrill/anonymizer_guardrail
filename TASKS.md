@@ -736,16 +736,19 @@ split, same calibration JSON.
 | **Device default differs from current behaviour** | We currently use `transformers.pipeline(...)` without an explicit `device` argument, which defaults to CPU. The `OPF` constructor's `device` parameter defaults to `"cuda"` (see `opf/_api.py`'s signature: `device: Literal["cpu", "cuda"] = "cuda"`). The fix is trivial — pass `device="cpu"` explicitly in `_load_model()` — but it must be done deliberately or the cpu image will silently try to load CUDA on hosts without a GPU. The CUDA path itself works fine (see `examples/scripts/finetuning/finetune_secret_demo.sh` in the privacy-filter repo for a CPU-mode reference); we just need a `PRIVACY_FILTER_DEVICE` env or build-arg to flip to `"cuda"` for cu130 image builds. |
 | **Mock-surface change in tests** | The 19 existing `test_privacy_filter.py` tests mock `_load_pipeline()` and consume the result as `pipeline_obj(text) -> list[dict]`. Phase 5 swaps this to a `_FakeOPF` returning a `RedactionResult`. Most assertions stay (they target the merge/split/label-mapping passes), but every test's fixture-construction line changes. Schedule a focused half-day for this rather than threading it through Phase 3/4 ad-hoc. |
 | **Label set differs subtly from HF output** | Spike showed opf labels `dc01.acmecorp.local` and `siem.acmecorp.local` as `private_url` / `secret` rather than `OTHER` — the recall increase pulls in entities that previously fell through. Run a one-time audit of `_LABEL_MAP` after Phase 4: any label opf emits that we don't map is currently routed to `OTHER`. Probably fine; worth a sanity check against a sample of production traffic. |
-| **Calibration tuning is corpus-specific** | Ship a reasonable default; expose `PRIVACY_FILTER_CALIBRATION` env so deployments with different traffic can override. Don't bake corpus-specific values. |
-| **Mock surface change breaks tests** | Wrap mock construction in a helper that produces opf-shaped or pipeline-shaped output via a flag during a transition window. |
+| **Calibration tuning is corpus-specific** | If Phase 2 ever lands, ship a reasonable default; expose `PRIVACY_FILTER_CALIBRATION` env so deployments with different traffic can override. Don't bake corpus-specific values. The MVP migration ships *without* a calibration JSON and that's fine — see Phase 2. |
 
 ### Effort summary
 
-- Total: **5–7 person-days** for full migration.
-- Stop-and-revert checkpoint: end of Phase 1.
-- Smallest viable shipping unit: Phases 1–3 (service-side only).
-  In-process can land separately as long as the parity contract is
-  preserved.
+Phase 1 done. Remaining work: **4–5 person-days** (Phase 3 service
+migration ~1.5d, Phase 4 in-process migration ~1d, Phase 5 mock
+adaptation ~1d, Phase 6 validation + docs ~½d). Phase 2
+calibration is optional, deferred until a corpus needs it.
+
+Smallest viable shipping unit is Phases 3 + 5 + 6 (service-side
+migration + tests + docs); the in-process migration in Phase 4 can
+land separately as long as the parity contract is preserved
+between the two implementations.
 
 **Non-goals:**
 
