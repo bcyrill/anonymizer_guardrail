@@ -12,8 +12,11 @@
 #   BAKE_MODEL=false (default)   image is small (~1 GB); the model
 #                                downloads on first container start.
 #                                Mount a NAMED VOLUME at
-#                                /app/.cache/huggingface so the
-#                                download survives container recreation.
+#                                /app/.opf so the download survives
+#                                container recreation. (opf writes
+#                                its checkpoint to ~/.opf/privacy_filter
+#                                and ignores HF_HOME — see the
+#                                end of the file for the rationale.)
 #   BAKE_MODEL=true              image carries the model weights
 #                                (~6.9 GB total); no runtime download,
 #                                works air-gapped.
@@ -27,9 +30,9 @@
 #       -f services/privacy_filter/Containerfile services/privacy_filter/
 #
 # Run (runtime download):
-#   podman volume create privacy-filter-hf-cache
+#   podman volume create privacy-filter-opf-cache
 #   podman run --rm -p 8001:8001 \
-#       -v privacy-filter-hf-cache:/app/.cache/huggingface \
+#       -v privacy-filter-opf-cache:/app/.opf \
 #       privacy-filter-service:latest
 #
 # Run (baked):
@@ -52,7 +55,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
  && apt-get update \
- && apt-get install -y --no-install-recommends curl
+ && apt-get install -y --no-install-recommends curl git
+# `git` is required for the pip install below — opf isn't on PyPI so
+# we install it from `git+https://github.com/openai/privacy-filter@<sha>`.
+# Drop back to just `curl` if opf ever publishes to PyPI.
 
 # Non-root user (Podman is rootless by default; this also helps on K8s).
 ARG APP_UID=10001
@@ -65,38 +71,67 @@ WORKDIR /app
 
 ARG BAKE_MODEL=false
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+# Pinned opf commit. opf isn't published to PyPI; we install from
+# OpenAI's privacy-filter repo by SHA so reproducible builds aren't at
+# the mercy of upstream master moving.
+ARG OPF_GIT_REF=f7f00ca7fb86
 
 # Two install steps so the torch wheel comes from the chosen index
 # (CPU vs CUDA). PyPI's default `torch` silently pulls in nvidia-cuda-*
 # packages we never use; the CPU wheel index skips them, dropping the
-# image substantially. The buildkit cache mount keeps wheels across
-# rebuilds; we drop --no-cache-dir for the same reason — the mount IS
-# the cache and lives outside the image layer.
+# image substantially. Pre-installing torch first means the subsequent
+# `opf` install (which lists `torch` without a constraint) sees torch
+# already satisfied and doesn't try to pull the CUDA build from PyPI.
+# The buildkit cache mount keeps wheels across rebuilds; we drop
+# --no-cache-dir for the same reason — the mount IS the cache and
+# lives outside the image layer.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --index-url "$TORCH_INDEX_URL" torch \
  && pip install \
-        'transformers>=4.40' \
+        "git+https://github.com/openai/privacy-filter@${OPF_GIT_REF}" \
         'fastapi>=0.110' \
         'uvicorn[standard]>=0.27' \
         'pydantic>=2.6'
 
 COPY main.py /app/main.py
 
-# HF cache lives at a known path so operators can mount a named volume
-# at the same location to persist downloads across container recreation.
-ENV HF_HOME=/app/.cache/huggingface
+# opf writes its checkpoint into `~/.opf/privacy_filter` (= `/app/.opf/`
+# for the app user) and ignores HF_HOME — so we mount the persistent
+# named volume directly at `/app/.opf` and don't bother redirecting
+# HF_HOME or symlinking. opf's checkpoint resolution rules
+# (opf/_api.py::resolve_checkpoint_path):
+#
+#   1. If `OPF()` is called with `model=` → that path (no download).
+#   2. Else if `OPF_CHECKPOINT` env is set → that path (no download).
+#   3. Else → call `ensure_default_checkpoint()` which auto-downloads
+#      from HuggingFace into `~/.opf/privacy_filter`.
+#
+# We deliberately do NOT set OPF_CHECKPOINT — that would disable the
+# auto-download path (opf treats it as "operator-supplied checkpoint,
+# trust them"), which we want active for the non-baked flavour.
+# Earlier iterations tried to redirect via OPF_CHECKPOINT or via a
+# symlink from /app/.opf into a different cache directory; both
+# fought the volume-mount overlay and broke pathlib's `mkdir(parents
+# =True, exist_ok=True)` walk inside huggingface_hub. Mounting the
+# volume at the natural `/app/.opf` path is simpler and doesn't fight
+# any layer.
+RUN mkdir -p /app/.opf \
+ && chown -R app:app /app/.opf
 
 # Optional: pre-download the model into the image. When baked, also
-# default HF_HUB_OFFLINE=1 so transformers doesn't ping HuggingFace Hub
-# on every container start to revalidate the cache (visible as 5+ seconds
-# of HEAD requests and a misleading "set HF_TOKEN" warning). The setting
-# is written to /app/_runtime-env, which the CMD sources before exec'ing
-# uvicorn; the `${HF_HUB_OFFLINE:-1}` form lets operators force online
-# mode at run time with `-e HF_HUB_OFFLINE=0` if they need to refresh
-# weights from inside a baked image. Non-baked flavour gets an empty
-# file so the source statement in CMD is a no-op.
+# default HF_HUB_OFFLINE=1 — kept post-opf-migration as deployment-intent
+# documentation ("this image is meant to run air-gapped") rather than as
+# load-bearing protection. Under transformers, the env var actively
+# suppressed periodic Hub revalidation HEAD requests on cache hits;
+# under opf, the `if target.exists()` check in
+# opf/_common/checkpoint_download.ensure_default_checkpoint short-circuits
+# BEFORE `from huggingface_hub import snapshot_download` runs, so the
+# offline flag is a no-op for warm-start traffic. Operators can still
+# force online mode with `-e HF_HUB_OFFLINE=0` to refresh weights from
+# inside a baked image. Non-baked flavour gets an empty file so the
+# source statement in CMD is a no-op.
 RUN if [ "$BAKE_MODEL" = "true" ]; then \
-        python -c "from transformers import pipeline; pipeline('token-classification', model='openai/privacy-filter', aggregation_strategy='first')" \
+        python -c "from opf._api import OPF; OPF(device='cpu', decode_mode='viterbi')" \
      && echo 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' > /app/_runtime-env; \
     else \
         : > /app/_runtime-env; \

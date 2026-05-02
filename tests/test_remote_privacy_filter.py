@@ -100,9 +100,9 @@ async def test_parses_matches_from_service_response(
     text = "Email alice@example.com about the meeting with Alice"
     mock_post.return_value = _ok_response([
         {"text": "alice@example.com", "entity_type": "EMAIL_ADDRESS",
-         "start": 6, "end": 23, "score": 0.99},
+         "start": 6, "end": 23},
         {"text": "Alice", "entity_type": "PERSON",
-         "start": 47, "end": 52, "score": 0.97},
+         "start": 47, "end": 52},
     ])
 
     matches = await detector.detect(text)
@@ -127,8 +127,7 @@ async def test_unknown_entity_type_normalized_to_other(
     crash, not propagate the unknown type into the surrogate generator."""
     text = "Surprising token: abc123"
     mock_post.return_value = _ok_response([
-        {"text": "abc123", "entity_type": "WIDGET", "start": 18, "end": 24,
-         "score": 0.91},
+        {"text": "abc123", "entity_type": "WIDGET", "start": 18, "end": 24},
     ])
 
     matches = await detector.detect(text)
@@ -145,10 +144,10 @@ async def test_hallucination_guard_drops_text_not_in_input(
     isn't in the input."""
     mock_post.return_value = _ok_response([
         {"text": "alice@example.com", "entity_type": "EMAIL_ADDRESS",
-         "start": 0, "end": 17, "score": 0.99},
+         "start": 0, "end": 17},
         # This one isn't in the source — must be dropped.
         {"text": "evil@attacker.com", "entity_type": "EMAIL_ADDRESS",
-         "start": 0, "end": 0, "score": 0.99},
+         "start": 0, "end": 0},
     ])
 
     matches = await detector.detect("Email alice@example.com please.")

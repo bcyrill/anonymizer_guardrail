@@ -72,10 +72,14 @@ for the size/runtime trade-off across all flavours.
 ## Run
 
 ```bash
-# With a persistent cache so the model survives container recreates:
-podman volume create privacy-filter-hf-cache
+# With a persistent cache so the model survives container recreates.
+# opf writes its checkpoint into `/app/.opf/privacy_filter` (its
+# default model path), so that's where the volume mounts. HF_HOME
+# isn't involved — opf uses huggingface_hub for the download stage
+# only and writes the final checkpoint to its own location.
+podman volume create privacy-filter-opf-cache
 podman run --rm -p 8001:8001 \
-    -v privacy-filter-hf-cache:/app/.cache/huggingface \
+    -v privacy-filter-opf-cache:/app/.opf \
     privacy-filter-service:latest
 ```
 

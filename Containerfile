@@ -67,7 +67,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
  && apt-get update \
- && apt-get install -y --no-install-recommends curl
+ && apt-get install -y --no-install-recommends curl git
+# `git` is required for the `pip install` step further down, which
+# pulls `opf` from `git+https://github.com/openai/privacy-filter@<sha>`
+# (opf isn't on PyPI). Only the pf / pf-baked flavours actually need
+# it, but installing it unconditionally costs ~5 MB on the slim image
+# and avoids a second build path. Drop this back to just `curl` if
+# opf ever publishes to PyPI.
 
 # Non-root user (Podman is rootless by default; this also helps on K8s).
 ARG APP_UID=10001

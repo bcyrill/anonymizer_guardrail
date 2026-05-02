@@ -83,6 +83,32 @@ guardrail's `pf` flavour uses, so an operator who already pulled the
 model via the in-process path doesn't pay the download again on
 switching to remote.
 
+## Decoder
+
+Both the in-process detector and the standalone service load the
+model via OpenAI's [`opf`](https://github.com/openai/privacy-filter)
+package — specifically `OPF.redact()` with `decode_mode="viterbi"`.
+This replaces the earlier `transformers.pipeline(
+"token-classification", aggregation_strategy="first")` integration.
+The Viterbi path is the decoder OpenAI actually trained the model
+with; the migration brought materially tighter span boundaries (no
+trailing punctuation absorbed), zero `\n\n` over-merges, and higher
+recall on emails / API keys / plaintext passwords. See
+[`services/privacy_filter/scripts/PROBE.md`](../../services/privacy_filter/scripts/PROBE.md#after-the-opf-migration)
+"After the opf migration" for the empirical before/after.
+
+Two operator-facing knobs:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PRIVACY_FILTER_DEVICE` | `cpu` | `cpu` or `cuda`. Overrides opf's own constructor default of `cuda` so the cpu image doesn't silently try to load CUDA on a GPU-less host. cu130 image builds set this to `cuda` to flip back. |
+| `PRIVACY_FILTER_CALIBRATION` | *(unset)* | Optional path to a Viterbi operating-points JSON. If unset or the file doesn't exist, opf's stock decoder is used — the spike confirmed it produces clean spans on every fixture we measured. Reserved for future corpora that need precision/recall tuning. JSON shape and bias semantics are documented in `services/privacy_filter/scripts/spike_opf.py`. |
+
+The post-processing pipeline (per-label merge gap caps, paragraph-
+break split pass) is kept as defense in depth — it doesn't fire on
+the fixtures we have under opf, but production traffic is broader
+than fixtures and the runtime cost is negligible.
+
 ## Failure handling
 
 `PRIVACY_FILTER_FAIL_CLOSED` (default `true`) is independent from

@@ -157,6 +157,19 @@ red-team fixture:
 
 ## Empirical findings
 
+> **Note (post-Viterbi migration):** the findings below were
+> captured against the original `transformers.pipeline(
+> aggregation_strategy="first")` integration. The service has
+> since switched to opf's constrained Viterbi decoder
+> (`OPF.redact()`, see TASKS.md → "opf-based Viterbi decoding"),
+> which produces materially different output: zero `\n\n`
+> over-merges, tighter span boundaries (no trailing
+> `,`/`.`/`)` absorbed), and higher recall on the entities
+> below. See "After the opf migration" further down for the
+> updated picture; the older findings are kept for historical
+> context and to motivate the per-label gap caps and
+> paragraph-split pass that still run as defense in depth.
+
 Numbers below come from running the example commands above against
 `sample.txt` and a couple of small isolation probes. Patterns that
 hold beyond the exact fixture:
@@ -274,3 +287,97 @@ transcripts) for the standard PII set, but loses recall when the
 text layout fragments local context. Layer the regex detector on
 top — that's what `_to_matches` and the merge logic in the
 in-process detector are designed to compose with.
+
+## After the opf migration
+
+Captured by the Phase-1 spike at
+`services/privacy_filter/scripts/spike_opf.py` and the post-
+migration probes against `sample.txt` and `engagement_notes.txt`.
+The decoder swap (HF aggregation → opf Viterbi) changed enough
+that the table-by-table comparisons above are no longer
+representative — this section captures the new picture.
+
+**1. Layout sensitivity is largely gone for emails.** All three
+shapes now fire at full confidence:
+
+| Input shape | `EMAIL_ADDRESS` result |
+|---|---|
+| `Contact Jane Doe at jane.doe@example.com …` (clean prose) | hit |
+| `…reachable at\njane.doe@example.com …` (line break) | hit |
+| `Bob Roberts\n(bob.roberts@firstnationalbank.com, …)` (parenthetical after a name) | hit (the leading `(` bleeds in cosmetically — `_to_matches`'s `.strip()` doesn't reach inside, but the surrogate replaces the noisy span and the `(` reappears in the rendered output) |
+
+This was the headline pre-migration regression for
+privacy-filter; opf's Viterbi decodes the `Bob Roberts`
+person-span and the email span as separate entities rather than
+one PERSON glued together.
+
+**2. `\n\n` over-merges no longer occur.** The three over-merged
+spans on `sample.txt` (`[164:191]` `2026-04-17 09:42\n\nCustomer:`,
+`[300:367]` `742\nEvergreen Terrace, …\n\nIssue`, `[803:827]`
+`2026-04-17.\n\nResolution:`) all produced clean spans
+post-migration without the split pass having to fire. The split
+pass is kept as defense in depth.
+
+**3. Span boundaries are tighter.** opf doesn't absorb trailing
+`,`/`.`/`)` into spans:
+
+| Pre-migration | Post-migration |
+|---|---|
+| `1987-03-22),` (DATE) | `1987-03-22` |
+| `+1 415-555-0181.` (PHONE) | `+1 415-555-0181` |
+| `+1 212-555-0107),` (PHONE) | `+1 212-555-0107` |
+| `https://...8e5a2f1c.` (URL) | `https://...8e5a2f1c` |
+| `Marcus Chen,` (PERSON) | `Marcus Chen` |
+| `88421.` (IDENTIFIER) | `88421` |
+
+The `SSN 123-45-6789` prefix-absorption case is unchanged —
+that's the model labeling the prefix word as part of the entity,
+not a decoder boundary issue.
+
+**4. Recall improvements on `sample.txt`.** opf catches entities
+the HF integration missed:
+
+| Entity | Pre-migration | Post-migration |
+|---|---|---|
+| `jane.doe@example.com` | missed | `EMAIL_ADDRESS` |
+| `SVC-2026-04-117` (ticket id) | missed | `account_number` |
+
+**5. Recall improvements on `engagement_notes.txt` are bigger.**
+opf labels things HF privacy-filter missed entirely; previously
+these had to be picked up by gliner-pii or the regex layer:
+
+| Entity | Pre-migration | Post-migration |
+|---|---|---|
+| `ghp_a1b2c3d4…` (GitHub PAT) | missed | `secret` |
+| `Sp4rkl3-Pony!@` (postgres password) | missed | `secret` |
+| `jenkinsCI123` (plaintext password) | missed | `secret` |
+| `3a7bd3e2…` (SHA-256 binary hash) | missed | `secret` |
+| `siem.acmecorp.local` | `CREDENTIAL` (wrong) | `private_url` |
+| NTDS dump `bob.smith:1107:…` | partial `IDENTIFIER` 0.361 | one tight `secret` span |
+| `10.0.5.10` (IP) | missed | `private_url` |
+
+**6. New label-set surprises.** opf is willing to label more
+strings as `secret` than HF was, including some that aren't
+secrets in any meaningful sense (`dc01.acmecorp.local` → `secret`,
+`4FFL339` → `account_number`, `svc_jenkins` → `private_person`).
+These are model-side training-data choices, not decoder issues —
+the regex layer or gliner-pii's specific labels are the right
+place to disambiguate. See TASKS.md → "Shape-anchored regex
+override tier in privacy-filter" for the planned fix.
+
+**7. Calibration tuning is now optional.** The spike's three
+calibration profiles (default / anti-merge / privacy-parser)
+produced identical span tables on `sample.txt` and differed on
+exactly one span on `engagement_notes.txt` — the NTDS hash
+boundary. Default Viterbi is the production decoder; the
+`PRIVACY_FILTER_CALIBRATION` env var is reserved for future
+corpora that need tuning.
+
+**Disposition of the merge / split / per-label gap caps:**
+
+All three post-processing passes are **kept as defense in
+depth**. The migration spike showed they don't fire on either
+fixture, but production traffic is broader than fixtures and the
+runtime cost is negligible. Re-evaluate removal after collecting
+production data showing none of them ever fires across N
+requests.

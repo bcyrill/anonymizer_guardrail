@@ -65,12 +65,16 @@ def _format_table(matches: list[dict]) -> str:
     "what does the model actually find on my data, and how often?"
     A type histogram answers that at a glance.
     """
-    header = ("entity_type", "score", "span", "text")
-    rows: list[tuple[str, str, str, str]] = [header]
+    # No `score` column: the wire format dropped that field when the
+    # service migrated from `transformers.pipeline` to opf. opf's
+    # DetectedSpan doesn't expose a per-span confidence, and a
+    # synthetic constant (we briefly shipped 1.0) was worse than
+    # nothing — operators reading it would assume real signal.
+    header = ("entity_type", "span", "text")
+    rows: list[tuple[str, str, str]] = [header]
     for m in matches:
         rows.append((
             m.get("entity_type", ""),
-            f"{float(m.get('score', 0.0)):.3f}",
             f"[{m.get('start')}:{m.get('end')}]",
             m.get("text", ""),
         ))

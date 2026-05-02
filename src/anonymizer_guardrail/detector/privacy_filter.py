@@ -14,14 +14,23 @@ ordering that fits your priority).
 
 Optional dependency: install the `privacy-filter` extra
 (`pip install anonymizer-guardrail[privacy-filter]`) to pull in torch +
-transformers. Without those, this module imports fine but instantiating
-the detector raises a clear ImportError pointing at the extras.
+the [`opf`](https://github.com/openai/privacy-filter) package (OpenAI's
+own inference wrapper for this model). Without those, this module
+imports fine but instantiating the detector raises a clear ImportError
+pointing at the extras.
+
+Inference layer note: this used to wrap `transformers.pipeline(
+"token-classification", aggregation_strategy="first")`. We migrated
+to `opf.OPF(decode_mode="viterbi")` for materially better span
+boundaries and recall — see `services/privacy_filter/scripts/PROBE.md`
+→ "post-Viterbi migration" for empirical numbers.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from typing import Any
@@ -63,6 +72,18 @@ class PrivacyFilterConfig(BaseSettings):
     # Independent from LLM_MAX_CONCURRENCY: a saturated PF queue
     # shouldn't reduce LLM headroom or vice versa.
     max_concurrency: int = 10
+    # Inference device for the in-process variant. opf's own
+    # constructor default is `cuda`; we override to `cpu` so a
+    # GPU-less host doesn't explode at first request. cu130 image
+    # builds set PRIVACY_FILTER_DEVICE=cuda to flip back.
+    device: str = "cpu"
+    # Optional path to a Viterbi operating-points JSON. If unset or
+    # the file doesn't exist, opf's stock decoder is used — the
+    # Phase-1 spike showed the stock decoder produces clean spans on
+    # every fixture we measured. Reserved for future corpora that
+    # need precision/recall tuning. JSON shape and bias semantics
+    # are documented in services/privacy_filter/scripts/spike_opf.py.
+    calibration: str = ""
 
     @field_validator("url", mode="after")
     @classmethod
@@ -172,27 +193,38 @@ def _gap_is_mergeable(
     return all(ch in connectors for ch in gap)
 
 
-# Paragraph break — used by the split pass to break apart a single
-# span the HF pipeline already aggregated across a `\n\n`. The
-# aggregation_strategy="first" used in `_load_pipeline` groups
-# adjacent same-entity tokens regardless of intervening whitespace,
-# so a date at the end of one paragraph and a header word at the
-# start of the next that the model tagged identically can come back
-# as one span. Splitting it here applies the same logical rule the
-# merge pass enforces from the opposite direction.
+# Paragraph break — used by the split pass to break apart any single
+# span the decoder collapsed across a `\n\n`. Originally needed for HF's
+# `aggregation_strategy="first"` which routinely glued tokens across
+# blank lines; the post-Viterbi-migration spike showed opf doesn't
+# produce these on our fixtures, but the split pass is kept as
+# defense in depth — production traffic is broader than fixtures and
+# the cost is negligible.
 _PARAGRAPH_BREAK = re.compile(r"\n{2,}")
 
 
-def _load_pipeline(model_name: str) -> Any:
-    """Construct the HuggingFace token-classification pipeline.
+def _load_model(model_name: str) -> Any:
+    """Construct the opf-backed PII model.
 
     Imports happen lazily so this module is harmless to import on
     deployments without the privacy-filter extras installed. The actual
     failure (with a clear remediation message) is deferred until someone
     tries to instantiate PrivacyFilterDetector.
+
+    `device` defaults to "cpu" — opf's own constructor default is
+    "cuda", and silently selecting GPU on a CPU-only host would
+    explode at first request rather than at boot. Operators on cu130
+    image builds set `PRIVACY_FILTER_DEVICE=cuda` to flip back.
+
+    Calibration JSON is optional. If `PRIVACY_FILTER_CALIBRATION`
+    points at a readable file, it's loaded into the Viterbi decoder;
+    otherwise opf's stock decoder is used. The Phase-1 spike showed
+    the stock decoder already produces clean spans on our fixtures
+    (see `services/privacy_filter/scripts/spike_opf.py`); calibration
+    is reserved for future corpora that need precision/recall tuning.
     """
     try:
-        from transformers import pipeline  # noqa: WPS433 — intentional lazy import
+        from opf._api import OPF  # noqa: WPS433 — intentional lazy import
     except ImportError as exc:
         raise ImportError(
             "The in-process PrivacyFilterDetector requires the "
@@ -208,14 +240,30 @@ def _load_pipeline(model_name: str) -> Any:
             "  • If running outside the container, install the extra: "
             "`pip install \"anonymizer-guardrail[privacy-filter]\"`."
         ) from exc
-    # aggregation_strategy="first" collapses BIOES per-token output into
-    # contiguous spans, with the entity_group derived from the first
-    # token's label — matches what the model card example expects.
-    return pipeline(
-        "token-classification",
-        model=model_name,
-        aggregation_strategy="first",
-    )
+    # opf's `model` parameter is a checkpoint *path*, not a HuggingFace
+    # repo id — passing "openai/privacy-filter" as a string makes opf
+    # try to load from a literal `./openai/privacy-filter/` directory.
+    # `None` triggers opf's auto-resolution: it reads `OPF_CHECKPOINT`
+    # (or the bundled default `~/.opf/privacy_filter`), downloads the
+    # model from HuggingFace if not present, and returns the path.
+    # We translate our HF-style default sentinel to None so the
+    # `MODEL_NAME=openai/privacy-filter` configuration (the historical
+    # default from the transformers integration) keeps working. An
+    # operator with a custom checkpoint passes the filesystem path
+    # explicitly.
+    opf_model = None if model_name == _DEFAULT_MODEL else model_name
+
+    # Read device + calibration via the shared PrivacyFilterConfig
+    # (PRIVACY_FILTER_DEVICE / PRIVACY_FILTER_CALIBRATION) so this
+    # module follows the project-wide pydantic-settings convention
+    # rather than spelling env vars by hand. CONFIG is a module
+    # global; tests that monkeypatch it (the `MOD.CONFIG.model_copy(
+    # update={...})` pattern) get picked up here at call time.
+    model = OPF(model=opf_model, device=CONFIG.device, decode_mode="viterbi")
+    if CONFIG.calibration and os.path.isfile(CONFIG.calibration):
+        model.set_viterbi_decoder(calibration_path=CONFIG.calibration)
+        log.info("Loaded Viterbi calibration from %s", CONFIG.calibration)
+    return model
 
 
 class PrivacyFilterDetector:
@@ -224,8 +272,16 @@ class PrivacyFilterDetector:
     name = "privacy_filter"
 
     def __init__(self, model_name: str = _DEFAULT_MODEL) -> None:
-        log.info("Loading privacy-filter model (%s) — first request will be slow…", model_name)
-        self._pipeline = _load_pipeline(model_name)
+        log.info("Loading privacy-filter model (%s) — first start may be slow…", model_name)
+        self._model = _load_model(model_name)
+        # Warm up the lazy runtime: opf's constructor only stores
+        # config; the safetensors → torch-tensor load runs on first
+        # `redact()`. Without this, the first request the pipeline
+        # routes through privacy_filter would block 30-60s loading
+        # 1.5B params off disk. Push that cost into startup so the
+        # boot log line genuinely means ready-to-serve.
+        log.info("Warming up runtime (loading model into memory)…")
+        self._model.redact("warmup")
         log.info("privacy-filter ready")
 
     async def detect(self, text: str) -> list[Match]:
@@ -234,17 +290,19 @@ class PrivacyFilterDetector:
         # Inference is CPU/GPU-bound and synchronous. asyncio.to_thread
         # offloads it so the event loop stays responsive — unlike regex
         # (microseconds, fine on the loop), this is hundreds of ms.
-        spans: list[dict[str, Any]] = await asyncio.to_thread(self._pipeline, text)
-        return self._to_matches(spans, text)
+        result = await asyncio.to_thread(self._model.redact, text)
+        return self._to_matches(result.detected_spans, text)
 
     @staticmethod
-    def _to_matches(spans: list[dict[str, Any]], source_text: str) -> list[Match]:
-        # Three passes:
-        #   1. extract  — turn raw pipeline output into (start, end, type)
+    def _to_matches(spans: Any, source_text: str) -> list[Match]:
+        # Four passes:
+        #   1. extract  — turn opf DetectedSpans into (start, end, type)
         #                 tuples, dropping anything malformed
         #   2. merge    — collapse same-type adjacent spans the model split
         #                 across pure whitespace (or comma for ADDRESS)
-        #   3. emit     — slice the source text and build Match objects
+        #   3. split    — break any single span the decoder collapsed
+        #                 across a `\n\n` paragraph break
+        #   4. emit     — slice the source text and build Match objects
         # The extract/merge separation is the bit that distinguishes
         # "Alice / Bob" (two people, slash gap → keep separate) from
         # "Alice Smith" (one person, space gap → merge).
@@ -252,11 +310,15 @@ class PrivacyFilterDetector:
         # 1) extract
         extracted: list[tuple[int, int, str]] = []
         for span in spans:
-            label = span.get("entity_group") or span.get("entity")
+            # opf's DetectedSpan has `.label / .start / .end / .text`.
+            # Use getattr so test fakes that mimic the dataclass don't
+            # have to instantiate every field they don't care about.
+            label = getattr(span, "label", "") or ""
             if not label:
                 continue
             entity_type = _LABEL_MAP.get(str(label), "OTHER")
-            start, end = span.get("start"), span.get("end")
+            start = getattr(span, "start", None)
+            end = getattr(span, "end", None)
             if (
                 not isinstance(start, int)
                 or not isinstance(end, int)
@@ -264,9 +326,9 @@ class PrivacyFilterDetector:
                 or end > len(source_text)
                 or start >= end
             ):
-                # No usable offsets → fall back to the `word` field with
-                # no merging (we can't compute gaps without positions).
-                fallback = str(span.get("word", "")).strip()
+                # No usable offsets → fall back to the span's own .text
+                # with no merging (we can't compute gaps without positions).
+                fallback = str(getattr(span, "text", "") or "").strip()
                 if fallback and fallback in source_text:
                     pos = source_text.find(fallback)
                     extracted.append((pos, pos + len(fallback), entity_type))

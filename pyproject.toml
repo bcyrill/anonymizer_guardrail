@@ -47,9 +47,18 @@ dev = [
 # detector (openai/privacy-filter on HuggingFace). Heavy: torch alone is
 # ~700 MB on disk plus the model weights (~3 GB at fp32). Only install
 # when DETECTOR_MODE will include `privacy_filter`.
+#
+# `opf` (OpenAI's own inference wrapper for the privacy-filter model)
+# isn't on PyPI, so we install it via VCS by pinned commit. The pin
+# matches the SHA referenced in services/privacy_filter/Containerfile's
+# OPF_GIT_REF — keep them in lockstep when bumping. Updating opf needs
+# a `pip install --extra-index-url https://download.pytorch.org/whl/cpu`
+# escape hatch on dev machines, since torch defaults to its CUDA build
+# on PyPI; see TASKS.md → "opf-based Viterbi decoding" → Phase 1 for
+# the recovery recipe if you hit it.
 privacy-filter = [
     "torch>=2.0",
-    "transformers>=4.40",
+    "opf @ git+https://github.com/openai/privacy-filter@f7f00ca7fb86",
 ]
 # Aho-Corasick backend for the denylist detector. Sub-linear in pattern
 # count, pays off above a few thousand entries. Default backend stays
@@ -60,6 +69,16 @@ denylist-aho = [
 
 [project.scripts]
 anonymizer-guardrail = "anonymizer_guardrail.main:app"
+
+[tool.hatch.metadata]
+# Required to allow VCS direct references in `[project.optional-dependencies]` —
+# specifically the `opf @ git+https://github.com/openai/privacy-filter@<sha>`
+# entry in the `privacy-filter` extra. opf isn't on PyPI, so VCS install is
+# the only option until it ships there. Hatchling refuses these by default
+# because PyPI rejects wheels carrying direct refs; we don't publish to PyPI
+# (the project ships via GHCR images and `pip install -e .` from source),
+# so the gate would only block our actual install paths.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/anonymizer_guardrail"]
