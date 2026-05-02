@@ -7,11 +7,12 @@ per opf label.
 The probe deliberately shows raw opf labels (`private_email`,
 `private_person`, `private_phone`, `private_url`, `private_address`,
 `private_date`, `account_number`, `secret`) rather than the
-canonicalised names the guardrail emits — this is a window onto
-what the service does, not an end-to-end view. Existing tables
-further down this file still use the canonical names
-(`EMAIL_ADDRESS`, `PERSON`, …); they pre-date the wire-format
-change and are slated for a refresh.
+canonicalised names the guardrail emits (`EMAIL_ADDRESS`, `PERSON`,
+…) — this is a window onto what the service does, not an end-to-end
+view. The *Empirical findings* section below uses the canonical
+names where it describes pre-migration HF-pipeline behaviour;
+post-migration tables (here and in *After the opf migration*) use
+raw opf labels.
 
 Stdlib-only — runs from any checkout without installing the
 service's Python deps. To start the service first, see the parent
@@ -52,8 +53,8 @@ the practical contrasts when running this one:
 
 `sample.txt` is a synthetic customer-service ticket shipped
 alongside the script — covers every entry in the model's label map
-(person, email, phone, URL, address, date of birth, IBAN / credit
-card / SSN as `IDENTIFIER`, password reference as `CREDENTIAL`).
+(person, email, phone, URL, address, date, IBAN / credit
+card / SSN as `account_number`, password reference as `secret`).
 Use it as a smoke fixture or as scaffolding for your own.
 
 ```bash
@@ -115,61 +116,67 @@ What to look for:
   graded. For confidence-sensitive routing across both, the
   regex detector with stable shape anchors is the disambiguator.
 - **Type granularity.** Privacy-filter advertises IBAN, credit
-  card, and SSN as one `IDENTIFIER` umbrella, but the empirical
-  findings below show the umbrella is leaky — IBAN fires, credit
-  card doesn't. For finer types, lean on the regex detector
-  (or gliner-pii's specific labels).
+  card, and SSN as one `account_number` umbrella, but in practice
+  the umbrella is leaky — IBAN fires, credit card doesn't (see
+  finding 3 in *Empirical findings*). For finer types, lean on
+  the regex detector (or gliner-pii's specific labels).
 
 ### What we observed (engagement_notes.txt run)
 
-The two detectors had **near-orthogonal** coverage on this
-red-team fixture:
+Coverage on this red-team fixture (probed against the post-opf
+service — span offsets and labels from a fresh run):
 
 | Class | privacy-filter | gliner-pii |
 |---|---|---|
-| Full-name persons (`Sarah Chen`, `Mike Hernandez`) | ✓ at 1.000 | ✓ at 0.998–0.999 |
-| Bare-first-name persons (`Mike;`) | ✓ at 0.557 (weak) | ✓ at 0.577 (weak) |
-| Bare FQDNs (`dc01.acmecorp.local`, `siem.acmecorp.local`) | ✓ as `URL` (~0.95) | ✗ (`url` needs a scheme) |
-| AWS access key + secret block (`.env`-style `KEY = VALUE`) | ✓ as `CREDENTIAL` at 0.968 — span `[991:1079]` covers both `AKIA…` and the `AWS_SECRET_ACCESS_KEY = …` line cleanly; the next-paragraph heading `Spotted` splits out as its own (model-misclassified) `CREDENTIAL` at `[1081:1088]`, droppable by length filter | ✗ |
-| JWT bearer token | ✓ as `CREDENTIAL` at 1.000 — span `[2079:2145]` is the JWT alone; the trailing `SHA-256` heading splits out as its own `CREDENTIAL` at `[2147:2154]`, similarly droppable | ✗ |
-| GitHub PAT (`ghp_…` in parenthetical prose) | ✗ | ✓ as `api_key` at 1.000 |
-| MAC address (`04:7c:16:a2:f3:9b`) | ✗ (no label) | ✓ as `mac_address` at 1.000 |
-| IPv4 addresses | ✗ (no label) | partial — 2 of 5 unique IPs (`10.0.7.18`, `10.0.7.42` at 0.8–0.99); missed `10.0.5.10`, `10.0.7.55`, `10.0.12.4` |
+| Full-name persons (`Sarah Chen`, `Mike Hernandez`) | ✓ as `private_person` | ✓ at 0.998–0.999 |
+| Bare-first-name `Mike;` | ✓ as `private_person` | ✓ at 0.577 (weak) |
+| Bare FQDN `dc01.acmecorp.local` | ✓ but as `secret` — model misclassification of an FQDN that happens to look credential-shaped | ✗ (`url` needs a scheme) |
+| Bare FQDN `siem.acmecorp.local` | ✓ as `private_url` | ✗ (`url` needs a scheme) |
+| AWS access key + secret block (`.env`-style `KEY = VALUE`) | ✓ as `secret` — clean span `[992:1079]` covers `AKIA…` through the end of the `AWS_SECRET_ACCESS_KEY = …` line. Post-opf decoder no longer swallows the next-paragraph heading. | ✗ |
+| GitHub PAT (`ghp_…` in parenthetical prose) | ✓ as `secret` `[1113:1153]` | ✓ as `api_key` at 1.000 |
+| JWT bearer token | ✓ as `secret` `[2080:2145]` — JWT alone, no trailing heading bleed | ✗ |
+| SHA-256 binary-hash hex string | ✓ as `secret` `[2185:2249]` — separate clean span | ✗ |
+| Plaintext password `Sp4rkl3-Pony!@` (in `postgres://user:pw@host`) | ✓ as `secret` | ✗ (`password` label not configured) |
+| Plaintext password `jenkinsCI123` (in parenthetical prose) | ✓ as `secret` | ✗ (`password` label not configured) |
+| NTDS dump line (`bob.smith:1107:aad…:88…:::`) | ✓ as one tight `secret` span `[1606:1689]` | ✗ |
+| Service account `svc_jenkins` | ✓ but as `private_person` — model treats `svc_*` like a personal handle (false-positive label) | ✗ |
+| MAC address (`04:7c:16:a2:f3:9b`) | ✗ (no MAC label) | ✓ as `mac_address` at 1.000 |
+| IPv4 addresses | partial — 1 of 6 mentions (`10.0.5.10` parenthetical) labelled as `private_url`; the five `nmap` table IPs all missed | partial — 2 of 5 unique IPs (`10.0.7.18`, `10.0.7.42` at 0.8–0.99); missed `10.0.7.55`, `10.0.12.4` |
 | Org names | ✗ (no label) | partial — `Globex Industries` at 0.998; **`AcmeCorp` missed** despite many mentions |
-| License plate (`7XKR492, CA`) | ✓ as `IDENTIFIER` at 0.489 (weak) | ✓ as `license_plate` at 0.972 |
-| NTLM hashes (NTDS dump line) | partial as `IDENTIFIER` at 0.361 | ✗ |
-| Plaintext passwords (`Summer2024!`, `jenkinsCI123`) in dumps/configs | ✗ | ✗ (with `password` in the label list and `--threshold 0.05` retried — not a threshold issue) |
+| License plate `7XKR492` (in flowing prose) | ✗ | ✓ as `license_plate` at 0.972 |
+| License plate `4FFL339` (rental, parenthetical) | ✓ as `account_number` `[1491:1498]` — but the canonical-name path maps `account_number` → `IDENTIFIER`, semantically wrong here | ✓ as `license_plate` |
+| Plaintext password `Summer2024!` (NT hash crack quote) | ✗ | ✗ |
+| Plaintext password `staging-DB-2024` | ✗ | ✗ |
 
 **Three takeaways:**
 
-1. **They don't substitute for each other.** Privacy-filter's
-   `CREDENTIAL` catches the multi-line AWS key block and the JWT
-   that gliner-pii misses; gliner-pii's `mac_address`, `ipv4`,
-   `company_name`, and `api_key` cover entities privacy-filter
-   has no label for. On a pentest-style transcript, run **both**
-   and compose — neither alone hits the majority of entities.
+1. **opf shifted the privacy-filter / gliner-pii balance toward
+   privacy-filter for credential-shaped secrets.** Pre-migration
+   privacy-filter missed the GitHub PAT, the postgres password,
+   and `jenkinsCI123`; opf catches all three as `secret`. The
+   AWS key block and JWT — already privacy-filter strengths —
+   are now cleaner (no trailing-heading bleed). The detectors
+   are still complementary, but the gap shrank: gliner-pii is
+   still the only path for `mac_address`, `company_name`, and
+   most `ipv4`s, plus the `7XKR492` plate; privacy-filter now
+   carries most credential / plaintext-password work.
 
-2. **The `\n\n` over-merge previously surfaced here too — now
-   fixed.** Pre-fix, the AWS-key `CREDENTIAL` span at `[991:1088]`
-   swallowed the next line *and* a `Spotted` heading; the JWT span
-   at `[2079:2154]` trailed into the `SHA-256` heading on the
-   following line. Post-fix, the AWS span is `[991:1079]` (88 chars,
-   credential bytes only) plus a separate `Spotted` `CREDENTIAL`
-   at `[1081:1088]`; the JWT is `[2079:2145]` (66 chars, JWT only)
-   plus a separate `SHA-256` `CREDENTIAL` at `[2147:2154]`. The
-   `CREDENTIAL` count rose from 2 → 4 because each over-merged
-   span split in two, but the *useful* matches (AWS block, JWT)
-   are now clean rather than corrupted. The misclassified halves
-   (`Spotted`, `SHA-256`) are length-droppable in production
-   post-filtering. See "Span-merge no longer over-extends across
-   `\n\n`" in the `sample.txt` findings below for the full
-   mechanism.
+2. **Two model misclassifications worth knowing about.**
+   `dc01.acmecorp.local` → `secret` (treats the FQDN as a
+   credential because it sits next to `AWS_SECRET_ACCESS_KEY` in
+   a `.env`-style block); `svc_jenkins` → `private_person` (the
+   `svc_` prefix isn't enough context for the model to disambiguate
+   service account from human handle). Neither is a decoder
+   issue — they're training-data artefacts. The regex layer with
+   shape anchors is the disambiguator if these occur in your
+   corpus.
 
-3. **Plaintext passwords and NTLM hashes are a regex job.** Both
-   detectors miss or weakly hit shape-stable secrets embedded in
-   structured contexts (NTDS dumps, `KEY = VALUE` blocks,
-   `postgres://user:pw@host` strings). The regex detector with
-   credential patterns is the right layer for those — see
+3. **NT hash plaintext (`Summer2024!`, etc.) is still a regex
+   job.** opf catches the *NTLM hash dump* (`bob.smith:1107:…:::`)
+   tightly but not the plaintext password quoted from the crack
+   step. Same goes for credential-like strings inside structured
+   layouts the model wasn't shown at training. Layer the regex
+   detector with credential patterns — see
    `docs/detectors/regex.md` and the bundled
    `regex_pentest.yaml`.
 
@@ -217,10 +224,11 @@ breaks (fixed).** Pre-fix, three over-merged spans on
 | `[803:827]` `DATE_OF_BIRTH` | `2026-04-17.\n\nResolution:` | "Resolution:" heading glued onto the date |
 | `[300:367]` `ADDRESS` | `742\nEvergreen Terrace, Springfield, IL 62701, United States.\n\nIssue` | "Issue" header from the next paragraph silently absorbed into the address |
 
-Two layers of defense, both in `services/privacy_filter/main.py`
-and `src/anonymizer_guardrail/detector/privacy_filter.py` (kept in
-lockstep — the in-process and remote detectors must produce
-identical output):
+Two layers of defense, both in
+`src/anonymizer_guardrail/detector/remote_privacy_filter.py`
+(post-processing now lives client-side; the service emits raw
+opf `DetectedSpan` records and the guardrail's `_to_matches`
+canonicalises labels and applies the merge / split passes):
 
 - **Merge side** (`_DEFAULT_GAP_PATTERN`): refuses to combine two
   adjacent same-type spans when the gap between them contains a
@@ -317,9 +325,9 @@ that the table-by-table comparisons above are no longer
 representative — this section captures the new picture.
 
 **1. Layout sensitivity is largely gone for emails.** All three
-shapes now fire at full confidence:
+shapes now fire as `private_email`:
 
-| Input shape | `EMAIL_ADDRESS` result |
+| Input shape | `private_email` result |
 |---|---|
 | `Contact Jane Doe at jane.doe@example.com …` (clean prose) | hit |
 | `…reachable at\njane.doe@example.com …` (line break) | hit |
@@ -327,8 +335,8 @@ shapes now fire at full confidence:
 
 This was the headline pre-migration regression for
 privacy-filter; opf's Viterbi decodes the `Bob Roberts`
-person-span and the email span as separate entities rather than
-one PERSON glued together.
+`private_person` span and the email span as separate entities
+rather than one person-span glued together.
 
 **2. `\n\n` over-merges no longer occur.** The three over-merged
 spans on `sample.txt` (`[164:191]` `2026-04-17 09:42\n\nCustomer:`,
@@ -340,40 +348,41 @@ pass is kept as defense in depth.
 **3. Span boundaries are tighter.** opf doesn't absorb trailing
 `,`/`.`/`)` into spans:
 
-| Pre-migration | Post-migration |
+| Pre-migration (canonical) | Post-migration (raw opf) |
 |---|---|
-| `1987-03-22),` (DATE) | `1987-03-22` |
-| `+1 415-555-0181.` (PHONE) | `+1 415-555-0181` |
-| `+1 212-555-0107),` (PHONE) | `+1 212-555-0107` |
-| `https://...8e5a2f1c.` (URL) | `https://...8e5a2f1c` |
-| `Marcus Chen,` (PERSON) | `Marcus Chen` |
-| `88421.` (IDENTIFIER) | `88421` |
+| `1987-03-22),` (DATE_OF_BIRTH) | `1987-03-22` (`private_date`) |
+| `+1 415-555-0181.` (PHONE) | `+1 415-555-0181` (`private_phone`) |
+| `+1 212-555-0107),` (PHONE) | `+1 212-555-0107` (`private_phone`) |
+| `https://...8e5a2f1c.` (URL) | `https://...8e5a2f1c` (`private_url`) |
+| `Marcus Chen,` (PERSON) | `Marcus Chen` (`private_person`) |
+| `88421.` (IDENTIFIER) | `88421` (`account_number`) |
 
 The `SSN 123-45-6789` prefix-absorption case is unchanged —
 that's the model labeling the prefix word as part of the entity,
 not a decoder boundary issue.
 
 **4. Recall improvements on `sample.txt`.** opf catches entities
-the HF integration missed:
+the HF integration missed (pre-migration column = canonical names
+from the old wire format; post-migration = raw opf labels):
 
-| Entity | Pre-migration | Post-migration |
+| Entity | Pre-migration (canonical) | Post-migration (raw opf) |
 |---|---|---|
-| `jane.doe@example.com` | missed | `EMAIL_ADDRESS` |
+| `jane.doe@example.com` | missed | `private_email` |
 | `SVC-2026-04-117` (ticket id) | missed | `account_number` |
 
 **5. Recall improvements on `engagement_notes.txt` are bigger.**
 opf labels things HF privacy-filter missed entirely; previously
 these had to be picked up by gliner-pii or the regex layer:
 
-| Entity | Pre-migration | Post-migration |
+| Entity | Pre-migration (canonical) | Post-migration (raw opf) |
 |---|---|---|
 | `ghp_a1b2c3d4…` (GitHub PAT) | missed | `secret` |
 | `Sp4rkl3-Pony!@` (postgres password) | missed | `secret` |
 | `jenkinsCI123` (plaintext password) | missed | `secret` |
 | `3a7bd3e2…` (SHA-256 binary hash) | missed | `secret` |
-| `siem.acmecorp.local` | `CREDENTIAL` (wrong) | `private_url` |
+| `siem.acmecorp.local` | `CREDENTIAL` (wrong type) | `private_url` |
 | NTDS dump `bob.smith:1107:…` | partial `IDENTIFIER` 0.361 | one tight `secret` span |
-| `10.0.5.10` (IP) | missed | `private_url` |
+| `10.0.5.10` (IP) | missed | partial — 1 of 6 mentions caught as `private_url`; the five `nmap`-table IPs still missed |
 
 **6. New label-set surprises.** opf is willing to label more
 strings as `secret` than HF was, including some that aren't
