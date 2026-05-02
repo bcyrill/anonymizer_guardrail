@@ -50,6 +50,29 @@ def test_parse_overrides_accepts_known_keys() -> None:
     assert o.denylist == "marketing"
 
 
+def test_overrides_json_roundtrip_preserves_tuple_fields() -> None:
+    """Pydantic serialises tuples as JSON arrays. Round-tripping
+    `Overrides → JSON → dict → parse_overrides → Overrides` must
+    return the tuple-shaped fields back as tuples (not lists), so the
+    `frozen=True` dataclass-style equality and the tuple-typed fields
+    stay valid. Drift here would surface as "Overrides aren't equal
+    after a serialisation round-trip" — easy to miss because the JSON
+    looks identical."""
+    original = parse_overrides({
+        "faker_locale": ["pt_BR", "en_US"],
+        "detector_mode": ["regex", "llm"],
+        "gliner_labels": ["ssn", "iban"],
+    })
+    body = original.model_dump_json()
+    import json
+    restored = parse_overrides(json.loads(body))
+    assert restored == original
+    # Field-level type assertions: tuples not lists.
+    assert isinstance(restored.faker_locale, tuple)
+    assert isinstance(restored.detector_mode, tuple)
+    assert isinstance(restored.gliner_labels, tuple)
+
+
 def test_parse_overrides_named_alternatives_strip_whitespace() -> None:
     """`regex_patterns`, `llm_prompt`, and `denylist` accept names — the
     parser strips surrounding whitespace, mirroring how detector_mode

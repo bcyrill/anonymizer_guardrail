@@ -71,7 +71,22 @@ class Vault:
                 )
 
     def pop(self, call_id: str) -> dict[str, str]:
-        """Retrieve and remove the mapping for a call. Returns {} if absent/expired."""
+        """Retrieve and remove the mapping for a call. Returns {} if absent/expired.
+
+        Expiry is logged at ERROR (not WARNING) because it means the
+        post_call arrived AFTER the vault TTL fired, so the
+        deanonymisation that the operator presumably wanted has
+        silently failed: the response shipped with `[PERSON_…]`
+        surrogates still in it. That's data-loss-ish — the original
+        request's mapping is gone for good. WARNING reads as benign;
+        ERROR puts it on the same severity as other detector
+        unavailability so an operator monitoring `error` lines sees
+        it.
+
+        Absent / no call_id returns silently — that's the no-op
+        path (`input_type=request` without a matching `response`,
+        or a request that intentionally bypasses the vault).
+        """
         if not call_id:
             return {}
         with self._lock:
@@ -80,7 +95,12 @@ class Vault:
             return {}
         ts, mapping = entry
         if time.monotonic() - ts > self._ttl_s:
-            log.warning("Vault entry for call_id=%s expired before post_call", call_id)
+            log.error(
+                "Vault entry for call_id=%s expired before post_call — "
+                "deanonymise dropped, surrogates still in response. "
+                "Raise VAULT_TTL_S if requests legitimately take this long.",
+                call_id,
+            )
             return {}
         return mapping
 
@@ -90,8 +110,16 @@ class Vault:
 
     def _evict_expired_locked(self) -> None:
         """Remove expired entries from the start of the store.
-        
+
         Assumes entries are inserted chronologically (enforced in put()).
+        The chronological invariant is *non-decreasing*, not strictly
+        increasing — POSIX `monotonic()` is only required to be
+        non-decreasing, so two `put()` calls in the same monotonic
+        tick get equal timestamps. The break-on-first-non-expired
+        below is still correct under that invariant: if entry N+1
+        isn't expired and shares timestamp ts with entry N, neither
+        is expired and stopping is right.
+
         Caller must hold self._lock.
         """
         now = time.monotonic()

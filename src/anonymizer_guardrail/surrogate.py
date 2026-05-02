@@ -45,10 +45,10 @@ from babel.core import UnknownLocaleError
 from babel.dates import format_date
 from faker import Faker
 
-log = logging.getLogger("anonymizer.surrogate")
-
 from .config import config
 from .detector.base import Match
+
+log = logging.getLogger("anonymizer.surrogate")
 
 
 def _format_dob(faker: Faker, dob: date) -> str:

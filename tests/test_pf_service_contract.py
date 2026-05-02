@@ -42,7 +42,10 @@ import pytest
 from pydantic import BaseModel
 
 from anonymizer_guardrail.detector.base import Match
-from anonymizer_guardrail.detector.remote_privacy_filter import _parse_matches
+from anonymizer_guardrail.detector.remote_privacy_filter import (
+    _LABEL_MAP,
+    _parse_matches,
+)
 
 
 # ── Canonical wire schema (what BOTH services must emit) ────────────────────
@@ -58,6 +61,50 @@ class _CanonicalDetectedSpan(BaseModel):
 
 class _CanonicalDetectResponse(BaseModel):
     spans: list[_CanonicalDetectedSpan]
+
+
+# ── Label vocabulary contract ──────────────────────────────────────────────
+# The complete set of raw opf labels the model emits (per its model
+# card on HuggingFace). If opf adds a new label, this set lifts to
+# include it AND `_LABEL_MAP` should grow a corresponding canonical
+# mapping; the test below catches the drift either way.
+_OPF_RAW_LABELS = frozenset({
+    "private_person",
+    "private_email",
+    "private_phone",
+    "private_url",
+    "private_address",
+    "private_date",
+    "account_number",
+    "secret",
+})
+
+
+def test_label_map_covers_every_opf_label() -> None:
+    """`_LABEL_MAP` must have a canonical entity-type mapping for
+    every raw opf label. Missing labels would silently fall through
+    to OTHER, dropping the surrogate generator's ability to produce
+    a type-matched substitute. Bumping opf's pinned commit and
+    forgetting to update `_LABEL_MAP` is exactly the drift this
+    catches at unit-test speed (vs surfacing as wrong-typed
+    surrogates in production)."""
+    missing = _OPF_RAW_LABELS - set(_LABEL_MAP)
+    assert not missing, (
+        f"`_LABEL_MAP` in remote_privacy_filter.py is missing canonical "
+        f"mappings for {sorted(missing)}. Add entries for each, or "
+        f"explicitly drop them from `_OPF_RAW_LABELS` in this test if "
+        f"the model card stops emitting them."
+    )
+    # The reverse direction — extra entries in `_LABEL_MAP` for
+    # labels the model never emits — is harmless (dead code) but
+    # worth flagging so a future cleanup can spot them.
+    extra = set(_LABEL_MAP) - _OPF_RAW_LABELS
+    assert not extra, (
+        f"`_LABEL_MAP` has entries for labels not in the documented "
+        f"opf vocabulary: {sorted(extra)}. Either add them to "
+        f"`_OPF_RAW_LABELS` (if the model card now emits them) or "
+        f"drop the dead entries from `_LABEL_MAP`."
+    )
 
 
 # ── Detector-side: parser accepts the canonical shape ──────────────────────

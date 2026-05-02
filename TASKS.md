@@ -394,6 +394,18 @@ below fires.
   who need different tuning ship a different JSON; the env var
   selects the file, not the values.
 
+**Companion task — retire the merge / split / gap-cap layer if
+production traffic confirms it never fires:**
+The guardrail-side `_to_matches` runs paragraph-break split,
+per-label gap caps, and same-type merge as defense in depth. On
+the bundled fixtures under opf's stock decoder these passes don't
+fire (the constrained Viterbi already produces correct boundaries).
+If production telemetry confirms zero firings across N requests
+(say, 10k+ across diverse shapes), the layer can be retired —
+saves a small per-request regex pass and removes one source of
+"why did the span change?" debugging questions. Until that signal
+exists, keep the layer (cost is microseconds).
+
 ---
 
 ## Promote `privacy-filter-hf-service` to default

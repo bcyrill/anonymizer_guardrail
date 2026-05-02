@@ -82,7 +82,22 @@ def _build_detectors() -> list[Detector]:
 
 
 def _dedup(matches: Iterable[Match]) -> list[Match]:
-    """Keep one Match per unique text, preferring the first-seen entity_type."""
+    """Keep one Match per unique text, preferring the first-seen entity_type.
+
+    Keying on text alone (not `(text, type)`) is intentional: the same
+    span getting flagged by two detectors with different types — e.g.
+    regex says EMAIL_ADDRESS, llm says PERSON — is the *normal* case,
+    and we need exactly one surrogate per substring. The detector
+    listed earlier in DETECTOR_MODE wins type-resolution, which is
+    why operators put deterministic detectors (regex, denylist) first
+    so their shape-based classifications beat the LLM/NER layers'
+    interpretive ones. See `docs/detectors/index.md` →
+    "When detectors disagree" for the worked example.
+
+    Don't "fix" this by keying on `(text, entity_type)` — that
+    produces two surrogates for the same substring, and the
+    replacement regex then can't tell which to use.
+    """
     seen: dict[str, Match] = {}
     for m in matches:
         if m.text and m.text not in seen:
