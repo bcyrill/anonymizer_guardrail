@@ -340,9 +340,15 @@ class Pipeline:
         try:
             if spec.has_semaphore:
                 # Gate the call behind the per-spec semaphore. The
-                # in-flight counter increment is the first statement
-                # after acquisition — no statement between acquire
-                # and `try` can raise, so the finally always fires.
+                # in-flight counter increment MUST be the first
+                # statement after acquisition, before the inner `try`
+                # — putting anything between `async with` and
+                # `+= 1` (or worse, between the increment and `try`)
+                # would silently leak counter slots if that statement
+                # raised: the with-block would still release the
+                # semaphore on the way out, but the matching `-= 1`
+                # in the `finally` would never fire. `/health` would
+                # show in_flight stuck above 0 forever.
                 async with self._semaphores[spec.name]:
                     self._inflight_counters[spec.name] += 1
                     try:
