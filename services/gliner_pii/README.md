@@ -142,10 +142,9 @@ python services/gliner_pii/scripts/probe.py \
     --labels email,ssn,person
 ```
 
-`--text-file path.txt` (or `--text-file -` for stdin) accepts longer
-inputs; `--threshold` overrides the confidence cutoff; `--url` points
-at a non-default service host; `--json` emits the raw response for
-piping into `jq` / scripts. See `--help` for the full flag list.
+See [scripts/PROBE.md](scripts/PROBE.md) for runnable examples
+(stdin / file input, threshold tuning, exploring zero-shot labels)
+and `--help` for the full flag list.
 
 ## Configuration
 

@@ -63,9 +63,10 @@ python services/gliner_pii/scripts/probe.py \
     --labels medication,diagnosis
 
 # Side-by-side comparison: do creative labels add coverage on top of
-# the standard PII set, or duplicate it?
+# the standard PII set, or duplicate it? `engagement_notes.txt` is a
+# synthetic red-team transcript shipped alongside the script.
 python services/gliner_pii/scripts/probe.py \
-    --text-file engagement_notes.txt \
+    --text-file services/gliner_pii/scripts/engagement_notes.txt \
     --labels person,organization,internal_hostname,vehicle_registration,api_key
 
 # Lower the threshold to surface marginal matches when probing

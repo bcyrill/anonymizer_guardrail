@@ -1,0 +1,23 @@
+[Synthetic engagement notes for probe.py exploration. All names,
+hostnames, plates, and keys are fabricated.]
+
+2026-Q2 internal red-team engagement, AcmeCorp
+
+Day 1: Scoping call with Sarah Chen (CISO) and Mike Hernandez (SOC
+lead). Initial recon from the office network turned up an exposed
+Jenkins instance at jenkins-build.acmecorp.local; stale credentials
+served from build02.acmecorp.local. Globex Industries (the parent's
+subsidiary) was named as a follow-up target for Q3.
+
+Day 2: Pulled an AWS access key (AKIA4QWERTYUIOPASDFG) from a .env
+committed to the internal Bitbucket. Notified Mike; rotation kicked
+off within thirty minutes. Spotted an internal GitHub PAT
+(ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8) hardcoded in a deploy
+script on dc01.acmecorp.local. Sarah's company car (plate 7XKR492,
+CA) parked next to the rental (4FFL339) in the lot — useful for
+lunch runs to the off-site meeting venue.
+
+Day 3: Lateral movement test. Pivoted from the Jenkins host to the
+staging DB at db-stage-01.acmecorp.local using a stale admin token.
+Final report draft delivered to Sarah Chen by end of day; debrief
+scheduled with the AcmeCorp engineering leadership next Monday.
