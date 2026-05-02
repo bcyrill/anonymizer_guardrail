@@ -260,16 +260,25 @@ SPEC = DetectorSpec(
     factory=MyDetector,                    # () -> Detector
     module=sys.modules[__name__],          # for live CONFIG lookup
     has_semaphore=True,                    # gate detect() behind a semaphore?
-    max_concurrency_field="max_concurrency",
     stats_prefix="my_detector",            # /health key prefix
     unavailable_error=MyDetectorUnavailableError,
-    fail_closed_field="fail_closed",
     blocked_reason=(
         "My detector is unreachable; request blocked to prevent "
         "unredacted data from reaching the upstream model."
     ),
+    has_cache=True,                        # surface result-cache stats on /health?
 )
 ```
+
+`has_semaphore=True` requires `CONFIG.max_concurrency` (an int)
+on your detector module. `unavailable_error=...` requires
+`CONFIG.fail_closed` (a bool). `has_cache=True` requires
+`CONFIG.cache_max_size` (an int) and a `cache_stats()` method on
+the detector instance returning `{size, max, hits, misses}` —
+see `detector/cache.py`'s `DetectorResultCache` Protocol. The
+`__post_init__` on `DetectorSpec` validates these at module
+import; misconfiguration crashes the import that defined the
+bad spec, not the request that first hit it.
 
 Optional `prepare_call_kwargs=fn` if `detect()` takes per-request
 overrides from the `Overrides` dataclass — see
@@ -299,10 +308,13 @@ REGISTERED_SPECS = (
 
 **That's it for the runtime.** `Pipeline.__init__` picks up the new
 spec automatically — its semaphore + counter are allocated, the log
-line includes its fail-mode and cap, `_run` dispatches via
+line includes its fail-mode and cap, `_run_detector` dispatches via
 `SPECS_BY_NAME[det.name]`, and `main.py`'s BLOCKED handler maps the
 typed error via `TYPED_UNAVAILABLE_ERRORS`. `/health` gains
-`<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency` keys.
+`<stats_prefix>_in_flight` / `<stats_prefix>_max_concurrency` keys
+(when `has_semaphore=True`) and
+`<stats_prefix>_cache_size` / `_cache_max` / `_cache_hits` /
+`_cache_misses` (when `has_cache=True`).
 The per-request `detector_mode` length cap in `api.py` is also
 derived from `len(REGISTERED_SPECS)`, so callers can pass the new
 detector in their override list without bumping a constant.

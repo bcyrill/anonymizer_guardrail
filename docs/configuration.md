@@ -39,7 +39,7 @@ docs:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. See [operations → Vault](operations.md#vault). |
+| `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. See [vault](vault.md). |
 | `VAULT_MAX_ENTRIES` | `10000` | Hard cap on vault entries; LRU-evicted on overflow as a backstop against a flood of unique `call_id`s before TTL clears them. Raise for sustained high in-flight traffic; floor of 1 protects against typos. |
 
 ## Capping detector concurrency

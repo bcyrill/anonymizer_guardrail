@@ -17,8 +17,12 @@ For deeper background:
 ## Observability
 
 `/health` returns live counters for both stores plus per-detector
-concurrency gauges so operators can monitor pressure or leak without
-inspecting the process:
+concurrency and cache gauges so operators can monitor pressure or
+leak without inspecting the process. Keys are static across
+detector modes — `pf_*`, `gliner_pii_*`, and `llm_*` are always
+present, regardless of which detectors are active under
+`DETECTOR_MODE`. That lets dashboards pin to stable names without
+needing a per-deployment template:
 
 ```json
 {
@@ -27,10 +31,24 @@ inspecting the process:
   "vault_size": 3,
   "surrogate_cache_size": 1421,
   "surrogate_cache_max": 100000,
+  "pf_in_flight": 0,
+  "pf_max_concurrency": 10,
+  "gliner_pii_in_flight": 0,
+  "gliner_pii_max_concurrency": 10,
   "llm_in_flight": 0,
   "llm_max_concurrency": 10,
-  "pf_in_flight": 0,
-  "pf_max_concurrency": 10
+  "pf_cache_size": 0,
+  "pf_cache_max": 0,
+  "pf_cache_hits": 0,
+  "pf_cache_misses": 0,
+  "gliner_pii_cache_size": 0,
+  "gliner_pii_cache_max": 0,
+  "gliner_pii_cache_hits": 0,
+  "gliner_pii_cache_misses": 0,
+  "llm_cache_size": 0,
+  "llm_cache_max": 0,
+  "llm_cache_hits": 0,
+  "llm_cache_misses": 0
 }
 ```
 
@@ -57,9 +75,10 @@ How to read each counter:
 - **`<prefix>_cache_size`** / **`<prefix>_cache_max`** /
   **`<prefix>_cache_hits`** / **`<prefix>_cache_misses`** — per-detector
   result-cache counters, emitted for every detector that opted into
-  caching (currently only `llm_*`). All four keys are present even when
-  caching is disabled (`*_cache_max=0`), so dashboards can pin to stable
-  names. See [Detector result caching](#detector-result-caching) below.
+  caching (today: `llm_*`, `pf_*`, `gliner_pii_*`). All four keys are
+  present even when caching is disabled (`*_cache_max=0`), so dashboards
+  can pin to stable names. See
+  [Detector result caching](#detector-result-caching) below.
 
 When extra detectors with semaphores are configured (e.g. `gliner_pii`),
 their `<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency`

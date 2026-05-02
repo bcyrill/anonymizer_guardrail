@@ -50,14 +50,34 @@ curl -s http://localhost:8000/health | python -m json.tool
   "vault_size": 0,
   "surrogate_cache_size": 0,
   "surrogate_cache_max": 100000,
+  "pf_in_flight": 0,
+  "pf_max_concurrency": 10,
+  "gliner_pii_in_flight": 0,
+  "gliner_pii_max_concurrency": 10,
   "llm_in_flight": 0,
-  "llm_max_concurrency": 10
+  "llm_max_concurrency": 10,
+  "pf_cache_size": 0,
+  "pf_cache_max": 0,
+  "pf_cache_hits": 0,
+  "pf_cache_misses": 0,
+  "gliner_pii_cache_size": 0,
+  "gliner_pii_cache_max": 0,
+  "gliner_pii_cache_hits": 0,
+  "gliner_pii_cache_misses": 0,
+  "llm_cache_size": 0,
+  "llm_cache_max": 0,
+  "llm_cache_hits": 0,
+  "llm_cache_misses": 0
 }
 ```
 
-The cache + concurrency caps come from `SURROGATE_CACHE_MAX_SIZE`
-and `LLM_MAX_CONCURRENCY` — useful for an ops dashboard that wants
-to alert on saturation (`llm_in_flight` approaching
+Concurrency and cache keys are emitted for every slow detector
+(`pf_*`, `gliner_pii_*`, `llm_*`) regardless of which mode is
+active under `DETECTOR_MODE`, so dashboards can pin to stable
+names. Caps come from each detector's own env vars
+(`PRIVACY_FILTER_MAX_CONCURRENCY`, `LLM_MAX_CONCURRENCY`,
+`*_CACHE_MAX_SIZE`, etc.) — useful for an ops dashboard that wants
+to alert on saturation (e.g. `llm_in_flight` approaching
 `llm_max_concurrency`) without having to know the configured cap
 separately.
 

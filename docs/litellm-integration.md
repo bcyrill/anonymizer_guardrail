@@ -7,7 +7,7 @@ LiteLLM calls it before forwarding a request upstream
 after the upstream model responds (`input_type="response"`) to
 deanonymize them. A short-lived in-memory mapping keyed by
 `litellm_call_id` connects the two sides of the round-trip — see
-[operations → Vault](operations.md#vault) for the lifecycle.
+[vault](vault.md) for the lifecycle.
 
 A working `config.yaml` snippet (see `litellm.config.example.yaml` for the
 full file):
