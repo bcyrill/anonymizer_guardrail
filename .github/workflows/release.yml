@@ -68,7 +68,7 @@ jobs:
 
             Baked-model variants (`pf-baked`, `pf-service-baked`) are
             not published from CI — they're multi-GB. Build locally with
-            `scripts/build-image.sh -t pf-baked` (or `-t pf-service-baked`)
+            `scripts/image_builder.sh -f pf-baked` (or `-t pf-service-baked`)
             if you need them.
 
             See the [Packages page](${{ github.server_url }}/${{ github.repository_owner }}?tab=packages&repo_name=${{ github.event.repository.name }}) for all available tags and digests.

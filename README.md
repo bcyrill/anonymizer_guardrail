@@ -14,7 +14,7 @@ sides of the round-trip.
 
 ```bash
 # Build all images (slim guardrail + privacy-filter-service + fake-llm).
-scripts/build-image.sh -t all
+scripts/image_builder.sh --preset all
 
 # Interactive launcher.
 scripts/launcher.sh --ui

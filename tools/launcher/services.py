@@ -126,7 +126,7 @@ def start_service(
         # which build command to invoke.
         _console.print(
             f"[red]No {service.container_name} image found locally. "
-            f"Build it with `scripts/build-image.sh -t <flavour>` "
+            f"Build it with `scripts/image_builder.sh -f <flavour>` "
             f"(see {' / '.join(service.image_tag_envs)} for tag candidates).[/red]",
         )
 

@@ -14,7 +14,7 @@ CI publishes CPU + CUDA 13.0 runtime-download variants of the
 gliner-pii-service to GHCR (`gliner-pii-service:vX.Y.Z-cpu` /
 `-cu130`); see [deployment → GLiNER-PII service](../deployment.md#gliner-pii-service-gliner-pii-service)
 for the full flavour matrix. Baked variants are local-build only —
-build via `scripts/build-image.sh -t gliner-service-baked`.
+build via `scripts/image_builder.sh -f gliner-service-baked`.
 
 **Remote only.** No in-process variant ships. The model is heavy
 (~570 MB weights + the `gliner` library + torch) and the production

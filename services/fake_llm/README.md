@@ -21,7 +21,7 @@ podman build -t fake-llm:latest \
     -f services/fake_llm/Containerfile services/fake_llm/
 
 # Or via the build script:
-scripts/build-image.sh -t fake-llm
+scripts/image_builder.sh -f fake-llm
 
 # With the bundled example rules:
 podman run --rm -p 4000:4000 --name fake-llm fake-llm:latest

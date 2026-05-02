@@ -96,7 +96,7 @@ podman build -t gliner-pii-service:baked-cu130 \
     -f Containerfile .
 ```
 
-Or use `scripts/build-image.sh` from the repo root: types
+Or use `scripts/image_builder.sh` from the repo root: types
 `gliner-service`, `gliner-service-baked`, `gliner-service-cu130`,
 `gliner-service-baked-cu130`.
 

@@ -26,7 +26,7 @@ name: Publish privacy-filter-service image
 #
 # pf-service-baked is deliberately NOT published from CI — the image is
 # multi-GB and stores indefinitely on GHCR. Anyone who needs it can
-# build locally with `scripts/build-image.sh -t pf-service-baked`. Same
+# build locally with `scripts/image_builder.sh -f pf-service-baked`. Same
 # rationale that excludes the guardrail's pf-baked from CI.
 #
 # This workflow is a sibling of publish-image.yml — both fire on `v*.*.*`
@@ -86,7 +86,7 @@ jobs:
         run: |
           echo "::error::Tag '${{ github.ref_name }}' refers to the baked pf-service flavour."
           echo "::error::Baked images are not published from CI — they're multi-GB."
-          echo "::error::Build locally with: scripts/build-image.sh -t pf-service-baked"
+          echo "::error::Build locally with: scripts/image_builder.sh -f pf-service-baked"
           exit 1
 
       - name: Lowercase owner for image name

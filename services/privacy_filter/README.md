@@ -64,7 +64,7 @@ podman build -t privacy-filter-service:baked \
     -f Containerfile .
 ```
 
-Or use `scripts/build-image.sh` from the repo root: types `pf-service`
+Or use `scripts/image_builder.sh` from the repo root: types `pf-service`
 and `pf-service-baked`. See
 [docs/deployment.md → Container images](../../docs/deployment.md#container-images)
 for the size/runtime trade-off across all flavours.

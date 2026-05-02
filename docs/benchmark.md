@@ -153,7 +153,7 @@ detector wired in, then run `--compare` on the bundled pentest corpus.
 ```bash
 # 1. Build every image needed for this run. Comma-separated -t builds
 #    them all in one shot (added in this sprint).
-./scripts/build-image.sh -t slim,pf-service,gliner-service,fake-llm
+./scripts/image_builder.sh --preset minimal-fakellm
 
 # 2. Start the guardrail with everything switched on. Worth knowing
 #    which flag does what:

@@ -68,7 +68,7 @@ tools/launcher/                  # dev-only, NOT in the wheel
 scripts/                         # bash wrappers, ~5 lines each
   launcher.sh                    # exec python -m tools.launcher
                                  #   (CLI by default, --ui opens TUI)
-  build-image.sh                 # podman/docker build wrapper
+  image_builder.sh                 # podman/docker build wrapper
   release.sh                     # git tag + push for CI
 
 services/                        # auxiliary inference containers
@@ -343,13 +343,22 @@ Five additional touches:
   `services/privacy_filter/Containerfile` for shape.
 - `README.md` — service-specific docs.
 
-**b. `scripts/build-image.sh`** — add the new flavour:
+**b. `tools/image_builder/specs.py`** — add the new flavour:
 
-- `TAG_MY_SERVICE` env-var default near the top.
-- New entry in the interactive menu.
-- New case in `resolve_flavour()`.
-- Add to `BUILD_LIST` for `--type all` if appropriate.
-- Post-build run hint.
+- New `Flavour(...)` entry in `_build_catalog()`. Set `containerfile`,
+  `context`, any `build_args` (e.g. CUDA index, baked-model toggle),
+  the default tag (with a matching `TAG_MY_SERVICE` env override via
+  `_resolve_default_tag`), and `bakes_model=True` if the build pulls
+  weights from HuggingFace at build time.
+- If you want it grouped under a new menu section, add a
+  `GROUP_MY_GROUP = "my-group"` constant and an entry in
+  `_GROUP_ORDER` in `tools/image_builder/menu.py`. Otherwise reuse
+  one of the existing groups.
+- Add it to relevant entries in the `PRESETS` dict (`all` is computed
+  automatically; per-service presets are explicit).
+
+The CLI's `--flavour` validation, the menu's checkbox grid, and
+`--list` all read `FLAVOURS` directly, so nothing else needs touching.
 
 **c. `tools/launcher/spec_extras.py`** — add a `LauncherSpec(...)`
 entry to `LAUNCHER_METADATA`:
@@ -425,7 +434,7 @@ build, run).
 |---|---|
 | **In-process detector only** | 2 — new detector module + `detector/__init__.py` |
 | **+ tests** | +1 to +2 — `tests/test_my_detector.py`, optional `tests/test_pipeline.py` |
-| **+ service container** | +5 — `services/my_service/{main.py,Containerfile,README.md}`, `scripts/build-image.sh`, `tools/launcher/spec_extras.py` |
+| **+ service container** | +5 — `services/my_service/{main.py,Containerfile,README.md}`, `scripts/image_builder.sh`, `tools/launcher/spec_extras.py` |
 | **+ launcher CLI** | +1 — `tools/launcher/main.py` |
 | **+ launcher menu** | +1 — `tools/launcher/menu.py` |
 | **+ docs** | +1 to +2 — `docs/detectors/<name>.md`, optional row in `docs/configuration.md` |

@@ -33,7 +33,7 @@ _console = Console(stderr=True)
 
 # ── Per-flavour image map ─────────────────────────────────────────────────
 # Mirrors the bash _lib.sh `resolve_flavour` switch. Tag overrides come
-# from env vars (TAG_SLIM / TAG_PF / TAG_PF_BAKED) so build-image.sh and
+# from env vars (TAG_SLIM / TAG_PF / TAG_PF_BAKED) so image_builder.sh and
 # the launcher agree on naming.
 _FLAVOUR_TAG_DEFAULTS = {
     "slim":     "anonymizer-guardrail:latest",
@@ -294,7 +294,7 @@ def run_guardrail(engine: Engine, cfg: LaunchConfig) -> int:
     if not engine.image_exists(image):
         _console.print(
             f"[red]Image \"{image}\" not found locally.[/red]\n"
-            f"Build it with:  scripts/build-image.sh -t {cfg.flavour}",
+            f"Build it with:  scripts/image_builder.sh -f {cfg.flavour}",
         )
         return 1
 

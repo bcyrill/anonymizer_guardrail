@@ -25,7 +25,7 @@ name: Publish gliner-pii-service image
 #
 # gliner-service-baked is deliberately NOT published from CI — the image
 # is multi-GB and stores indefinitely on GHCR. Anyone who needs it can
-# build locally with `scripts/build-image.sh -t gliner-service-baked`.
+# build locally with `scripts/image_builder.sh -f gliner-service-baked`.
 # Same rationale as pf-service-baked.
 
 on:
@@ -84,7 +84,7 @@ jobs:
         run: |
           echo "::error::Tag '${{ github.ref_name }}' refers to the baked gliner-service flavour."
           echo "::error::Baked images are not published from CI — they're multi-GB."
-          echo "::error::Build locally with: scripts/build-image.sh -t gliner-service-baked"
+          echo "::error::Build locally with: scripts/image_builder.sh -f gliner-service-baked"
           exit 1
 
       - name: Lowercase owner for image name

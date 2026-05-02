@@ -8,7 +8,7 @@ name: Publish container image
 # pf-baked is deliberately NOT published from CI — the image is multi-GB
 # and stores indefinitely on GHCR, but most operators never need it.
 # Anyone who does can build it locally with
-# `scripts/build-image.sh -t pf-baked`. Same rationale for the
+# `scripts/image_builder.sh -f pf-baked`. Same rationale for the
 # privacy-filter-service baked variant in publish-pf-service-image.yml.
 #
 # vX.Y.Z+pf-service tags are handled by publish-pf-service-image.yml,
@@ -19,7 +19,7 @@ name: Publish container image
 # matching workflow.
 #
 # Branch pushes do NOT trigger image builds — most testing happens
-# locally via scripts/build-image.sh and scripts/run_container.sh, and
+# locally via scripts/image_builder.sh and scripts/run_container.sh, and
 # building a fresh image on every commit was producing too much registry
 # churn. Use workflow_dispatch if you need an ad-hoc build off a branch.
 #
@@ -81,7 +81,7 @@ jobs:
               *+pf-baked|*+pf-service-baked)
                 echo "::error::Tag suffix '${{ github.ref_name }}' refers to a baked flavour."
                 echo "::error::Baked images are not published from CI — they're multi-GB."
-                echo "::error::Build locally with: scripts/build-image.sh -t pf-baked (or pf-service-baked)."
+                echo "::error::Build locally with: scripts/image_builder.sh -f pf-baked (or -f pf-service-baked)."
                 exit 1
                 ;;
               *+*)

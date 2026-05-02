@@ -62,7 +62,7 @@ Pick this when:
   (single model copy in memory; one place to attach a GPU).
 - Model updates need to ship without rebuilding the guardrail image.
 
-Build the service image via `scripts/build-image.sh -t pf-service`
+Build the service image via `scripts/image_builder.sh -f pf-service`
 (runtime download) or `pf-service-baked` (model in image). See
 [`services/privacy_filter/README.md`](../../services/privacy_filter/README.md)
 for the API contract, env vars, and standalone build/run commands.

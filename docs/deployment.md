@@ -13,7 +13,7 @@ inference service when the operator opts into them.
 # plus the auxiliary services (privacy-filter-service in two
 # variants, fake-llm). Pass -t to build a single one (e.g. -t slim,
 # or -t pf-service-cu130 for the CUDA build of the pf service).
-scripts/build-image.sh -t all
+scripts/image_builder.sh --preset all
 
 # Interactive launcher — single-screen menuconfig-style UI, every
 # setting visible at once, drill in to edit, hit Launch.
@@ -65,7 +65,7 @@ The repo builds three artifacts: the **guardrail** itself, the
 standalone **privacy-filter-service** and **gliner-pii-service**
 (paired with the slim guardrail when you don't want torch in the API
 container), and the **fake-llm** test backend.
-`scripts/build-image.sh` knows about every flavour listed below. The
+`scripts/image_builder.sh` knows about every flavour listed below. The
 *published as* column shows the GHCR tag CI ships; flavours marked
 **local only** are buildable but not on the registry — see
 [Why some flavours aren't published](#why-some-flavours-arent-published)
@@ -123,7 +123,7 @@ OpenAI-compatible Chat Completions server backed by a YAML rules file
 (see [`services/fake_llm/README.md`](../services/fake_llm/README.md)).
 Used by the test recipes and `scripts/launcher.sh --llm-backend service`
 to exercise the LLM-detector path deterministically without an
-actual LLM. **Local-build only** — `scripts/build-image.sh -t fake-llm`.
+actual LLM. **Local-build only** — `scripts/image_builder.sh -f fake-llm`.
 Not for production.
 
 ### Why some flavours aren't published
@@ -136,7 +136,7 @@ CI publishes the variants most operators pull. The local-only set is:
   indefinitely on GHCR for what's usually a build-once artifact. A
   runtime-download image with a persistent HF cache volume gets you to
   the same place after one cold start, so the registry mass isn't
-  worth it. Build with `scripts/build-image.sh -t pf-baked` (etc.)
+  worth it. Build with `scripts/image_builder.sh -f pf-baked` (etc.)
   when you actually need them.
 - **`fake-llm`** — a test/dev tool with no place in a production
   registry. Operators who need it for their own CI typically build
@@ -148,7 +148,7 @@ CI publishes the variants most operators pull. The local-only set is:
 
 ## Building manually
 
-`scripts/build-image.sh` is the recommended path; the equivalent raw
+`scripts/image_builder.sh` is the recommended path; the equivalent raw
 commands are:
 
 ```bash
@@ -173,7 +173,7 @@ podman build --format=docker -t anonymizer-guardrail:privacy-filter-baked \
 format, which doesn't include a HEALTHCHECK field — without the flag,
 the `HEALTHCHECK` directive in the Containerfile is silently dropped
 and `podman healthcheck run` won't work. `docker build` always emits
-Docker format, so the flag is podman-specific (and `build-image.sh`
+Docker format, so the flag is podman-specific (and `image_builder.sh`
 adds it conditionally).
 
 ## Running manually

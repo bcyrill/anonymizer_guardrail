@@ -4,7 +4,7 @@
 # Pushing the branch does NOT trigger any GitHub Actions workflow on
 # its own — image builds and GitHub Releases are tag-driven only, so
 # day-to-day commits don't churn the container registry. Local testing
-# via scripts/build-image.sh covers the iteration loop.
+# via scripts/image_builder.sh covers the iteration loop.
 #
 # Pushing a tag triggers the workflows in .github/workflows/:
 #   - publish-image.yml                  (guardrail image → ghcr.io)
@@ -22,8 +22,8 @@
 #
 # Baked variants (`+pf-baked`, `+pf-service-baked`, `+gliner-service-baked`)
 # are NOT published from CI — the images are multi-GB. Build them
-# locally with `scripts/build-image.sh -t pf-baked` (or
-# `-t pf-service-baked` / `-t gliner-service-baked`).
+# locally with `scripts/image_builder.sh -f pf-baked` (or
+# `-f pf-service-baked` / `-f gliner-service-baked`).
 
 set -euo pipefail
 
@@ -165,8 +165,8 @@ ok "Tag ${new_tag} pushed. GitHub Actions will build the slim image and create t
 #   vX.Y.Z+gliner-service → separate ghcr package: gliner-pii-service
 #
 # Baked variants of any axis are intentionally absent — they're
-# local-build only (`scripts/build-image.sh -t pf-baked` /
-# `-t pf-service-baked` / `-t gliner-service-baked`).
+# local-build only (`scripts/image_builder.sh -f pf-baked` /
+# `-f pf-service-baked` / `-f gliner-service-baked`).
 variants=()
 
 say ""
