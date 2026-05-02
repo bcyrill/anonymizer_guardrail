@@ -33,8 +33,8 @@ for the configuration knobs and image flavours.
 
 The wire format is opf's raw `DetectedSpan` shape — `label` is the
 opf label verbatim (`private_person`, `private_email`,
-`private_phone_number`, `private_url`, `private_address`,
-`private_date_of_birth`, `private_identifier`, `private_credential`).
+`private_phone`, `private_url`, `private_address`, `private_date`,
+`account_number`, `secret`).
 Label canonicalisation, paragraph-break split, and per-label
 gap-cap post-processing all run client-side in the guardrail's
 [`RemotePrivacyFilterDetector`](../../src/anonymizer_guardrail/detector/remote_privacy_filter.py).

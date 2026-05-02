@@ -5,11 +5,13 @@ text input and prints the spans it returns, plus a count of spans
 per opf label.
 
 The probe deliberately shows raw opf labels (`private_email`,
-`private_person`, …) rather than the canonicalised names the
-guardrail emits — this is a window onto what the service does, not
-an end-to-end view. Existing tables further down this file still
-use the canonical names (`EMAIL_ADDRESS`, `PERSON`, …); they pre-
-date the wire-format change and are slated for a refresh.
+`private_person`, `private_phone`, `private_url`, `private_address`,
+`private_date`, `account_number`, `secret`) rather than the
+canonicalised names the guardrail emits — this is a window onto
+what the service does, not an end-to-end view. Existing tables
+further down this file still use the canonical names
+(`EMAIL_ADDRESS`, `PERSON`, …); they pre-date the wire-format
+change and are slated for a refresh.
 
 Stdlib-only — runs from any checkout without installing the
 service's Python deps. To start the service first, see the parent
@@ -26,10 +28,10 @@ the practical contrasts when running this one:
 
 - **No `--labels`.** The privacy-filter model has a *fixed*
   vocabulary baked in at training time. Labels you can expect:
-  `private_person`, `private_email`, `private_phone_number`,
-  `private_url`, `private_address`, `private_date_of_birth`,
-  `private_identifier` (catch-all for IBAN / CC / SSN-shaped
-  strings), `private_credential`. To detect custom categories like
+  `private_person`, `private_email`, `private_phone`,
+  `private_url`, `private_address`, `private_date`,
+  `account_number` (catch-all for IBAN / CC / SSN-shaped strings),
+  `secret`. To detect custom categories like
   `vehicle_registration`, use gliner-pii (zero-shot) or a regex.
 - **No `--threshold`.** Different reason than gliner-pii: opf's
   `DetectedSpan` doesn't expose a per-span confidence at all, so

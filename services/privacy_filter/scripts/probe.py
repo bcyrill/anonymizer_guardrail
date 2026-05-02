@@ -9,9 +9,9 @@ DetectedSpan doesn't expose one — see PROBE.md for the migration
 context.)
 
 Labels are emitted **raw** — `private_person`, `private_email`,
-`private_phone_number`, `private_url`, `private_address`,
-`private_date_of_birth`, `private_identifier`, `private_credential`
-— the same shape opf returns. The guardrail-side
+`private_phone`, `private_url`, `private_address`, `private_date`,
+`account_number`, `secret` — the same shape opf returns. The
+guardrail-side
 `RemotePrivacyFilterDetector` is what canonicalises these into
 `PERSON` / `EMAIL_ADDRESS` / etc. Showing raw labels here keeps
 this script a thin window onto what the service does, separate
@@ -136,8 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--timeout",
-        type=float, default=30.0,
-        help="Per-request HTTP timeout in seconds. Default 30.",
+        type=float, default=180.0,
+        help="Per-request HTTP timeout in seconds. Default 180. "
+             "Tuned for CPU inference of multi-KB inputs — opf takes "
+             "~30s per KB on CPU; on GPU drop this to 30 if you like.",
     )
     parser.add_argument(
         "--json",
