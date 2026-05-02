@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """Calibration-comparison utility for the opf Viterbi decoder.
 
-Originally written as the Phase-1 spike that gated the
-`transformers.pipeline` → `opf.OPF` migration (see
-`services/privacy_filter/scripts/PROBE.md` → "After the opf
-migration" for the empirical findings that came out of it).
-The migration's now live; we keep this script as the runnable
-calibration-comparison tool — useful when:
+Runs three calibration profiles side-by-side against the bundled
+fixtures so operators can:
 
-  * An opf upstream update lands and we want to re-verify span
-    boundaries against our fixtures.
-  * A new corpus surfaces a precision/recall gap that calibration
-    tuning might close (the in-process detector reads
-    `PRIVACY_FILTER_CALIBRATION` env, which points at a JSON in
-    the same format the profiles below produce).
-  * Someone wants to understand the bias dial empirically rather
-    than read the README.
+  * Re-verify span boundaries after an opf upstream update.
+  * Tune bias values when a new corpus surfaces a precision/recall
+    gap. The in-process detector reads `PRIVACY_FILTER_CALIBRATION`,
+    which points at a JSON in the same format the profiles below
+    produce.
+  * Understand the bias dial empirically rather than read the README.
 
-Three calibration profiles ship side-by-side:
+Three calibration profiles:
 
   1. `default` — opf with no bias tuning. The production decoder.
   2. `anti-merge` — encourage span termination at neutral context;
-     discourage running across paragraph breaks. The setting we
-     considered shipping but didn't because `default` already wins.
+     discourage running across paragraph breaks.
   3. `privacy-parser` — biases the chiefautism/privacy-parser repo
      uses (pro-merge, glues fragmented person names back together).
-     Included as a contrast: confirms the dial moves behaviour in
+     Included as a contrast — confirms the dial moves behaviour in
      the expected direction.
 
 Prerequisites:

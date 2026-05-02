@@ -4,7 +4,9 @@
 Use this to see how openai/privacy-filter classifies entities in
 your data before wiring it into the guardrail. Hit a running
 service (default http://localhost:8001) and read back the matches
-grouped by entity type, with confidence scores.
+grouped by entity type. (No per-span confidence: the service's
+opf-based decoder doesn't expose one — see PROBE.md for the
+migration context.)
 
 Stdlib-only on purpose — runs from any checkout without installing
 the service's Python deps. To start the service first, see

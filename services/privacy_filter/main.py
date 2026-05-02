@@ -1,13 +1,12 @@
 """
 Privacy-filter inference service.
 
-A tiny FastAPI app that loads the openai/privacy-filter token-classification
-model via the [`opf`](https://github.com/openai/privacy-filter) package
-(OpenAI's own constrained-Viterbi decoder, replacing the old
-`transformers.pipeline` integration) and exposes it over HTTP. Designed
-to be paired with the guardrail's RemotePrivacyFilterDetector so the
-heavy ML deps (torch + opf + ~3 GB of weights) live in a separate,
-independently-scaled container instead of inflating the guardrail image.
+FastAPI wrapper around the openai/privacy-filter token-classification
+model via the [`opf`](https://github.com/openai/privacy-filter)
+package's constrained-Viterbi decoder. Pairs with the guardrail's
+RemotePrivacyFilterDetector so the heavy ML deps (torch + opf + ~3 GB
+of weights) live in their own container instead of inflating the
+guardrail image.
 
 API:
 
@@ -20,43 +19,32 @@ API:
 
   GET  /health      readiness probe; returns ok once the model is loaded.
 
-No `score` field on the wire — opf's DetectedSpan doesn't expose a
-per-span confidence and we removed the hardcoded `1.0` placeholder
-that briefly lived here, since a synthetic constant is worse than
-nothing (operators reading it would assume real signal). For
-confidence-based routing decisions, layer the regex detector on top
-— `AKIA…` / `ghp_…` / etc. matches are deterministic.
-
-The post-processing here (span extract/merge/split) intentionally mirrors
+Span extract/merge/split post-processing mirrors
 `anonymizer_guardrail.detector.privacy_filter.PrivacyFilterDetector._to_matches`
-in-process. Parity is a hard contract — operators must be able to swap
-between the in-process and remote variants with zero observable output
-drift.
+exactly — operators must be able to swap between the in-process and
+remote variants with zero observable output drift.
 
 Configuration:
-  MODEL_NAME                    Sentinel "openai/privacy-filter" (default) →
-                                opf auto-downloads from HuggingFace into
+  MODEL_NAME                    Default "openai/privacy-filter" → opf
+                                auto-downloads from HuggingFace into
                                 ~/.opf/privacy_filter on first request.
-                                Anything else → treated as a filesystem path
-                                to a checkpoint directory.
+                                Anything else → filesystem path to a
+                                checkpoint directory.
   PORT                          listen port (default 8001)
   LOG_LEVEL                     Python logging level (default INFO)
-  PRIVACY_FILTER_DEVICE         "cpu" (default) or "cuda" — overrides opf's CUDA default.
-  PRIVACY_FILTER_CALIBRATION    path to a Viterbi calibration JSON. Optional;
-                                ignored if missing. See
+  PRIVACY_FILTER_DEVICE         "cpu" (default) or "cuda".
+  PRIVACY_FILTER_CALIBRATION    path to a Viterbi calibration JSON.
+                                Optional; ignored if missing. See
                                 services/privacy_filter/scripts/spike_opf.py
                                 for the JSON shape.
 
-Cache: opf writes its checkpoint into `~/.opf/privacy_filter` (=
-`/app/.opf/privacy_filter` for the app user). That's the path
-operators mount the persistent named volume at. We deliberately do
-NOT set `OPF_CHECKPOINT` — the env var disables opf's auto-download
-path (it's interpreted as "operator says the model is here, trust
-them"), which we want active for the non-baked flavour. Earlier
-designs tried mounting at `/app/.cache/huggingface` and symlinking
-`/app/.opf/` into it; the volume overlay broke that approach
-because pathlib's `mkdir(parents=True, exist_ok=True)` chokes on a
-dangling symlink in the parent chain when the volume is empty.
+Persistent cache: mount a named volume at `/app/.opf` to keep the
+model across container recreations. opf writes its checkpoint into
+`~/.opf/privacy_filter` (= `/app/.opf/privacy_filter` for the app
+user) and ignores HF_HOME. `OPF_CHECKPOINT` is intentionally NOT
+set — that env var disables opf's auto-download (it's interpreted
+as "operator-supplied checkpoint, trust them"), which we need
+active for the runtime-download flavour.
 """
 
 from __future__ import annotations
@@ -148,9 +136,8 @@ def _gap_is_mergeable(
 
 
 # Paragraph break used by the split pass — see the in-process
-# detector for the long rationale. tl;dr: defense in depth against
-# any decoder that fuses a span across a `\n\n`. opf's Viterbi
-# doesn't produce these on our fixtures; kept anyway for safety.
+# detector for the rationale. Defense in depth against any decoder
+# that fuses a span across a `\n\n`.
 _PARAGRAPH_BREAK = re.compile(r"\n{2,}")
 
 
@@ -158,20 +145,11 @@ _PARAGRAPH_BREAK = re.compile(r"\n{2,}")
 def _load_model(model_name: str) -> Any:
     """Construct the opf-backed PII model.
 
-    `device` defaults to "cpu" — opf's own constructor default is
-    "cuda", and silently selecting GPU on a CPU-only host would
-    explode at first request. cu130 image builds set
-    `PRIVACY_FILTER_DEVICE=cuda` to flip back. Mirrors the in-process
-    detector's loader; see anonymizer_guardrail.detector.privacy_filter
-    for the longer rationale.
-
-    `model_name` is interpreted in two ways. The default sentinel
-    "openai/privacy-filter" (carried over from the transformers
-    integration where it was a HuggingFace repo id) is translated to
-    `None`, which triggers opf's auto-download path
-    (`OPF_CHECKPOINT` env var → bundled default `~/.opf/privacy_filter`
-    → fetch from HuggingFace if not on disk). Anything else is
-    passed through as a filesystem path to a checkpoint directory.
+    Mirrors the in-process detector's loader; see
+    `anonymizer_guardrail.detector.privacy_filter` for the rationale
+    on `device="cpu"` (opf's own default is `"cuda"`) and on the
+    sentinel translation that makes `model_name="openai/privacy-filter"`
+    map to opf's auto-download path.
     """
     from opf._api import OPF  # heavy import; defer to startup
 
@@ -193,9 +171,8 @@ def _to_matches(spans: Any, source_text: str) -> list[dict[str, Any]]:
     output drift.
 
     `spans` is the iterable of opf DetectedSpan-shaped objects from
-    `RedactionResult.detected_spans` — each carrying `.label / .start /
-    .end / .text`. opf doesn't expose a per-span score, so the wire
-    format omits it.
+    `RedactionResult.detected_spans` — each carrying
+    `.label / .start / .end / .text`.
     """
     # 1) extract: turn opf DetectedSpans into (start, end, type) tuples.
     extracted: list[tuple[int, int, str]] = []

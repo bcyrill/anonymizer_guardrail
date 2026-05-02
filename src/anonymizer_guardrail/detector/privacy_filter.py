@@ -18,12 +18,6 @@ the [`opf`](https://github.com/openai/privacy-filter) package (OpenAI's
 own inference wrapper for this model). Without those, this module
 imports fine but instantiating the detector raises a clear ImportError
 pointing at the extras.
-
-Inference layer note: this used to wrap `transformers.pipeline(
-"token-classification", aggregation_strategy="first")`. We migrated
-to `opf.OPF(decode_mode="viterbi")` for materially better span
-boundaries and recall — see `services/privacy_filter/scripts/PROBE.md`
-→ "post-Viterbi migration" for empirical numbers.
 """
 
 from __future__ import annotations
@@ -72,17 +66,13 @@ class PrivacyFilterConfig(BaseSettings):
     # Independent from LLM_MAX_CONCURRENCY: a saturated PF queue
     # shouldn't reduce LLM headroom or vice versa.
     max_concurrency: int = 10
-    # Inference device for the in-process variant. opf's own
-    # constructor default is `cuda`; we override to `cpu` so a
-    # GPU-less host doesn't explode at first request. cu130 image
-    # builds set PRIVACY_FILTER_DEVICE=cuda to flip back.
+    # Inference device. opf's own constructor default is `cuda`; we
+    # default to `cpu` so a GPU-less host doesn't explode at first
+    # request. cu130 image builds set PRIVACY_FILTER_DEVICE=cuda.
     device: str = "cpu"
-    # Optional path to a Viterbi operating-points JSON. If unset or
-    # the file doesn't exist, opf's stock decoder is used — the
-    # Phase-1 spike showed the stock decoder produces clean spans on
-    # every fixture we measured. Reserved for future corpora that
-    # need precision/recall tuning. JSON shape and bias semantics
-    # are documented in services/privacy_filter/scripts/spike_opf.py.
+    # Optional path to a Viterbi operating-points JSON. Empty (default)
+    # uses opf's stock decoder. JSON shape and bias semantics are
+    # documented in services/privacy_filter/scripts/spike_opf.py.
     calibration: str = ""
 
     @field_validator("url", mode="after")
@@ -194,12 +184,9 @@ def _gap_is_mergeable(
 
 
 # Paragraph break — used by the split pass to break apart any single
-# span the decoder collapsed across a `\n\n`. Originally needed for HF's
-# `aggregation_strategy="first"` which routinely glued tokens across
-# blank lines; the post-Viterbi-migration spike showed opf doesn't
-# produce these on our fixtures, but the split pass is kept as
-# defense in depth — production traffic is broader than fixtures and
-# the cost is negligible.
+# span the decoder collapsed across a `\n\n`. Defense in depth: the
+# current decoder rarely produces such spans, but production traffic
+# is broader than test fixtures and the runtime cost is negligible.
 _PARAGRAPH_BREAK = re.compile(r"\n{2,}")
 
 
@@ -211,17 +198,12 @@ def _load_model(model_name: str) -> Any:
     failure (with a clear remediation message) is deferred until someone
     tries to instantiate PrivacyFilterDetector.
 
-    `device` defaults to "cpu" — opf's own constructor default is
-    "cuda", and silently selecting GPU on a CPU-only host would
-    explode at first request rather than at boot. Operators on cu130
-    image builds set `PRIVACY_FILTER_DEVICE=cuda` to flip back.
-
-    Calibration JSON is optional. If `PRIVACY_FILTER_CALIBRATION`
-    points at a readable file, it's loaded into the Viterbi decoder;
-    otherwise opf's stock decoder is used. The Phase-1 spike showed
-    the stock decoder already produces clean spans on our fixtures
-    (see `services/privacy_filter/scripts/spike_opf.py`); calibration
-    is reserved for future corpora that need precision/recall tuning.
+    Reads two knobs off `CONFIG`:
+      * `device` ("cpu" by default; "cuda" for GPU builds).
+      * `calibration` (optional path to a Viterbi operating-points
+        JSON; empty means use opf's stock decoder). See
+        `services/privacy_filter/scripts/spike_opf.py` for the JSON
+        shape.
     """
     try:
         from opf._api import OPF  # noqa: WPS433 — intentional lazy import
@@ -241,24 +223,15 @@ def _load_model(model_name: str) -> Any:
             "`pip install \"anonymizer-guardrail[privacy-filter]\"`."
         ) from exc
     # opf's `model` parameter is a checkpoint *path*, not a HuggingFace
-    # repo id — passing "openai/privacy-filter" as a string makes opf
-    # try to load from a literal `./openai/privacy-filter/` directory.
-    # `None` triggers opf's auto-resolution: it reads `OPF_CHECKPOINT`
-    # (or the bundled default `~/.opf/privacy_filter`), downloads the
-    # model from HuggingFace if not present, and returns the path.
-    # We translate our HF-style default sentinel to None so the
-    # `MODEL_NAME=openai/privacy-filter` configuration (the historical
-    # default from the transformers integration) keeps working. An
-    # operator with a custom checkpoint passes the filesystem path
-    # explicitly.
+    # repo id — passing "openai/privacy-filter" as a string would make
+    # opf load from a literal `./openai/privacy-filter/` directory.
+    # `None` triggers opf's auto-resolution: read `$OPF_CHECKPOINT` or
+    # the default `~/.opf/privacy_filter`, fetching from HuggingFace
+    # if not on disk. The default sentinel maps to None so the natural
+    # `MODEL_NAME=openai/privacy-filter` configuration works; an
+    # operator with a custom checkpoint passes a filesystem path.
     opf_model = None if model_name == _DEFAULT_MODEL else model_name
 
-    # Read device + calibration via the shared PrivacyFilterConfig
-    # (PRIVACY_FILTER_DEVICE / PRIVACY_FILTER_CALIBRATION) so this
-    # module follows the project-wide pydantic-settings convention
-    # rather than spelling env vars by hand. CONFIG is a module
-    # global; tests that monkeypatch it (the `MOD.CONFIG.model_copy(
-    # update={...})` pattern) get picked up here at call time.
     model = OPF(model=opf_model, device=CONFIG.device, decode_mode="viterbi")
     if CONFIG.calibration and os.path.isfile(CONFIG.calibration):
         model.set_viterbi_decoder(calibration_path=CONFIG.calibration)

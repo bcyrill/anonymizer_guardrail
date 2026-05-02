@@ -22,14 +22,16 @@ by changing the detector list.
 | `PRIVACY_FILTER_TIMEOUT_S` | `30` | Per-call timeout (seconds) on the remote privacy-filter HTTP requests. |
 | `PRIVACY_FILTER_FAIL_CLOSED` | `true` | Block requests when the privacy_filter detector errors. Independent flag — operators can fail closed on one detector and open on another. Applies to both the in-process and remote variants. |
 | `PRIVACY_FILTER_MAX_CONCURRENCY` | `10` | Semaphore on in-flight `privacy_filter` calls (in-process AND remote). Independent of `LLM_MAX_CONCURRENCY`. Surfaced as `pf_in_flight`/`pf_max_concurrency` on `/health`. |
-| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop transformers pinging HuggingFace Hub on every start. The `pf-baked` image flavour sets it automatically; runtime-download flavours leave it unset on first run. `scripts/launcher.sh --hf-offline` / the menu offer it once the cache volume is populated. |
+| `HF_HUB_OFFLINE` | *(unset)* / `1` *(baked images)* | Set to `1` to stop `huggingface_hub` (called by opf during model download) from pinging HuggingFace Hub on every start. The `pf-baked` image flavour sets it automatically as deployment-intent documentation, but post-opf-migration this is largely cosmetic — opf's `target.exists()` check in `ensure_default_checkpoint` short-circuits before `huggingface_hub` is even imported when the model is on disk, so the offline flag is a no-op for warm-start traffic. `scripts/launcher.sh --hf-offline` / the menu still offer it once the cache volume is populated. |
 
 ## In-process (default)
 
 Loads the `openai/privacy-filter` model into the guardrail's own
-process. Pulls in `torch`, `transformers`, and the full set of model
-weights, so this option only works on the `pf` / `pf-baked` image
-flavours — slim doesn't ship the dependencies. See
+process. Pulls in `torch`, [`opf`](https://github.com/openai/privacy-filter)
+(OpenAI's own inference wrapper for this model — replaces the older
+`transformers.pipeline` integration; see "Decoder" below), and the
+full set of model weights, so this option only works on the `pf` /
+`pf-baked` image flavours — slim doesn't ship the dependencies. See
 [deployment → Container images](../deployment.md#container-images) for
 the size impact. Microsecond glue overhead per call; shares the
 guardrail's CPU/memory budget.
@@ -47,8 +49,9 @@ side ships it via `--build-arg WITH_PRIVACY_FILTER=true`.
 ## Remote (`PRIVACY_FILTER_URL` set)
 
 Off-loads inference to a standalone container running
-`services/privacy_filter/main.py` — a thin FastAPI wrapper around the
-same `transformers` pipeline plus identical span-merge post-processing.
+`services/privacy_filter/main.py` — a thin FastAPI wrapper around
+the same opf decoder plus identical merge / split / per-label gap
+post-processing.
 The guardrail's `RemotePrivacyFilterDetector` posts each request's
 text to `${PRIVACY_FILTER_URL}/detect` and parses the returned span
 list. Output is byte-equivalent to the in-process detector for the

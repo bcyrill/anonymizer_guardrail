@@ -25,9 +25,11 @@ the practical contrasts when running this one:
   trained label is dropped or routed through `OTHER`. To detect
   custom categories like `vehicle_registration`, use gliner-pii
   (zero-shot) or a regex.
-- **No `--threshold`.** The service returns every span the model
-  emits with its raw confidence score. Filter on the `score`
-  column yourself if you want to drop low-confidence matches.
+- **No `--threshold`.** Different reason than gliner-pii: opf's
+  `DetectedSpan` doesn't expose a per-span confidence at all, so
+  there's no score to threshold on. The wire format omits the
+  `score` field for that reason — for confidence-sensitive routing,
+  layer the regex detector with stable shape anchors on top.
 - **Span merging happens server-side.** Adjacent same-type tokens
   are combined into one match (so "Alice Smith" comes back as one
   `PERSON` span, not two). See `_to_matches` in
@@ -61,10 +63,10 @@ python services/privacy_filter/scripts/probe.py \
     --url http://privacy.internal:8001 \
     --text-file services/privacy_filter/scripts/sample.txt
 
-# Raw JSON for scripting — e.g. only high-confidence matches:
+# Raw JSON for scripting — e.g. just the EMAIL_ADDRESS matches:
 python services/privacy_filter/scripts/probe.py \
     --text-file services/privacy_filter/scripts/sample.txt \
-    --json | jq '.matches[] | select(.score > 0.9)'
+    --json | jq '.matches[] | select(.entity_type == "EMAIL_ADDRESS")'
 ```
 
 ## Comparing detectors on the same fixture
@@ -92,10 +94,13 @@ What to look for:
   (people, addresses, emails). Where one fires and the other
   doesn't is informative — it tells you which detector to lean on
   for each entity class.
-- **Confidence shape.** Privacy-filter typically gives uniformly
-  high scores within its trained vocabulary; gliner-pii's scores
-  spread more, with the bottom end being weakly-anchored mentions
-  (see [gliner-pii PROBE.md → Empirical findings](../../gliner_pii/scripts/PROBE.md#empirical-findings)).
+- **Confidence shape.** Asymmetric: gliner-pii's wire format
+  carries per-span scores you can compare side-by-side (see
+  [gliner-pii PROBE.md → Empirical findings](../../gliner_pii/scripts/PROBE.md#empirical-findings)).
+  Privacy-filter's opf-based decoder doesn't expose one, so the
+  comparison is binary (matched / didn't match) rather than
+  graded. For confidence-sensitive routing across both, the
+  regex detector with stable shape anchors is the disambiguator.
 - **Type granularity.** Privacy-filter advertises IBAN, credit
   card, and SSN as one `IDENTIFIER` umbrella, but the empirical
   findings below show the umbrella is leaky — IBAN fires, credit

@@ -25,12 +25,17 @@ for when to pick the in-process vs the remote variant.
       "text": "alice@example.com",
       "entity_type": "EMAIL_ADDRESS",
       "start": 6,
-      "end": 23,
-      "score": 0.998
+      "end": 23
     }
   ]
 }
 ```
+
+No per-span `score` field — opf's `DetectedSpan` doesn't expose
+confidence, and a synthetic constant would be worse than its
+absence (operators reading it would assume real signal). For
+confidence-sensitive routing, layer the regex detector with stable
+shape anchors on top.
 
 `entity_type` uses the same canonical names as the guardrail
 (`PERSON`, `EMAIL_ADDRESS`, `PHONE`, `URL`, `ADDRESS`, `DATE_OF_BIRTH`,

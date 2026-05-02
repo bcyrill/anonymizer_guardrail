@@ -95,41 +95,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY main.py /app/main.py
 
-# opf writes its checkpoint into `~/.opf/privacy_filter` (= `/app/.opf/`
-# for the app user) and ignores HF_HOME — so we mount the persistent
-# named volume directly at `/app/.opf` and don't bother redirecting
-# HF_HOME or symlinking. opf's checkpoint resolution rules
-# (opf/_api.py::resolve_checkpoint_path):
-#
-#   1. If `OPF()` is called with `model=` → that path (no download).
-#   2. Else if `OPF_CHECKPOINT` env is set → that path (no download).
-#   3. Else → call `ensure_default_checkpoint()` which auto-downloads
-#      from HuggingFace into `~/.opf/privacy_filter`.
-#
-# We deliberately do NOT set OPF_CHECKPOINT — that would disable the
-# auto-download path (opf treats it as "operator-supplied checkpoint,
-# trust them"), which we want active for the non-baked flavour.
-# Earlier iterations tried to redirect via OPF_CHECKPOINT or via a
-# symlink from /app/.opf into a different cache directory; both
-# fought the volume-mount overlay and broke pathlib's `mkdir(parents
-# =True, exist_ok=True)` walk inside huggingface_hub. Mounting the
-# volume at the natural `/app/.opf` path is simpler and doesn't fight
-# any layer.
+# opf writes its checkpoint into `~/.opf/privacy_filter` (=
+# `/app/.opf/` for the app user) and ignores HF_HOME, so the
+# persistent named volume mounts directly at `/app/.opf`.
+# Intentionally NOT setting OPF_CHECKPOINT — that env var is
+# interpreted as "operator-supplied checkpoint, trust them" and
+# disables the HuggingFace auto-download path
+# (opf/_common/checkpoint_download.py::ensure_default_checkpoint),
+# which we need active for the runtime-download flavour.
 RUN mkdir -p /app/.opf \
  && chown -R app:app /app/.opf
 
 # Optional: pre-download the model into the image. When baked, also
-# default HF_HUB_OFFLINE=1 — kept post-opf-migration as deployment-intent
-# documentation ("this image is meant to run air-gapped") rather than as
-# load-bearing protection. Under transformers, the env var actively
-# suppressed periodic Hub revalidation HEAD requests on cache hits;
-# under opf, the `if target.exists()` check in
-# opf/_common/checkpoint_download.ensure_default_checkpoint short-circuits
-# BEFORE `from huggingface_hub import snapshot_download` runs, so the
-# offline flag is a no-op for warm-start traffic. Operators can still
-# force online mode with `-e HF_HUB_OFFLINE=0` to refresh weights from
-# inside a baked image. Non-baked flavour gets an empty file so the
-# source statement in CMD is a no-op.
+# default `HF_HUB_OFFLINE=1` as deployment-intent documentation ("this
+# image is meant to run air-gapped") — operators can override with
+# `-e HF_HUB_OFFLINE=0` to refresh weights at runtime. Non-baked
+# flavour gets an empty `_runtime-env` so the source statement in
+# CMD is a no-op.
 RUN if [ "$BAKE_MODEL" = "true" ]; then \
         python -c "from opf._api import OPF; OPF(device='cpu', decode_mode='viterbi')" \
      && echo 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' > /app/_runtime-env; \
