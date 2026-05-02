@@ -48,6 +48,144 @@ app = FastAPI(
 )
 
 
+class _BodySizeLimitMiddleware:
+    """Pure-ASGI middleware that rejects POST bodies above
+    ``config.max_body_bytes`` with HTTP 503 BEFORE Pydantic
+    deserializes them.
+
+    Distinct from `LLM_MAX_CHARS`: that's an LLM-context-window concern
+    that fires after the body is already in memory; this is a
+    DoS-protection concern that prevents the process from allocating
+    memory for a runaway payload in the first place. See
+    `docs/configuration.md`.
+
+    Two paths:
+
+    - **Honest client (`Content-Length` header set):** the size is
+      known up front; reject in O(1) without reading the body.
+    - **Chunked / no Content-Length:** buffer chunks while counting
+      cumulative bytes; reject as soon as the cap is crossed.
+      Otherwise replay the buffered body to the app verbatim. Worst-
+      case memory per request is `max_bytes` (the buffer is dropped
+      either way).
+
+    Implemented as a pure ASGI middleware rather than
+    `BaseHTTPMiddleware` because the latter consumes the request body
+    through its own internal pipeline; constructing a `Request` with
+    a custom `receive` callable doesn't intercept the body-read path
+    `BaseHTTPMiddleware` uses, so the downstream handler's
+    `await request.json()` blocks forever. The ASGI-level wrap of
+    `receive` is the canonical pattern for body-size enforcement.
+
+    The cap applies to *every* request — including `/health`. That's
+    intentional: a no-op endpoint shouldn't accept a 500 MB body
+    either, and a generous default cap (10 MiB) is well above any
+    realistic guardrail payload.
+
+    Why 503 instead of the semantically-precise 413: LiteLLM's
+    Generic Guardrail API client (see
+    `litellm/proxy/guardrails/guardrail_hooks/generic_guardrail_api/`)
+    has a hardcoded `is_unreachable = status_code in (502, 503, 504)`
+    check. Returning 413 makes LiteLLM treat the response as a hard
+    failure and block the upstream LLM call regardless of the
+    operator's `unreachable_fallback` setting. Returning 503 routes
+    through `unreachable_fallback` instead, so operators who chose
+    `fail_open` get traffic through and those who chose `fail_closed`
+    get the request blocked — *both* honoured. The HTTP-semantic
+    mismatch (503 means "service unavailable," not "body too large")
+    is the cost; honouring operator intent is the win.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        # Lifespan / websocket / etc. — pass through untouched.
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Fast path: declared Content-Length over cap. Reject in O(1)
+        # without reading the body. Headers are list[(bytes, bytes)] in
+        # raw ASGI scope.
+        for name, value in scope.get("headers", ()):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    # Malformed header — leave it for downstream to
+                    # reject; we don't enforce on garbage input.
+                    break
+                if declared > self.max_bytes:
+                    await self._send_too_large(send, declared)
+                    return
+                break
+
+        # Streaming path: drain receive() into a buffer, counting bytes
+        # as they arrive. Reject the moment cumulative size crosses the
+        # cap. Otherwise replay the buffered messages to the downstream
+        # app so the handler reads the same body it would have seen.
+        buffered: list[dict] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                # Disconnect or other event — buffer it and stop.
+                buffered.append(message)
+                break
+            chunk = message.get("body", b"") or b""
+            total += len(chunk)
+            if total > self.max_bytes:
+                await self._send_too_large(send, total)
+                return
+            buffered.append(message)
+            if not message.get("more_body", False):
+                break
+
+        # Replay buffered messages once; after they're exhausted, behave
+        # like a closed stream (disconnect). The downstream handler
+        # reads via this wrapped receive and sees exactly the body we
+        # already measured.
+        replay_idx = 0
+
+        async def _replay():
+            nonlocal replay_idx
+            if replay_idx < len(buffered):
+                msg = buffered[replay_idx]
+                replay_idx += 1
+                return msg
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, _replay, send)
+
+    async def _send_too_large(self, send, observed_bytes: int) -> None:
+        log.warning(
+            "Rejecting request body of %d bytes (cap %d). Adjust "
+            "MAX_BODY_BYTES if legitimate traffic exceeds the cap.",
+            observed_bytes, self.max_bytes,
+        )
+        body = (
+            f"Request body exceeds the {self.max_bytes}-byte cap "
+            f"(MAX_BODY_BYTES). Reject at the proxy or raise the cap."
+        ).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
+
+
+app.add_middleware(_BodySizeLimitMiddleware, max_bytes=config.max_body_bytes)
+
+
 def _forwarded_bearer(headers: Mapping[str, object] | None) -> str | None:
     """Extract the user's bearer token from a forwarded Authorization header.
 

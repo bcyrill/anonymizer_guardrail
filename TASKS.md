@@ -278,44 +278,6 @@ LiteLLM's guardrail-API contract for streaming may evolve.
 
 ---
 
-## HTTP request body-size cap
-
-**What:** middleware that rejects POST bodies above a configurable byte
-limit with HTTP 413, before Pydantic deserializes them.
-
-**Why:** `LLM_MAX_CHARS` caps the text we send to the detection LLM, but
-that check fires *after* Pydantic has already parsed the request body.
-A caller — malicious or just confused — can POST a 500 MB body and the
-process happily allocates memory to parse it. Soft DoS vector. Distinct
-from `LLM_MAX_CHARS` because that's an LLM-context-window concern, not a
-DoS-protection concern.
-
-**Why deferred:** when the guardrail sits inside a private network behind
-LiteLLM, the surface area is small and there's typically an upstream proxy
-(nginx, Envoy, ALB) already enforcing body-size limits. Becomes urgent the
-moment the endpoint sits at a trust boundary.
-
-**Sketch:**
-
-1. Add `MAX_BODY_BYTES` env var (default ~10 MiB — enough for very
-   chatty requests, small enough that a runaway client can't OOM us).
-2. Add a Starlette/FastAPI middleware that reads `Content-Length` and
-   short-circuits with a 413 response when over the limit. Fall back to
-   incremental read with a counter for clients that don't send
-   `Content-Length`.
-3. Document the difference from `LLM_MAX_CHARS` in the README env table.
-
-**Concrete trigger:** the guardrail starts accepting traffic from
-untrusted callers, or an upstream proxy isn't reliably enforcing the
-limit.
-
-**Non-goals:**
-
-- Not a per-tenant rate limit. That's a separate concern (and probably
-  belongs in LiteLLM, not the guardrail).
-
----
-
 ## Optional structured (JSON) logging
 
 **What:** add a `LOG_FORMAT=text|json` env var (default `text`). When

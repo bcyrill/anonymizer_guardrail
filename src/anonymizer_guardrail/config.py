@@ -37,6 +37,17 @@ class Config(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "INFO"
+    # Hard cap on POST body bytes — applied by the body-size middleware
+    # in main.py BEFORE Pydantic deserializes the request. Distinct from
+    # `LLM_MAX_CHARS`: that's an LLM-context-window concern that fires
+    # AFTER parsing; this is a DoS-protection concern that prevents the
+    # process from allocating memory for a runaway payload in the first
+    # place. Floor of 1 via Field(ge=1) — a 0/negative cap would either
+    # reject every request or be silently ignored, both worse than a
+    # configuration error at boot. Default 10 MiB: large enough for very
+    # chatty conversation histories with many `texts` entries, small
+    # enough that a runaway client can't exhaust process memory.
+    max_body_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
 
     # ── Detector pipeline ──────────────────────────────────────────────────────
     # Comma-separated list of detector names. Order matters: `_dedup` keeps

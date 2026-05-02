@@ -23,6 +23,7 @@ docs:
 | `PORT` | `8000` | |
 | `LOG_LEVEL` | `INFO` | |
 | `DETECTOR_MODE` | `regex,llm` | Comma-separated list of detector names. Order matters — see [detectors](detectors/index.md). |
+| `MAX_BODY_BYTES` | `10485760` (10 MiB) | Hard cap on POST request body size, enforced by middleware BEFORE Pydantic parses. Distinct from `LLM_MAX_CHARS` — that's an LLM-context-window concern; this is DoS protection that prevents the process from allocating memory for a runaway payload. Oversized requests get HTTP 503; LiteLLM's `unreachable_fallback` setting decides whether the upstream LLM call proceeds (`fail_open`) or is blocked (`fail_closed`). 503 — rather than the semantically-precise 413 — was chosen because LiteLLM's Generic Guardrail client hardcodes `is_unreachable in (502, 503, 504)`, so 413 would block the LLM call regardless of operator intent. Floor of 1 byte — a 0/negative cap fails at boot. |
 
 ## Surrogates and Faker
 

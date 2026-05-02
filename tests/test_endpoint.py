@@ -379,3 +379,121 @@ def test_redacted_authorization_does_not_become_bearer(
         },
     )
     assert cap.received_api_key is None
+
+
+# ── MAX_BODY_BYTES middleware ──────────────────────────────────────────────
+# Caps POST body size BEFORE Pydantic deserializes (DoS protection
+# distinct from LLM_MAX_CHARS). 503 chosen over 413 so LiteLLM's
+# hardcoded `is_unreachable in (502, 503, 504)` check routes the
+# rejection through the operator's `unreachable_fallback` setting —
+# see main.py's `_BodySizeLimitMiddleware` docstring for the rationale.
+
+
+def _client_with_cap(monkeypatch: pytest.MonkeyPatch, max_bytes: int) -> TestClient:
+    """Rebuild the FastAPI app with a smaller body cap so tests can
+    exercise the limit without sending megabytes through TestClient.
+    The default cap (10 MiB) makes legitimate test payloads unrejectable,
+    which is exactly the production behaviour we want — but useless for
+    proving the middleware fires."""
+    from fastapi import FastAPI
+    from anonymizer_guardrail.main import _BodySizeLimitMiddleware
+
+    test_app = FastAPI()
+
+    @test_app.post("/echo")
+    async def echo(payload: dict) -> dict:
+        return {"received": len(payload.get("texts", []))}
+
+    @test_app.get("/ping")
+    async def ping() -> dict:
+        return {"ok": True}
+
+    test_app.add_middleware(_BodySizeLimitMiddleware, max_bytes=max_bytes)
+    return TestClient(test_app)
+
+
+def test_body_under_cap_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body comfortably under the cap goes through and the handler
+    sees the payload it would have seen without the middleware."""
+    c = _client_with_cap(monkeypatch, max_bytes=1024)
+    r = c.post("/echo", json={"texts": ["a", "b", "c"]})
+    assert r.status_code == 200
+    assert r.json() == {"received": 3}
+
+
+def test_body_at_exactly_cap_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boundary: len == cap is allowed, len > cap is rejected. Pads the
+    payload to a deterministic byte length so the boundary is testable."""
+    import json
+    payload = {"pad": "a" * 100}
+    body = json.dumps(payload).encode("utf-8")
+    cap = len(body)  # exactly at cap
+
+    c = _client_with_cap(monkeypatch, max_bytes=cap)
+    r = c.post("/echo", content=body, headers={"content-type": "application/json"})
+    assert r.status_code == 200
+
+
+def test_body_over_cap_rejected_with_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Honest client: declared Content-Length over the cap. Reject in
+    O(1) with 503 — must NOT touch the handler at all."""
+    c = _client_with_cap(monkeypatch, max_bytes=100)
+    big_payload = {"pad": "x" * 1000}  # ~1 KB, well over 100 B
+    r = c.post("/echo", json=big_payload)
+    assert r.status_code == 503
+    assert b"MAX_BODY_BYTES" in r.content
+
+
+def test_body_over_cap_via_chunked_rejected_with_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Chunked transfer (no Content-Length): the streaming path counts
+    cumulative bytes and rejects once the cap is crossed. Simulated by
+    sending raw bytes via httpx.Stream so TestClient doesn't add a
+    Content-Length header automatically."""
+    c = _client_with_cap(monkeypatch, max_bytes=100)
+
+    def chunked_body():
+        yield b'{"pad": "'
+        yield b"x" * 200    # cumulative ~210 B, over 100 B cap
+        yield b'"}'
+
+    # httpx infers chunked transfer when given a generator and no
+    # explicit Content-Length. The middleware's streaming path then
+    # fires and rejects mid-stream.
+    r = c.post(
+        "/echo",
+        content=chunked_body(),
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 503
+    assert b"MAX_BODY_BYTES" in r.content
+
+
+def test_health_request_passes_through_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET requests with no body must not be confused with oversized
+    POSTs. Middleware should pass them through cleanly."""
+    c = _client_with_cap(monkeypatch, max_bytes=10)  # tiny cap
+    r = c.get("/ping")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+
+def test_real_endpoint_default_cap_doesnt_reject_legitimate_traffic(
+    client: TestClient,
+) -> None:
+    """The default 10 MiB cap on the real app must comfortably accept
+    realistic guardrail payloads — pin a small-but-real one as a
+    regression check that we didn't accidentally default the cap too low."""
+    # ~5 KB of texts: well within 10 MiB, well above any realistic
+    # production payload's smallest text.
+    big_text = "alice@example.com " * 250  # ~4.5 KB
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": [big_text],
+            "input_type": "request",
+            "litellm_call_id": "default-cap-regression",
+        },
+    )
+    # Don't assert the exact action — depends on whether regex caught
+    # the email. We just need the request to be ACCEPTED (not 503).
+    assert r.status_code == 200
