@@ -98,6 +98,7 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 | LiteLLM wiring | [docs/litellm-integration.md](docs/litellm-integration.md) |
 | Surrogate generation, Faker, salt, locales | [docs/surrogates.md](docs/surrogates.md) |
 | Vault — round-trip mapping, TTL, size cap | [docs/vault.md](docs/vault.md) |
+| Caching — pipeline / per-detector / surrogate / vault layers | [docs/operations.md](docs/operations.md#detector-result-caching) |
 | Observability — `/health`, in-flight gauges | [docs/operations.md](docs/operations.md) |
 | Container images, build, run | [docs/deployment.md](docs/deployment.md) |
 | Curl recipes | [docs/examples.md](docs/examples.md) |

@@ -1,16 +1,31 @@
 # Operations: observability
 
-The guardrail is operated as a stateless HTTP service with two
-in-memory stores ([vault](vault.md) and
-[surrogate cache](surrogates.md#surrogate-cache)). This page covers
-the cross-cutting `/health` endpoint and how to read it; each store's
-own lifecycle and sizing knobs live with its dedicated docs.
+The guardrail is operated as a stateless HTTP service with four
+opt-in stores it manages internally:
+
+| Store | Where | When does it fire | Default |
+|---|---|---|---|
+| **Vault** | per-call mapping (surrogate → original + type + sources + kwargs) | Written on `request`; popped on the matching `response` | always on (memory backend; flip to redis for multi-replica) |
+| **Surrogate cache** | process-wide `original → surrogate` map | Hit on every entity the surrogate generator touches; backs cross-request consistency | always on (LRU cap of 100k) |
+| **Pipeline-level result cache** | deduped match list keyed by `(text, detector_mode, kwargs)` | Wraps detector dispatch; hit skips ALL detectors. Also dual-written by deanonymize-side prewarm | OFF (`PIPELINE_CACHE_BACKEND=none`) |
+| **Per-detector result cache** | one cache per cache-using detector keyed by `(text, that-detector's kwargs)` | Hit inside `det.detect(text)`; backup tier when the pipeline cache misses on partial-kwargs change | OFF (`<DETECTOR>_CACHE_MAX_SIZE=0`) |
+
+This page covers the cross-cutting `/health` endpoint and how to
+read it; each store's own lifecycle and sizing knobs live with its
+dedicated docs.
 
 For deeper background:
 
 - **[Vault](vault.md)** — round-trip mapping, TTL, size cap.
 - **[Surrogate cache](surrogates.md#surrogate-cache)** — cross-call
   consistency, LRU eviction.
+- **[Pipeline-level result cache](#pipeline-level-result-cache-with-source-tracked-prewarm)**
+  (this page, below) — the new layer that absorbs full-text
+  repeats; deanonymize-side prewarm closes the assistant-message
+  miss.
+- **[Per-detector result caching](#detector-result-caching)** (this
+  page, below) — one cache per slow detector; structural backup
+  tier under override fragmentation.
 - **[Limitations](limitations.md)** — single-replica constraint,
   streaming, restart behaviour.
 
@@ -31,6 +46,11 @@ needing a per-deployment template:
   "vault_size": 3,
   "surrogate_cache_size": 1421,
   "surrogate_cache_max": 100000,
+  "pipeline_cache_backend": "none",
+  "pipeline_cache_size": 0,
+  "pipeline_cache_max": 0,
+  "pipeline_cache_hits": 0,
+  "pipeline_cache_misses": 0,
   "pf_in_flight": 0,
   "pf_max_concurrency": 10,
   "gliner_pii_in_flight": 0,
@@ -83,6 +103,16 @@ How to read each counter:
   present even when caching is disabled (`*_cache_max=0`), so dashboards
   can pin to stable names. See
   [Detector result caching](#detector-result-caching) below.
+- **`pipeline_cache_backend`** / **`pipeline_cache_size`** /
+  **`pipeline_cache_max`** / **`pipeline_cache_hits`** /
+  **`pipeline_cache_misses`** — the pipeline-level cache that wraps
+  detector dispatch. `backend` reflects the configured value
+  (`none` / `memory` / `redis`); the four counters are 0 when
+  `backend=none`. `size`/`max` follow the same backend asymmetry as
+  the per-detector caches (memory: actual count vs LRU cap; redis: 0
+  placeholder, query Redis directly). See
+  [Pipeline-level result cache](#pipeline-level-result-cache-with-source-tracked-prewarm)
+  below.
 
 When extra detectors with semaphores are configured (e.g. `gliner_pii`),
 their `<stats_prefix>_in_flight` and `<stats_prefix>_max_concurrency`
@@ -185,7 +215,7 @@ of which user authenticated. For gliner, label *order* IS part of
 the key — different orderings are treated as different calls
 because the wire request preserves order.
 
-### Pipeline-level result cache (with deanonymize-side prewarm)
+### Pipeline-level result cache (with source-tracked prewarm)
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -204,6 +234,10 @@ frozen_per_call_kwargs)`. Two write paths populate it:
   matches from the typed vault entry and writes them into both the
   pipeline cache (for the deanonymized text) AND each per-detector
   cache (filtered by the entry's `source_detectors` per surrogate).
+  See [design-decisions → Bidirectional pipeline-level result cache](design-decisions.md#bidirectional-pipeline-level-result-cache-with-source-tracked-prewarm)
+  for why filtering by `source_detectors` matters (without it, every
+  per-detector cache stat would inflate with entities other detectors
+  found).
 
 Closes the assistant-message-on-turn-N+1 case: today the cache
 hits on every replayed prior user message but always misses on

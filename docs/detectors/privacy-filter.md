@@ -55,6 +55,17 @@ equally to both variants. Variant-specific notes are flagged inline.
 | `PRIVACY_FILTER_CACHE_TTL_S` | `600` | Per-key TTL for redis-backed entries, reset on every cache write. Raise when you want privacy-filter verdicts cached longer; lower after a model upgrade where stale verdicts are misleading. Memory backend ignores this knob. |
 | `PRIVACY_FILTER_INPUT_MODE` | `per_text` | How the pipeline dispatches `req.texts` to this detector. `per_text` (default) calls the detector once per text; `merged` concatenates all texts with a sentinel separator and makes one call per request. See [operations → Merged-input mode](../operations.md#merged-input-mode) for the trade-offs. Mutually exclusive with `PRIVACY_FILTER_CACHE_MAX_SIZE`: setting both logs a warning at boot and the cache is bypassed. |
 
+> **Note on cache layering.** The per-detector cache above is the
+> *second tier*. When `PIPELINE_CACHE_BACKEND≠none` (see
+> [configuration → Pipeline-level result cache](../configuration.md#pipeline-level-result-cache)),
+> a request that hits the pipeline cache skips the privacy-filter
+> detector entirely — the per-detector cache is only consulted on
+> a pipeline miss. PF has no per-call overrides today, so its
+> per-detector key is just `(text,)`; once the pipeline cache is
+> on, the PF cache mostly serves as a backup for cases where some
+> *other* detector's overrides changed and bumped the pipeline-cache
+> key into a different slot.
+
 ## Configuration (service-side)
 
 These knobs apply to the standalone privacy-filter-service container.

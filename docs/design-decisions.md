@@ -187,10 +187,11 @@ detector cache so turn N's assistant message wouldn't miss on
 turn N+1. That's a separate path — it can be done *without*
 running detection by deriving synthetic matches from the vault
 during the existing deanonymize step. Implemented as a
-documented design decision below — see "Detector cache pre-warm
-from deanonymize-derived matches" — so the design decision
-here stays focused on whether to *redact model output*, which
-the synthetic-match approach does not address.
+documented design decision below — see "Bidirectional
+pipeline-level result cache (with source-tracked prewarm)" — so
+the design decision here stays focused on whether to *redact
+model output*, which the synthetic-match approach does not
+address.
 
 **When to re-evaluate:**
 

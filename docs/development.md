@@ -62,8 +62,15 @@ src/anonymizer_guardrail/        # the importable package — what ships
                                  # Per-detector config lives in the
                                  # detector module.
   vault.py                       # VaultBackend Protocol + factory
+                                 # + VaultEntry/VaultSurrogate types
+                                 # + freeze_kwargs helper
   vault_memory.py                # MemoryVault (default)
   vault_redis.py                 # RedisVault (opt-in)
+  pipeline_cache.py              # PipelineResultCache Protocol +
+                                 # factory + Disabled-sentinel
+  pipeline_cache_memory.py       # InMemoryPipelineCache (default
+                                 # when backend != "none")
+  pipeline_cache_redis.py        # RedisPipelineCache (opt-in)
 
 tools/launcher/                  # dev-only, NOT in the wheel
   __main__.py                    # `python -m tools.launcher` entry

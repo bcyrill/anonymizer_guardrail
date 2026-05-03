@@ -293,3 +293,50 @@ async def test_size_returns_zero(vault: RedisVault) -> None:
     await vault.put("call-1", _entry())
     await vault.put("call-2", _entry())
     assert vault.size() == 0
+
+
+# ── Frozen-kwargs round-trip with list-valued kwargs ──────────────────
+
+
+async def test_frozen_kwargs_with_tuple_value_round_trips(
+    vault: RedisVault,
+) -> None:
+    """gliner's `labels` kwarg is a tuple in `FrozenKwargs`. JSON
+    encodes tuples as arrays; on decode we MUST coerce back to tuple
+    so the post-pop kwargs dict + cache_key_for round-trip produces
+    the same hashable shape a freshly-frozen kwargs would.
+
+    Regression: without `_coerce_value`'s list→tuple step in the
+    decoder, `entry.kwargs[i][1]` would carry a list at deanonymize
+    time and a tuple at anonymize time → mismatched hashes →
+    pipeline cache misses on every prewarm."""
+    from anonymizer_guardrail.vault import VaultEntry, VaultSurrogate
+
+    entry = VaultEntry(
+        surrogates={
+            "[PERSON_A1B2C3D4]": VaultSurrogate(
+                original="alice", entity_type="PERSON",
+                source_detectors=("regex", "gliner_pii"),
+            ),
+        },
+        detector_mode=("regex", "gliner_pii"),
+        # Tuple-valued kwarg simulating gliner's frozen labels.
+        kwargs=(
+            ("regex", (("overlap_strategy", None),)),
+            ("gliner_pii", (
+                ("labels", ("person", "organization")),
+                ("threshold", 0.5),
+            )),
+        ),
+    )
+    await vault.put("call-frozen", entry)
+    got = await vault.pop("call-frozen")
+
+    # Equality: tuple-typed labels must come back as tuples, not lists.
+    assert got == entry
+    gliner_kwargs = dict(got.kwargs)["gliner_pii"]
+    labels_pair = next((k, v) for k, v in gliner_kwargs if k == "labels")
+    assert isinstance(labels_pair[1], tuple), (
+        f"labels must round-trip as tuple, got {type(labels_pair[1]).__name__}"
+    )
+    assert labels_pair[1] == ("person", "organization")

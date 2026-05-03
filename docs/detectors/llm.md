@@ -30,6 +30,16 @@ config pattern.
 | `LLM_CACHE_TTL_S` | `600` | Per-key TTL for redis-backed entries, reset on every cache write. Raise for stable workloads where re-detection wastes LLM budget; lower if you swap models / prompts often and want fresher verdicts. Memory backend ignores this knob (LRU eviction is bounded by `cache_max_size`). |
 | `LLM_INPUT_MODE` | `per_text` | How the pipeline dispatches `req.texts` to this detector. `per_text` (default) calls the detector once per text; `merged` concatenates all texts with a sentinel separator and makes one call per request. See [operations → Merged-input mode](../operations.md#merged-input-mode) for the trade-offs. Mutually exclusive with `LLM_CACHE_MAX_SIZE`: setting both logs a warning at boot and the cache is bypassed. |
 
+> **Note on cache layering.** The per-detector cache above is the
+> *second tier*. When `PIPELINE_CACHE_BACKEND≠none` (see
+> [configuration → Pipeline-level result cache](../configuration.md#pipeline-level-result-cache)),
+> a request that hits the pipeline cache skips the LLM detector
+> entirely — the per-detector cache is only consulted on a pipeline
+> miss. Useful when per-call kwargs differ per detector
+> (e.g. only `llm_model` changes between calls): the pipeline cache
+> misses on the kwargs union, but the LLM per-detector cache still
+> has the model-keyed slot if `model` *did* match.
+
 ## Per-request overrides
 
 Two LLM-specific keys can be passed in

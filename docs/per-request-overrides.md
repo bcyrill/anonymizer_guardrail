@@ -102,10 +102,14 @@ The per-detector result cache has a separate, simpler interaction:
 when a detector is configured with `<DETECTOR>_INPUT_MODE=merged`
 (startup config — not a per-request override), its result cache is
 bypassed entirely because every merged blob is unique by
-construction. See
-[operations → Merged-input mode](operations.md#merged-input-mode)
-for the trade-off and the cache + merge mutual-exclusivity warning
-operators get at boot when both are configured non-trivially.
+construction. The same is true for the
+[pipeline-level result cache](operations.md#pipeline-level-result-cache-with-source-tracked-prewarm)
+on the merged-blob path: merged-mode detectors don't go through
+`_detect_one`'s pipeline-cache wrap (the per-text path still
+benefits — see the boot-time warning operators get when
+`PIPELINE_CACHE_BACKEND≠none` is paired with a merged-mode detector).
+See [operations → Merged-input mode](operations.md#merged-input-mode)
+for the trade-off and the cache + merge mutual-exclusivity warnings.
 
 ## Named alternatives
 

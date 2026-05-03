@@ -307,7 +307,7 @@ the contribution info is computed implicitly but never surfaced.
 
 Source-tracked prewarm is already shipped as part of the
 bidirectional pipeline cache (see
-[design-decisions → Bidirectional pipeline-level result cache](docs/design-decisions.md#bidirectional-pipeline-level-result-cache));
+[design-decisions → Bidirectional pipeline-level result cache](docs/design-decisions.md#bidirectional-pipeline-level-result-cache-with-source-tracked-prewarm));
 this task gives operators the *aggregate* per-process question
 ("is gliner pulling its weight across all calls?") that the
 per-call vault `source_detectors` field doesn't surface.

@@ -50,9 +50,33 @@ Wire format on Redis:
     [operations → Redis backend: why the cache key is salted](operations.md#redis-backend-why-the-cache-key-is-salted).)
     Direct keys also keep `redis-cli GET vault:<call_id>` available
     for oncall debugging.
-  * **Value:** JSON-encoded `dict[str, str]` (the surrogate→original
-    mapping). JSON over msgpack so operators can debug entries
-    directly: `redis-cli GET vault:abc-123`.
+  * **Value:** JSON-encoded `VaultEntry` — a 3-key top-level object
+    with `surrogates`, `detector_mode`, and `kwargs`. The structured
+    shape is required by the [pipeline-level cache prewarm](operations.md#pipeline-level-result-cache-with-source-tracked-prewarm)
+    so synthesised matches carry their `entity_type` and the source
+    detectors that found each entity. JSON over msgpack so operators
+    can debug entries directly: `redis-cli GET vault:abc-123`. Example:
+
+    ```json
+    {
+      "surrogates": {
+        "[PERSON_ABCD1234]": ["Alice Smith", "PERSON", ["regex", "llm"]],
+        "[EMAIL_ADDRESS_DEADBEEF]": ["alice@example.com", "EMAIL_ADDRESS", ["regex"]]
+      },
+      "detector_mode": ["regex", "llm"],
+      "kwargs": [
+        ["llm",   [["model", "anonymize"], ["prompt_name", "default"]]],
+        ["regex", [["overlap_strategy", null], ["patterns_name", null]]]
+      ]
+    }
+    ```
+
+    Each surrogate value is a 3-tuple `[original, entity_type,
+    source_detectors]`. The Python types live in
+    [`vault.py`](../src/anonymizer_guardrail/vault.py) as
+    `VaultEntry` / `VaultSurrogate`; see
+    [design-decisions → Bidirectional pipeline-level result cache](design-decisions.md#bidirectional-pipeline-level-result-cache-with-source-tracked-prewarm)
+    for the rationale on each field.
   * **TTL:** per-key `EXPIRE` set on `put`. Redis evicts expired
     entries server-side — no client-side scheduling.
   * **Atomic pop:** `GETDEL` (Redis ≥ 6.2). Single round-trip

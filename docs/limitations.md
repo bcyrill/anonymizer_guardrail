@@ -87,19 +87,27 @@ deferred until a metrics scraper is actually deployed in front of it.
 
 ## In-memory by default
 
-Three internal stores back the guardrail's stateful behaviour. Default
-backends are all process-local; opt-in Redis backends ship for the two
-that need cross-replica or restart-persistent state:
+Four internal stores back the guardrail's stateful behaviour. Default
+backends are all process-local; opt-in Redis backends ship for the
+three that benefit from cross-replica or restart-persistent state:
 
 - [Vault](vault.md) — `MemoryVault` (default) or `RedisVault` (opt-in
   via `VAULT_BACKEND=redis` + `VAULT_REDIS_URL`). Required for
   multi-replica deployments where pre_call and post_call may land on
   different replicas behind a load balancer.
-- [Detector result cache](operations.md#detector-result-caching) —
+- [Pipeline-level result cache](operations.md#pipeline-level-result-cache-with-source-tracked-prewarm)
+  — disabled by default; opt in via `PIPELINE_CACHE_BACKEND=memory`
+  (in-process LRU) or `PIPELINE_CACHE_BACKEND=redis` (shared store
+  reusing `CACHE_REDIS_URL` + `CACHE_SALT`). Wraps detector dispatch
+  — on a hit, the pipeline skips ALL detectors. Useful for chat
+  workloads where prior turn texts repeat across requests.
+- [Per-detector result cache](operations.md#detector-result-caching) —
   `InMemoryDetectionCache` (default) or `RedisDetectionCache` (opt-in
   per detector via `<DETECTOR>_CACHE_BACKEND=redis` +
   `CACHE_REDIS_URL`). Useful for multi-replica cache hits and
-  cache survival across guardrail restarts.
+  cache survival across guardrail restarts. Acts as the structural
+  backup tier when the pipeline cache misses on partial-kwargs
+  changes.
 - [Surrogate cache](surrogates.md#surrogate-cache) — process-local
   only. Cross-replica surrogate consistency is achieved via a shared
   `SURROGATE_SALT` (deterministic seeded BLAKE2b — every replica

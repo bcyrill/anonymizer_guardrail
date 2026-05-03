@@ -106,7 +106,18 @@ class PipelineResultCache(Protocol):
         """Return cached matches for `key`, or run `compute()` and
         cache its result. Returned list is independent of cache
         state — callers (e.g. the pipeline's downstream stages) can
-        mutate it without poisoning subsequent reads."""
+        mutate it without poisoning subsequent reads.
+
+        Concurrent-write semantics differ across backends:
+          * **Redis** uses `SET nx=True` (first writer wins).
+          * **In-memory** is last-writer-wins (compute runs outside
+            the lock, multiple racing computes all write the same
+            value).
+        Both are correctness-safe because real detection produces a
+        deterministic result for a fixed cache key — the racing
+        writers converge on the same value. Counters (hits/misses)
+        may double-count under contention; acceptable for a stats
+        endpoint."""
         ...
 
     async def put(
@@ -115,9 +126,11 @@ class PipelineResultCache(Protocol):
         """Best-effort write — populates the slot if missing. Used by
         the deanonymize-side prewarm path, which doesn't need the
         get-or-compute round-trip semantics. On a populated slot, the
-        existing entry stays (Redis: SET nx=True; in-memory: setdefault
-        equivalent). Empty match lists are still written — they're a
-        valid "we ran detection, found nothing" answer."""
+        existing entry stays (both backends honour first-writer-wins
+        for `put`: Redis via `SET nx=True`, in-memory via
+        `if key in self._cache: return`). Empty match lists are still
+        written — they're a valid "we ran detection, found nothing"
+        answer."""
         ...
 
     def stats(self) -> dict[str, int]:

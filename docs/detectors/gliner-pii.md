@@ -38,6 +38,17 @@ crashes loud at boot.
 | `GLINER_PII_CACHE_TTL_S` | `600` | Per-key TTL for redis-backed entries, reset on every cache write. Raise when label sets / thresholds are stable across deployments; lower after a label-vocabulary change so cached verdicts under the old label set evict promptly. Memory backend ignores this knob. |
 | `GLINER_PII_INPUT_MODE` | `per_text` | How the pipeline dispatches `req.texts` to this detector. `per_text` (default) calls the detector once per text; `merged` concatenates all texts with a sentinel separator and makes one call per request. See [operations → Merged-input mode](../operations.md#merged-input-mode) for the trade-offs. Mutually exclusive with `GLINER_PII_CACHE_MAX_SIZE`: setting both logs a warning at boot and the cache is bypassed. |
 
+> **Note on cache layering.** The per-detector cache above is the
+> *second tier*. When `PIPELINE_CACHE_BACKEND≠none` (see
+> [configuration → Pipeline-level result cache](../configuration.md#pipeline-level-result-cache)),
+> a request that hits the pipeline cache skips the gliner-pii
+> detector entirely — the per-detector cache is only consulted on
+> a pipeline miss. The structural backup matters most when only
+> `gliner_labels` / `gliner_threshold` change between calls (a
+> per-request override scoped to gliner): the pipeline cache misses
+> on the kwargs union, but the gliner per-detector cache still
+> matches if its own kwargs were unchanged.
+
 ## Per-request overrides
 
 Two gliner-specific keys can be passed in

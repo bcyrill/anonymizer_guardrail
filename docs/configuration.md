@@ -52,12 +52,29 @@ own page (see `<DETECTOR>_CACHE_*` rows in
 [privacy filter](detectors/privacy-filter.md#configuration),
 [GLiNER PII](detectors/gliner-pii.md#configuration)). The two
 cross-cutting fields below are shared across every detector that
-selects `<DETECTOR>_CACHE_BACKEND=redis`:
+selects `<DETECTOR>_CACHE_BACKEND=redis` AND across the
+pipeline-level cache when `PIPELINE_CACHE_BACKEND=redis`:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CACHE_REDIS_URL` | *(empty)* | Required when any detector picks `cache_backend=redis`. Format: `redis://[user:pass@]host:port/db`. Distinct from `VAULT_REDIS_URL` so vault and cache can target different Redis instances. Install `pip install "anonymizer-guardrail[cache-redis]"` to get the redis dep. |
-| `CACHE_SALT` | *(empty → random per process)* | Secret keying material for the BLAKE2b digest used in Redis cache keys. Closes a confirmation-attack oracle on Redis read access — see [operations → Redis backend: why the cache key is salted](operations.md#redis-backend-why-the-cache-key-is-salted). Empty → fresh 16 random bytes generated at process start (logged once). Set to a fixed value for multi-replica cache hits or cache survival across process restarts. Distinct from `SURROGATE_SALT` so they can be rotated independently. |
+| `CACHE_REDIS_URL` | *(empty)* | Required when any detector picks `cache_backend=redis` OR `PIPELINE_CACHE_BACKEND=redis`. Format: `redis://[user:pass@]host:port/db`. Distinct from `VAULT_REDIS_URL` so vault and cache can target different Redis instances. Install `pip install "anonymizer-guardrail[cache-redis]"` to get the redis dep. |
+| `CACHE_SALT` | *(empty → random per process)* | Secret keying material for the BLAKE2b digest used in Redis cache keys. Closes a confirmation-attack oracle on Redis read access — see [operations → Redis backend: why the cache key is salted](operations.md#redis-backend-why-the-cache-key-is-salted). Empty → fresh 16 random bytes generated at process start (logged once). Set to a fixed value for multi-replica cache hits or cache survival across process restarts. Distinct from `SURROGATE_SALT` so they can be rotated independently. Shared between the per-detector and pipeline-level Redis caches. |
+
+## Pipeline-level result cache
+
+Caches the deduped match list per text, keyed by `(text,
+detector_mode, frozen_per_call_kwargs)`. Sits ABOVE the per-detector
+caches: on a hit, the pipeline skips ALL detector dispatch. Default
+off; the deanonymize-side prewarm dual-writes into both this cache
+AND each per-detector cache when enabled. Full background and
+operational notes in
+[operations → Pipeline-level result cache](operations.md#pipeline-level-result-cache-with-source-tracked-prewarm).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PIPELINE_CACHE_BACKEND` | `none` | One of `none`, `memory`, `redis`. `none` is off (default) — every anonymize runs detection. `memory` caches in-process; `redis` shares state across replicas (uses `CACHE_REDIS_URL` + `CACHE_SALT` above). |
+| `PIPELINE_CACHE_MAX_SIZE` | `0` | LRU cap. Memory backend only. `0` with `backend=memory` is a runtime no-op. |
+| `PIPELINE_CACHE_TTL_S` | `600` | Per-key TTL via `EXPIRE`. Redis backend only; memory backend bounds via `MAX_SIZE`. |
 
 ## Capping detector concurrency
 

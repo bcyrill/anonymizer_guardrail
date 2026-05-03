@@ -330,3 +330,148 @@ async def test_source_detectors_filter_per_detector_prewarm(
         f"expected source_detectors=('regex',), got {vs.source_detectors!r}"
     )
     await p.aclose()
+
+
+# ── Per-text filtering at prewarm ──────────────────────────────────────
+
+
+async def test_prewarm_filters_synth_per_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Critical: prewarm writes per-text-scoped match lists, NOT the
+    full vault-entry union to every text's slot. Without this, a
+    response text containing only one entity would get a cache value
+    listing every entity from anywhere in the original anonymize call,
+    and the next anonymize on that text would write spurious vault
+    entries for entities that aren't actually in the text.
+
+    Test shape:
+      1. Anonymize two texts, each containing a different email.
+      2. Deanonymize a response containing only ONE of the two
+         surrogates → restored response text contains only one email.
+      3. Anonymize the restored response text.
+      4. Vault entry for that anonymize call should contain ONLY the
+         one email — NOT a leaked entry for the other email from the
+         original turn.
+    """
+    p, mock_post = _setup(monkeypatch, llm_cache_max_size=0)
+
+    # Disable the LLM finding things (so regex is the sole detector
+    # that finds emails — pin source_detectors to ('regex',)).
+    def _no_entities():
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps({"entities": []})}}]
+        }
+        resp.text = ""
+        return resp
+    mock_post.return_value = _no_entities()
+
+    # Anonymize two texts with distinct emails.
+    text_a = "Contact alice@example.org for billing"
+    text_b = "Contact bob@example.com for support"
+    _, mapping = await p.anonymize([text_a, text_b], call_id="leak-1")
+    sur_a = next(s for s, o in mapping.items() if o == "alice@example.org")
+    sur_b = next(s for s, o in mapping.items() if o == "bob@example.com")
+
+    # Deanonymize a response that mentions ONLY alice's surrogate.
+    response = f"Acknowledged — billing routed to {sur_a}."
+    restored = await p.deanonymize([response], call_id="leak-1")
+    assert "alice@example.org" in restored[0]
+    assert "bob@example.com" not in restored[0]
+
+    # Anonymize the restored response text — pipeline cache hit
+    # should give us ONLY alice's match, not bob's. Otherwise the
+    # vault entry for this call would carry a stale bob-surrogate
+    # the substring replacer never applies.
+    _, mapping2 = await p.anonymize([restored[0]], call_id="leak-2")
+    originals = set(mapping2.values())
+    assert "alice@example.org" in originals
+    assert "bob@example.com" not in originals, (
+        "prewarm leaked an entity from a different text — synth "
+        "should be filtered per-text by substring presence"
+    )
+    await p.aclose()
+
+
+# ── Empty-text in batch ────────────────────────────────────────────────
+
+
+async def test_empty_text_in_batch_does_not_pollute_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty string in the texts list short-circuits at multiple
+    levels — `_detect_via_cache` returns [] for empty input, the
+    pipeline-cache prewarm guard skips empty restored texts, and
+    `_safe_pipeline_put`'s defensive guard catches any escapees.
+    Pin that no slot is written for empty input so a future
+    `anonymize([""])` doesn't get a cached match list."""
+    p, _ = _setup(monkeypatch, llm_cache_max_size=0)
+
+    # Anonymize a real text; no empty-text mix yet — pure baseline.
+    await p.anonymize(["Email alice@example.org"], call_id="empty-1")
+    pre_size = p.stats()["pipeline_cache_size"]
+
+    # Deanonymize with an empty response in the batch.
+    restored = await p.deanonymize(["", "no entities here"], call_id="empty-1")
+    assert restored == ["", "no entities here"]
+
+    # The pipeline cache should NOT have grown by an entry keyed on
+    # empty text. Two new slots possible at most: one for the
+    # non-empty restored text. The empty text must not contribute.
+    post_size = p.stats()["pipeline_cache_size"]
+    # The non-empty text is short enough that its filtered synth
+    # list is empty (no surrogate's original is in "no entities here").
+    # Even so, an empty-list slot may be written for it. The empty
+    # text must NOT contribute a slot.
+    assert post_size - pre_size <= 1, (
+        f"expected at most 1 new pipeline-cache slot from prewarm "
+        f"(only the non-empty text), got {post_size - pre_size}"
+    )
+    await p.aclose()
+
+
+# ── Detector dropped between anonymize and deanonymize ─────────────────
+
+
+async def test_prewarm_skips_detectors_missing_from_vault_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Anonymize with detector_mode override that excludes the LLM,
+    then deanonymize. The vault entry's `kwargs` only carries regex,
+    so prewarm must skip the LLM per-detector cache (no kwargs to
+    construct a key with). Pins that DETECTOR_MODE-drift between
+    anonymize and deanonymize doesn't crash prewarm."""
+    import logging
+
+    from anonymizer_guardrail.api import Overrides
+
+    p, mock_post = _setup(monkeypatch)
+
+    # Anonymize with regex-only override → vault entry kwargs only
+    # has 'regex'.
+    user_text = "Email alice@example.org"
+    _, mapping = await p.anonymize(
+        [user_text], call_id="drift-1",
+        overrides=Overrides(detector_mode=("regex",)),
+    )
+    surrogate = next(s for s, o in mapping.items() if o == "alice@example.org")
+
+    # Deanonymize a response — `self._detectors` still has llm
+    # configured, but the vault entry's kwargs only has regex.
+    response = f"Confirmed contact {surrogate} on file."
+    with caplog.at_level(logging.DEBUG, logger="anonymizer.pipeline"):
+        restored = await p.deanonymize([response], call_id="drift-1")
+
+    # Round-trip survives despite the kwargs-mismatch.
+    assert "alice@example.org" in restored[0]
+
+    # The skip is logged at DEBUG so an operator investigating "why
+    # didn't my prewarm fire?" has a breadcrumb.
+    assert any(
+        "DETECTOR_MODE drift" in r.message and "llm" in r.message
+        for r in caplog.records
+    ), f"expected drift-skip log; got: {[r.message for r in caplog.records]}"
+    await p.aclose()

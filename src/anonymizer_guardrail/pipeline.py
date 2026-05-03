@@ -1054,17 +1054,27 @@ class Pipeline:
         synthesised matches to:
 
           1. The pipeline-level cache, keyed by `(text, detector_mode,
-             kwargs)` reconstructed from the vault entry — every text
-             gets the deduped Match list with `source_detectors`
-             attribution. Future identical-overrides requests for the
-             same restored text hit in one shot.
+             kwargs)` reconstructed from the vault entry. Each text
+             gets the subset of vault surrogates whose original
+             actually appears in that text — matches what real
+             detection on that text alone would produce. Future
+             identical-overrides requests for the same restored text
+             hit in one shot.
           2. Each active cache-using detector's per-detector cache,
-             filtered by `source_detectors` per surrogate. Only entities
-             that THAT detector independently found land in its slot —
-             so per-detector cache hit/miss stats stay meaningful, and
-             override-fragmented requests where some detectors' kwargs
-             match this call's hit per-detector caches even when the
-             pipeline cache misses.
+             filtered TWICE: by `source_detectors` per surrogate (only
+             entities that THAT detector independently found) AND by
+             per-text presence (only entities actually substring-
+             present in this text). Per-detector cache hit/miss stats
+             stay meaningful AND match what a real `det.detect(text)`
+             call would have produced.
+
+        Per-text filtering matters: without it, a text whose only
+        match is `[PERSON_A]` would get a cache slot containing
+        BOTH `[PERSON_A]` and unrelated surrogates from other texts
+        in the same vault entry. A future cache hit on that text
+        would then write the unrelated surrogates into the next
+        request's vault — bloat that scales with `surrogates × texts`
+        per round-trip.
 
         Both writes use the cache layer's "compute on miss, return
         cached on hit" semantics: real-detection results aren't
@@ -1075,9 +1085,9 @@ class Pipeline:
         if not entry.surrogates:
             return
 
-        # Build the synthesised (Match, sources) list once. Used by
-        # both writes — pipeline cache stores the full list verbatim;
-        # per-detector caches use a filtered view per detector.
+        # Build the full synthesised (Match, sources) list once. Used
+        # as the unfiltered source — per-text filtering happens inside
+        # the loop below.
         synth: list[MatchWithSources] = []
         for vs in entry.surrogates.values():
             synth.append((
@@ -1085,29 +1095,19 @@ class Pipeline:
                 vs.source_detectors,
             ))
 
-        tasks: list[asyncio.Task] = []
-
-        # 1. Pipeline cache writes — one per restored text, keyed by
-        #    the same shape detect-side computes.
-        if self._pipeline_cache.enabled:
-            for text in restored:
-                key: PipelineCacheKey = (text, entry.detector_mode, entry.kwargs)
-                tasks.append(
-                    asyncio.create_task(
-                        self._safe_pipeline_put(key, list(synth)),
-                    )
-                )
-
-        # 2. Per-detector cache writes — for each active cache-using
-        #    detector, build the filtered match list and the
-        #    detector-specific cache key. Skip detectors not in the
-        #    vault entry's kwargs (DETECTOR_MODE override changed
-        #    between anonymize and deanonymize, no kwargs to use).
+        # Reconstruct kwargs as dicts once per call (not per text/
+        # per detector). Used for per-detector cache key construction.
         kwargs_by_detector: dict[str, dict[str, Any]] = {
             name: {key: value for key, value in frozen}
             for name, frozen in entry.kwargs
         }
         cache_using = {spec.name for spec in SPECS_WITH_CACHE}
+        # Snapshot active cache-using detectors with their cache +
+        # cache_key_for handles. Skip detectors absent from the vault
+        # entry's kwargs (config drift between anonymize and
+        # deanonymize: DETECTOR_MODE change, fresh process, etc.) —
+        # we can't construct a correct cache key without their kwargs.
+        active_detectors: list[tuple[str, Any, Callable[..., Any], dict[str, Any]]] = []
         for det in self._detectors:
             if det.name not in cache_using:
                 continue
@@ -1118,32 +1118,55 @@ class Pipeline:
                 continue
             kwargs = kwargs_by_detector.get(det.name)
             if kwargs is None:
-                # This detector wasn't part of the original anonymize
-                # call (DETECTOR_MODE differed). Without kwargs we
-                # can't construct a correct cache key — skip rather
-                # than risk writing to the wrong slot.
+                log.debug(
+                    "prewarm: skipping per-detector cache for %s — "
+                    "no kwargs in vault entry (DETECTOR_MODE drift?)",
+                    det.name,
+                )
                 continue
             cache_key_for = getattr(det, "cache_key_for", None)
             if cache_key_for is None:
                 continue
-            # Filter: only matches this detector independently found.
-            filtered = [
-                Match(text=vs.original, entity_type=vs.entity_type)
-                for vs in entry.surrogates.values()
-                if det.name in vs.source_detectors
+            active_detectors.append((det.name, cache, cache_key_for, kwargs))
+
+        tasks: list[asyncio.Task] = []
+        for text in restored:
+            # Empty / whitespace-only restored text doesn't need a
+            # cache slot — `_detect_via_cache` short-circuits empty
+            # text at detect time, so any slot keyed on empty input
+            # would never be looked up. Skip cleanly.
+            if not text or not text.strip():
+                continue
+
+            # Per-text filter: only surrogates whose original actually
+            # appears in this text. Substring match mirrors what real
+            # detection produces — a detector running on this text
+            # alone could only return matches present in it.
+            text_synth: list[MatchWithSources] = [
+                (m, sources) for m, sources in synth if m.text in text
             ]
-            if not filtered:
-                # This detector found nothing — still warm the slot
-                # with an empty result so a future identical request
-                # gets a hit-with-empty-list rather than running
-                # detection again. Same shape `_detect_via_cache`
-                # would write on a cold call that returned no matches.
-                pass
-            for text in restored:
+
+            # 1. Pipeline cache write for this text.
+            if self._pipeline_cache.enabled:
+                key: PipelineCacheKey = (text, entry.detector_mode, entry.kwargs)
+                tasks.append(
+                    asyncio.create_task(self._safe_pipeline_put(key, text_synth)),
+                )
+
+            # 2. Per-detector cache writes for this text — filter by
+            #    source_detectors (this detector found it) AND by
+            #    per-text presence (already done via text_synth).
+            #    Empty-list slots are written intentionally: a detector
+            #    that found nothing in this text *should* return [] on
+            #    a future cache hit, matching real-detection output.
+            for det_name, cache, cache_key_for, kwargs in active_detectors:
+                filtered = [
+                    m for m, sources in text_synth if det_name in sources
+                ]
                 tasks.append(
                     asyncio.create_task(
                         self._safe_detector_warm(
-                            det.name, cache, cache_key_for,
+                            det_name, cache, cache_key_for,
                             text, kwargs, filtered,
                         ),
                     )
@@ -1161,14 +1184,20 @@ class Pipeline:
     ) -> None:
         """Best-effort wrapper for one pipeline-cache prewarm write.
         Logs and swallows any exception so a single bad slot can't
-        break the deanonymize round-trip."""
+        break the deanonymize round-trip. Empty-text guard mirrors
+        `_safe_detector_warm` for parity — `_prewarm_caches` already
+        skips empty texts in the outer loop, but the guard keeps a
+        future direct caller honest."""
+        text = key[0]
+        if not text or not text.strip():
+            return
         try:
             await self._pipeline_cache.put(key, synth)
         except Exception:
             log.exception(
                 "pipeline cache prewarm put failed key=(text_len=%d, "
                 "detector_mode=%r) — continuing",
-                len(key[0]), key[1],
+                len(text), key[1],
             )
 
     async def _safe_detector_warm(
