@@ -93,14 +93,24 @@ class LaunchConfig:
     # Keys are detector names; values are "service" / "external" / "" (skip).
     backends: dict[str, str] = field(default_factory=dict)
 
-    # Redis infrastructure backend. "service" → auto-start the shared
-    # `anonymizer-redis` container and inject VAULT_REDIS_URL +
-    # CACHE_REDIS_URL into the guardrail env. "external" → operator
-    # supplies the URLs themselves (via env or `-e` extras). Empty
-    # → no Redis machinery; the guardrail uses memory backends. Same
-    # vocabulary as the per-detector backends so the CLI / preset
-    # surface stays uniform.
-    redis_backend: str = ""
+    # Redis backend selection — split per side so vault and cache can
+    # resolve independently. Common combinations:
+    #
+    #   * Both empty: no Redis at all (memory backends).
+    #   * vault_redis_backend=service, cache_redis_backend="" :
+    #     vault on shared anonymizer-redis, cache stays memory.
+    #   * Both =service : single anonymizer-redis container backs both;
+    #     URL injection separates them via DB index (vault → /0,
+    #     cache → /1).
+    #   * vault_redis_backend=external, cache_redis_backend=service :
+    #     operator's external Redis for vault, shared container for cache.
+    #
+    # The launcher auto-starts the shared `anonymizer-redis` container
+    # when EITHER side picks "service" — we never run two redis
+    # containers (the operator wanting different redis instances picks
+    # external for one or both sides and supplies the URL).
+    vault_redis_backend: str = ""
+    cache_redis_backend: str = ""
 
     # Per-detector service-variant selection. Empty / missing = use
     # the LauncherSpec's default `service`; a string keys into
@@ -201,21 +211,24 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
         if val:
             env_args.extend(["-e", f"{var}={val}"])
 
-    # Auto-started Redis: inject VAULT_REDIS_URL + CACHE_REDIS_URL so
-    # presets / configs that select redis backends Just Work without
-    # the operator having to wire URLs themselves. Distinct logical
-    # DB indices (vault → /0, cache → /1) keep the two namespaces
-    # from colliding so operators can `FLUSHDB` one without wiping
-    # the other. Override any operator-supplied values from the
-    # cross-cutting loop above — the auto-started container is the
-    # canonical source for those URLs (same pattern as detector
-    # services overriding `*_URL` from `guardrail_env_when_started`).
+    # Auto-started Redis: inject the URL for whichever side(s)
+    # picked `redis_backend=service`. Distinct logical DB indices
+    # (vault → /0, cache → /1) keep the namespaces separate so
+    # operators can `FLUSHDB` one without wiping the other.
+    #
+    # We inject ONLY the side(s) using "service" — leaving the
+    # other side's URL alone. An operator with vault=service +
+    # cache=external sets `CACHE_REDIS_URL` themselves (via env or
+    # a `-e` extra); auto-injecting `CACHE_REDIS_URL=redis://anonymizer-redis:6379/1`
+    # would silently override that. Same pattern as detector
+    # services only overriding `*_URL` for the side they auto-started.
     if redis_was_started():
         redis_host = "anonymizer-redis"  # SHARED_NETWORK hostname
-        injected = {
-            "VAULT_REDIS_URL": f"redis://{redis_host}:6379/0",
-            "CACHE_REDIS_URL": f"redis://{redis_host}:6379/1",
-        }
+        injected: dict[str, str] = {}
+        if getattr(cfg, "vault_redis_backend", "") == "service":
+            injected["VAULT_REDIS_URL"] = f"redis://{redis_host}:6379/0"
+        if getattr(cfg, "cache_redis_backend", "") == "service":
+            injected["CACHE_REDIS_URL"] = f"redis://{redis_host}:6379/1"
         # Replace any earlier `-e VAR=…` for these keys (mirrors the
         # detector-side override loop's already_set_keys reconciler).
         for k, v in injected.items():

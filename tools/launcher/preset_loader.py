@@ -77,12 +77,20 @@ class LauncherPreset(BaseModel):
     pf_backend: Literal["service", "external", ""] = ""
     gliner_backend: Literal["service", "external", ""] = ""
 
-    # Shared Redis infrastructure backend (used by VAULT_BACKEND=redis
-    # and `<DETECTOR>_CACHE_BACKEND=redis`). "service" → auto-start a
-    # bundled Redis container and inject the URLs; "external" →
-    # operator supplies the URLs; empty → no Redis (memory backends
-    # everywhere). Same shape as the per-detector backend fields.
-    redis_backend: Literal["service", "external", ""] = ""
+    # Per-side Redis backend selection. The launcher runs at most one
+    # shared `anonymizer-redis` container even when both sides pick
+    # service (each side gets its own logical DB index). External =
+    # operator supplies the matching URL via env or CLI.
+    #
+    #   vault_redis_backend  → drives VAULT_BACKEND=redis routing
+    #   cache_redis_backend  → drives `<DETECTOR>_CACHE_BACKEND=redis` routing
+    #
+    # Empty on either field means "this side stays on its memory
+    # backend"; explicit env_overrides like `VAULT_BACKEND: redis` are
+    # what *select* redis for that side, the *_redis_backend field
+    # then picks where the redis comes from.
+    vault_redis_backend: Literal["service", "external", ""] = ""
+    cache_redis_backend: Literal["service", "external", ""] = ""
 
     # Per-detector service-variant selection. Mirrors LaunchConfig's
     # `service_variants` dict — keys are detector names, values are

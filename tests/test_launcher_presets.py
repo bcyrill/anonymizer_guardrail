@@ -385,11 +385,13 @@ def test_bundled_vault_redis_preset_pins_backend_and_env() -> None:
     """vault-redis must (a) auto-start the shared Redis container and
     (b) set VAULT_BACKEND=redis. Pin both — operator picking the
     preset expects the vault to actually use redis, not the memory
-    backend with redis side-running."""
+    backend with redis side-running. Cache side stays empty so we
+    don't auto-inject CACHE_REDIS_URL when no cache uses redis."""
     from tools.launcher.preset_loader import load_presets
 
     vr = load_presets()["vault-redis"].spec
-    assert vr.redis_backend == "service"
+    assert vr.vault_redis_backend == "service"
+    assert vr.cache_redis_backend == ""
     assert vr.env_overrides["VAULT_BACKEND"] == "redis"
 
 
@@ -398,28 +400,36 @@ def test_bundled_pf_cache_redis_pins_backend_and_cache_env() -> None:
     AND select PRIVACY_FILTER_CACHE_BACKEND=redis so the PF detector
     actually routes its result cache through redis. Plus the HF
     variant — matches `privacy-filter-service`'s choice for the same
-    rationale."""
+    rationale. Vault side stays empty so we don't auto-inject
+    VAULT_REDIS_URL when vault stays on memory."""
     from tools.launcher.preset_loader import load_presets
 
     pf = load_presets()["pf-cache-redis"].spec
     assert pf.pf_backend == "service"
-    assert pf.redis_backend == "service"
+    assert pf.cache_redis_backend == "service"
+    assert pf.vault_redis_backend == ""
     assert pf.service_variants == {"privacy_filter": "hf"}
     assert pf.env_overrides["PRIVACY_FILTER_CACHE_BACKEND"] == "redis"
 
 
-def test_apply_preset_writes_redis_backend() -> None:
-    """`_apply_preset` must propagate `redis_backend` from the spec
-    into `cfg.redis_backend` so `auto_start_services` knows to fire
-    `start_redis`. Pin so a refactor that drops the apply step
-    silently regresses every redis-using preset to memory backends."""
+def test_apply_preset_writes_redis_backend_per_side() -> None:
+    """`_apply_preset` must propagate the per-side redis backend
+    fields from the spec into `cfg`. Pin so a refactor that drops the
+    apply step silently regresses every redis-using preset to memory
+    backends."""
     from tools.launcher.main import _apply_preset
     from tools.launcher.runner import LaunchConfig
 
     cfg = LaunchConfig()
     _apply_preset(cfg, "vault-redis")
-    assert cfg.redis_backend == "service"
+    assert cfg.vault_redis_backend == "service"
+    assert cfg.cache_redis_backend == ""  # not touched
     assert cfg.env_overrides["VAULT_BACKEND"] == "redis"
+
+    cfg2 = LaunchConfig()
+    _apply_preset(cfg2, "pf-cache-redis")
+    assert cfg2.cache_redis_backend == "service"
+    assert cfg2.vault_redis_backend == ""
 
 
 def test_apply_preset_writes_service_variants() -> None:

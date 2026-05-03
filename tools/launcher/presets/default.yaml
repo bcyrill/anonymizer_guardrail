@@ -149,7 +149,7 @@ presets:
   vault-redis:
     detector_mode: regex
     use_faker: false
-    redis_backend: service
+    vault_redis_backend: service
     env_overrides:
       VAULT_BACKEND: redis
       REGEX_OVERLAP_STRATEGY: longest
@@ -164,7 +164,7 @@ presets:
     detector_mode: privacy_filter
     use_faker: false
     pf_backend: service
-    redis_backend: service
+    cache_redis_backend: service
     service_variants:
       privacy_filter: hf
     env_overrides:

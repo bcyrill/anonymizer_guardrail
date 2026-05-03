@@ -482,7 +482,14 @@ def auto_start_services(
     # network reachability — Redis is fast-ready (~1s) so any
     # detector race is benign — but starting it first keeps the
     # operator-facing log lines in a sensible order.)
-    if getattr(cfg, "redis_backend", "") == "service":
+    #
+    # Single shared container even when both vault and cache pick
+    # service — they coexist in different DB indices via the URL
+    # injection in runner.py.
+    if (
+        getattr(cfg, "vault_redis_backend", "") == "service"
+        or getattr(cfg, "cache_redis_backend", "") == "service"
+    ):
         start_redis(engine)
         started.append(_REDIS_NAME)
     for det_name, backend in cfg.backends.items():

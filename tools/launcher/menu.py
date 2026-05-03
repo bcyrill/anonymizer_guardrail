@@ -584,6 +584,48 @@ class LauncherApp(App):
         salt_label = "set (stable)" if cfg.surrogate_salt else "random per restart"
         items.append(_row("surrogate_salt", "Surrogate salt", salt_label))
 
+        # Vault: memory|redis (env_overrides["VAULT_BACKEND"]). The
+        # follow-up rows (vault_redis_backend, vault_redis_url) only
+        # render when the operator picked redis — collapsing the
+        # not-yet-relevant rows keeps the General section tidy for
+        # the common memory-backend deployment.
+        # No indent on the conditional rows — matches the existing
+        # convention for follow-up rows like `privacy_filter_url`
+        # (only shown when backend=external) which sit flush with
+        # their siblings rather than sub-bulleted.
+        vault_state = cfg.env_overrides.get("VAULT_BACKEND", "memory")
+        items.append(_row("vault", "Vault", vault_state))
+        if vault_state == "redis":
+            items.append(_row(
+                "vault_redis_backend", "Vault backend",
+                cfg.vault_redis_backend or "(unset)",
+            ))
+            if cfg.vault_redis_backend == "external":
+                items.append(_row(
+                    "vault_redis_url", "Vault Redis URL",
+                    cfg.env_overrides.get("VAULT_REDIS_URL", "(unset)"),
+                ))
+
+        # Cache backend / URL: shown only when AT LEAST ONE active
+        # detector picked redis for its result cache. Mirrors the
+        # vault flow above. We check the per-detector cache backend
+        # env vars rather than tracking a separate cfg flag — the
+        # env_overrides dict is the canonical source.
+        cache_keys = ("LLM_CACHE_BACKEND", "PRIVACY_FILTER_CACHE_BACKEND", "GLINER_PII_CACHE_BACKEND")
+        any_cache_redis = any(
+            cfg.env_overrides.get(k, "memory") == "redis" for k in cache_keys
+        )
+        if any_cache_redis:
+            items.append(_row(
+                "cache_redis_backend", "Cache backend",
+                cfg.cache_redis_backend or "(unset)",
+            ))
+            if cfg.cache_redis_backend == "external":
+                items.append(_row(
+                    "cache_redis_url", "Cache Redis URL",
+                    cfg.env_overrides.get("CACHE_REDIS_URL", "(unset)"),
+                ))
+
         # ── Detectors meta ────────────────────────────────────────────────
         items.append(Separator())
         items.append(_header("Detectors", hint=cfg.detector_mode))
@@ -644,6 +686,13 @@ class LauncherApp(App):
                 "privacy_filter_fail", "Fail mode",
                 "open" if cfg.env_overrides.get("PRIVACY_FILTER_FAIL_CLOSED") == "false" else "closed",
             ))
+            # Per-detector cache type. Picking redis surfaces the
+            # General-section rows for cache_redis_backend + (when
+            # external) cache_redis_url.
+            items.append(_row(
+                "pf_cache", "Cache",
+                cfg.env_overrides.get("PRIVACY_FILTER_CACHE_BACKEND", "memory"),
+            ))
 
         if "gliner_pii" in active:
             items.append(Separator())
@@ -666,6 +715,10 @@ class LauncherApp(App):
             items.append(_row(
                 "gliner_pii_fail", "Fail mode",
                 "open" if cfg.env_overrides.get("GLINER_PII_FAIL_CLOSED") == "false" else "closed",
+            ))
+            items.append(_row(
+                "gliner_pii_cache", "Cache",
+                cfg.env_overrides.get("GLINER_PII_CACHE_BACKEND", "memory"),
             ))
 
         if "llm" in active:
@@ -693,6 +746,10 @@ class LauncherApp(App):
             items.append(_row(
                 "llm_fail", "Fail mode",
                 "open" if cfg.env_overrides.get("LLM_FAIL_CLOSED") == "false" else "closed",
+            ))
+            items.append(_row(
+                "llm_cache", "Cache",
+                cfg.env_overrides.get("LLM_CACHE_BACKEND", "memory"),
             ))
 
         # ── Faker ─────────────────────────────────────────────────────────
@@ -911,6 +968,86 @@ class LauncherApp(App):
                 lambda v: self._set("faker_locale", v),
                 help_text="Comma-separated, e.g. 'pt_BR,en_US'. Empty = en_US default.",
             )
+        # ── Vault + cache redis dispatch ──────────────────────────────
+        # Two parallel flows (vault + cache) that toggle memory/redis
+        # at the per-detector layer and surface follow-up rows
+        # (service/external + URL) only when redis is picked. Each
+        # flow's intermediate rows live in the General section
+        # because the rows are conditional on cross-detector state
+        # (vault is one boolean; cache is "any active detector with
+        # redis"). Putting them inline inside one detector's section
+        # would mis-attribute the choice when other detectors share it.
+        elif key == "vault":
+            self._pick(
+                "Vault backend",
+                [
+                    ("memory", "memory (process-local, default)"),
+                    ("redis", "redis (shared across replicas, restart-persistent)"),
+                ],
+                cfg.env_overrides.get("VAULT_BACKEND", "memory"),
+                self._set_vault_backend,
+            )
+        elif key == "vault_redis_backend":
+            self._pick(
+                "Vault Redis source",
+                [
+                    ("service", "service (auto-start anonymizer-redis)"),
+                    ("external", "external (operator-supplied URL)"),
+                ],
+                cfg.vault_redis_backend or "service",
+                lambda v: self._set("vault_redis_backend", v),
+            )
+        elif key == "vault_redis_url":
+            # Friendly title (matches the row label) rather than the
+            # raw env var name — operators clicked "Vault Redis URL"
+            # and expect to see the same wording on the modal.
+            self._text(
+                "Vault Redis URL",
+                cfg.env_overrides.get("VAULT_REDIS_URL", ""),
+                lambda v: self._set_env("VAULT_REDIS_URL", v),
+                help_text="Required when Vault backend = external. e.g. redis://host:6379/0 — sets VAULT_REDIS_URL.",
+            )
+        elif key in ("llm_cache", "pf_cache", "gliner_pii_cache"):
+            # Per-detector cache type picker. The env-var mapping is
+            # `<DETECTOR>_CACHE_BACKEND` (memory|redis). Picking
+            # redis surfaces the General-section cache_redis_backend
+            # row on the next refresh.
+            env_var = {
+                "llm_cache": "LLM_CACHE_BACKEND",
+                "pf_cache": "PRIVACY_FILTER_CACHE_BACKEND",
+                "gliner_pii_cache": "GLINER_PII_CACHE_BACKEND",
+            }[key]
+            label = {
+                "llm_cache": "LLM cache",
+                "pf_cache": "Privacy-filter cache",
+                "gliner_pii_cache": "GLiNER-PII cache",
+            }[key]
+            self._pick(
+                label,
+                [
+                    ("memory", "memory (in-process LRU, default)"),
+                    ("redis", "redis (shared, opt into Cache backend in General)"),
+                ],
+                cfg.env_overrides.get(env_var, "memory"),
+                lambda v, ev=env_var: self._set_cache_backend(ev, v),
+            )
+        elif key == "cache_redis_backend":
+            self._pick(
+                "Cache Redis source",
+                [
+                    ("service", "service (auto-start anonymizer-redis)"),
+                    ("external", "external (operator-supplied URL)"),
+                ],
+                cfg.cache_redis_backend or "service",
+                lambda v: self._set("cache_redis_backend", v),
+            )
+        elif key == "cache_redis_url":
+            self._text(
+                "Cache Redis URL",
+                cfg.env_overrides.get("CACHE_REDIS_URL", ""),
+                lambda v: self._set_env("CACHE_REDIS_URL", v),
+                help_text="Required when Cache backend = external. e.g. redis://host:6379/1 — sets CACHE_REDIS_URL.",
+            )
 
     # ── Modal helpers ─────────────────────────────────────────────────────
     def _text(
@@ -980,6 +1117,27 @@ class LauncherApp(App):
             self.cfg.backends[det] = value
         else:
             self.cfg.backends.pop(det, None)
+
+    def _set_vault_backend(self, value: str) -> None:
+        """Set VAULT_BACKEND and default the redis source on first
+        flip-to-redis. Without the default, the conditional "Vault
+        backend" row would render "(unset)" until the operator
+        clicked through it — extra friction for the obvious-default
+        case (operator picked redis ⇒ they probably want auto-start).
+        Toggling back to memory leaves `vault_redis_backend` alone so
+        a later re-toggle preserves the previous choice."""
+        self._set_env("VAULT_BACKEND", value)
+        if value == "redis" and not self.cfg.vault_redis_backend:
+            self.cfg.vault_redis_backend = "service"
+
+    def _set_cache_backend(self, env_var: str, value: str) -> None:
+        """Set `<DETECTOR>_CACHE_BACKEND` and default
+        `cfg.cache_redis_backend` to "service" on first flip of any
+        detector cache to redis. Mirrors `_set_vault_backend` —
+        same friction-reducing rationale."""
+        self._set_env(env_var, value)
+        if value == "redis" and not self.cfg.cache_redis_backend:
+            self.cfg.cache_redis_backend = "service"
 
     def _set_pf_variant(self, value: str) -> None:
         """Store the privacy-filter variant on the LaunchConfig. The

@@ -259,37 +259,83 @@ def test_show_presets_table_renders_service_variants() -> None:
     assert "privacy_filter=hf" in rendered
 
 
-def test_runner_injects_redis_urls_when_redis_was_started(
+def test_runner_injects_vault_redis_url_only_when_vault_is_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When Redis is auto-started, the runner must inject
-    VAULT_REDIS_URL=redis://anonymizer-redis:6379/0 and
-    CACHE_REDIS_URL=…/1 into the guardrail container env. Distinct
-    DB indices keep the vault and cache namespaces separate.
-    Operator-supplied URLs (via env) get overridden — the auto-started
-    container is the canonical source. Pin so a refactor that drops
-    the URL-injection block doesn't silently route the guardrail at a
-    nonexistent URL."""
+    """When ONLY vault picks redis-service, the runner must inject
+    VAULT_REDIS_URL but NOT CACHE_REDIS_URL — auto-injecting the
+    cache URL would silently route a memory-backed cache at a
+    nonexistent path. Per-side semantics matter for operators
+    mixing redis/memory across vault and cache."""
     from tools.launcher import services as services_mod
 
-    # Simulate redis was started in this process.
     monkeypatch.setattr(
         services_mod, "_STARTED_SERVICES", {services_mod._REDIS_NAME},
     )
-    # Operator also has VAULT_REDIS_URL set in their env — auto-start
-    # must override.
     monkeypatch.setenv("VAULT_REDIS_URL", "redis://operator-supplied:9999/5")
     monkeypatch.setenv("VAULT_BACKEND", "redis")
 
-    cfg = LaunchConfig(detector_mode="regex")
+    cfg = LaunchConfig(
+        detector_mode="regex",
+        vault_redis_backend="service",
+        cache_redis_backend="",        # cache stays memory
+    )
+    argv = build_run_argv(_FakeEngine(), cfg)
+    env = _argv_to_env_dict(argv)
+
+    # Vault URL injected (overrides operator env).
+    assert env["VAULT_REDIS_URL"] == "redis://anonymizer-redis:6379/0"
+    # Cache URL NOT injected — operator didn't pick redis for cache.
+    assert "CACHE_REDIS_URL" not in env
+    assert env["VAULT_BACKEND"] == "redis"
+
+
+def test_runner_injects_both_urls_when_both_sides_are_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both sides on service → both URLs injected, distinct DB indices."""
+    from tools.launcher import services as services_mod
+
+    monkeypatch.setattr(
+        services_mod, "_STARTED_SERVICES", {services_mod._REDIS_NAME},
+    )
+    cfg = LaunchConfig(
+        detector_mode="regex",
+        vault_redis_backend="service",
+        cache_redis_backend="service",
+    )
     argv = build_run_argv(_FakeEngine(), cfg)
     env = _argv_to_env_dict(argv)
 
     assert env["VAULT_REDIS_URL"] == "redis://anonymizer-redis:6379/0"
     assert env["CACHE_REDIS_URL"] == "redis://anonymizer-redis:6379/1"
-    # The operator's VAULT_BACKEND=redis still flows through (not an
-    # auto-injected URL — just an env passthrough).
-    assert env["VAULT_BACKEND"] == "redis"
+
+
+def test_runner_injects_cache_url_only_when_cache_is_service_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the vault-only test: cache=service, vault=external/empty
+    → only CACHE_REDIS_URL injected. Operator-supplied VAULT_REDIS_URL
+    flows through the cross-cutting passthrough untouched."""
+    from tools.launcher import services as services_mod
+
+    monkeypatch.setattr(
+        services_mod, "_STARTED_SERVICES", {services_mod._REDIS_NAME},
+    )
+    monkeypatch.setenv("VAULT_REDIS_URL", "redis://external-vault:9999/5")
+
+    cfg = LaunchConfig(
+        detector_mode="regex",
+        vault_redis_backend="external",
+        cache_redis_backend="service",
+    )
+    argv = build_run_argv(_FakeEngine(), cfg)
+    env = _argv_to_env_dict(argv)
+
+    # Cache URL injected for the auto-started side.
+    assert env["CACHE_REDIS_URL"] == "redis://anonymizer-redis:6379/1"
+    # Vault URL flows through unchanged from operator env.
+    assert env["VAULT_REDIS_URL"] == "redis://external-vault:9999/5"
 
 
 def test_runner_does_not_inject_redis_urls_when_redis_not_started(
@@ -301,7 +347,6 @@ def test_runner_does_not_inject_redis_urls_when_redis_not_started(
     passthrough loop."""
     from tools.launcher import services as services_mod
 
-    # Make sure nothing was "started" in this test.
     monkeypatch.setattr(services_mod, "_STARTED_SERVICES", set())
     monkeypatch.setenv("VAULT_REDIS_URL", "redis://operator-supplied:9999/5")
 
@@ -309,11 +354,7 @@ def test_runner_does_not_inject_redis_urls_when_redis_not_started(
     argv = build_run_argv(_FakeEngine(), cfg)
     env = _argv_to_env_dict(argv)
 
-    # Operator value flows through (cross-cutting passthrough), not
-    # the auto-injected /0 URL.
     assert env["VAULT_REDIS_URL"] == "redis://operator-supplied:9999/5"
-    # CACHE_REDIS_URL wasn't set in env, no auto-start — should be
-    # absent entirely.
     assert "CACHE_REDIS_URL" not in env
 
 
