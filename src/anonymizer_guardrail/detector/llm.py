@@ -295,8 +295,15 @@ class LLMDetector(BaseRemoteDetector):
         """Default-overrides cache key shape — must match what
         `detect()` produces when called with `model=None,
         prompt_name=None`. Used by the deanonymize-side cache
-        prewarm path."""
-        return (text, self.model, "default")
+        prewarm path.
+
+        `self.model` is stripped to mirror `detect()`'s
+        `(model or self.model).strip() or self.model` resolution —
+        otherwise an operator who configured `LLM_MODEL=" name "`
+        would prewarm one slot and read another.
+        """
+        effective_model = self.model.strip() or self.model
+        return (text, effective_model, "default")
 
     async def detect(
         self,

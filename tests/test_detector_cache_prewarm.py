@@ -315,3 +315,114 @@ async def test_prewarm_does_not_fire_when_flag_off(
         "expected real detection on response text when prewarm is off"
     )
     await p.aclose()
+
+
+# ── LLM cache-key parity ───────────────────────────────────────────────
+
+
+async def test_llm_default_cache_key_strips_model_whitespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`detect()` resolves `effective_model = (model or self.model).strip()
+    or self.model`. The prewarm-side `_default_cache_key` MUST mirror
+    the same strip — otherwise an operator-misconfigured
+    `LLM_MODEL=" anonymize "` writes prewarm to the unstripped slot
+    while real `detect()` reads the stripped slot, and the prewarm
+    silently never hits.
+
+    This test pins the slot equality by constructing both keys and
+    asserting they're identical for a model carrying surrounding
+    whitespace."""
+    from anonymizer_guardrail.detector.llm import LLMDetector
+
+    det = LLMDetector.__new__(LLMDetector)  # bypass httpx wiring
+    det.model = "  llm-anonymize  "
+
+    prewarm_key = det._default_cache_key("hello")
+
+    # Reconstruct what `detect(model=None, prompt_name=None)` would
+    # produce — same logic, inlined here so the test pins the parity
+    # rather than just calling the same code on both sides.
+    effective_model = (None or det.model).strip() or det.model
+    detect_key = ("hello", effective_model, "default")
+
+    assert prewarm_key == detect_key, (
+        f"slot mismatch: prewarm={prewarm_key!r} detect={detect_key!r}"
+    )
+
+
+# ── Resilience: prewarm failure must not break deanonymize ─────────────
+
+
+async def test_prewarm_failure_does_not_break_deanonymize(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Prewarm is best-effort: if `_default_cache_key` (or any other
+    step in the warm path) raises, deanonymize still returns the
+    restored text. The caller already received the substitution
+    work — a prewarm failure is purely a missed optimisation, not a
+    contract violation."""
+    p, mock_post = _setup_prewarm_pipeline(monkeypatch, prewarm=True)
+
+    user_text = "Please email alice@corp.example."
+    modified, mapping = await p.anonymize([user_text], call_id="boom-1")
+    surrogate = next(s for s, o in mapping.items() if o == "alice@corp.example")
+
+    # Sabotage the LLM detector's cache-key construction. Pipeline
+    # iterates self._detectors at deanonymize time and builds tasks
+    # for each cache-using detector → at least one task will raise.
+    llm_det = next(d for d in p._detectors if d.name == "llm")
+    monkeypatch.setattr(
+        llm_det, "_default_cache_key",
+        lambda text: (_ for _ in ()).throw(RuntimeError("synthetic prewarm failure")),
+    )
+
+    response_with_surrogate = f"Confirmed contact for {surrogate} on file."
+    with caplog.at_level(logging.ERROR, logger="anonymizer.pipeline"):
+        restored = await p.deanonymize([response_with_surrogate], call_id="boom-1")
+
+    # Round-trip survives: the substitution still happened.
+    assert "alice@corp.example" in restored[0]
+    # And the failure was logged — operator visibility into the missed
+    # prewarm without a request-time crash.
+    assert any(
+        "prewarm failed" in r.message and "detector=llm" in r.message
+        for r in caplog.records
+    ), f"expected prewarm-failure log; got: {[r.message for r in caplog.records]}"
+    await p.aclose()
+
+
+# ── warm_cache no-op when cache disabled ───────────────────────────────
+
+
+async def test_warm_cache_no_op_when_cache_disabled() -> None:
+    """`LLM_CACHE_MAX_SIZE=0` puts the detector cache in `enabled=False`
+    state — get_or_compute becomes a passthrough. `warm_cache` must
+    short-circuit before constructing the cache key (which would
+    otherwise be wasted work writing to a no-op cache).
+
+    Pinned via a synthetic detector with an in-memory cache built at
+    `max_size=0` and a `_default_cache_key` that raises if called —
+    asserts warm_cache returns without touching the key path."""
+    from anonymizer_guardrail.detector.base import Match
+    from anonymizer_guardrail.detector.cache_memory import InMemoryDetectionCache
+    from anonymizer_guardrail.detector.remote_base import BaseRemoteDetector
+
+    class _Sentinel(BaseRemoteDetector):
+        name = "sentinel"
+
+        def _default_cache_key(self, text: str):
+            raise AssertionError(
+                "warm_cache must short-circuit on disabled cache "
+                "before constructing the key"
+            )
+
+    det = _Sentinel.__new__(_Sentinel)  # skip httpx wiring
+    det._cache = InMemoryDetectionCache(max_size=0)
+    assert det._cache.enabled is False
+
+    # Should not raise.
+    await det.warm_cache(
+        "some text", [Match(text="x", entity_type="EMAIL_ADDRESS")],
+    )

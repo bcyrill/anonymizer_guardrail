@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from .api import Overrides
 from .config import config
@@ -868,11 +868,21 @@ class Pipeline:
         from polluting caches with OTHER-typed entries that would
         break surrogate consistency.
 
-        On a previously-populated cache slot, `warm_cache` does NOT
-        overwrite (`get_or_compute`'s contract is "compute on miss,
-        return cached on hit") — real detection's result wins over
-        synthesised matches when both paths happen to fire on the
-        same text.
+        Race semantics: prewarm and a concurrent real `detect()`
+        on the same key both call `get_or_compute`. Under Redis
+        the SET uses `nx=True` (first writer wins). The in-memory
+        backend is last-writer-wins by design (see
+        `cache_memory.py` — holding the lock across an LLM call
+        would defeat the per-detector concurrency cap). Both are
+        correctness-safe under the USE_FAKER=false boot invariant
+        because real-detection and synthesised matches are
+        deterministically equal on the same input (same model +
+        prompt + text → same matches), so whichever writer lands
+        last contributes the same value the other would have.
+
+        Best-effort: per-call failures are logged and skipped so
+        prewarm can never break the deanonymize round-trip the
+        caller already received its restored text for.
         """
         # Build a single synthesised Match list from the vault
         # entries — same list pre-warms every detector's cache slot
@@ -899,6 +909,7 @@ class Pipeline:
         cache_using = {
             spec.name for spec in SPECS_WITH_CACHE
         }
+        tasks: list[asyncio.Task] = []
         for det in self._detectors:
             if det.name not in cache_using:
                 continue
@@ -908,7 +919,38 @@ class Pipeline:
                 # may not have warm_cache. Skip rather than crash.
                 continue
             for text in restored:
-                await warm(text, synth)
+                tasks.append(
+                    asyncio.create_task(self._safe_warm(warm, det.name, text, synth))
+                )
+
+        if tasks:
+            # Gather rather than serialise: under a Redis-backed cache
+            # the sequential await would pay one RTT per (detector,
+            # text) pair on the deanonymize hot path. Independent
+            # writes have no ordering dependency, so let the event
+            # loop interleave them.
+            await asyncio.gather(*tasks)
+
+    async def _safe_warm(
+        self,
+        warm: Callable[[str, list[Match]], Awaitable[Any]],
+        det_name: str,
+        text: str,
+        synth: list[Match],
+    ) -> None:
+        """Best-effort wrapper around a single detector's warm_cache
+        call. Prewarm is purely a latency optimisation for the next
+        request — a failure here must not break the current
+        deanonymize round-trip (the caller already received its
+        restored text). Log the failure with enough detail to
+        diagnose, then continue."""
+        try:
+            await warm(text, synth)
+        except Exception:
+            log.exception(
+                "prewarm failed detector=%s text_len=%d — continuing",
+                det_name, len(text),
+            )
 
 
 __all__ = ["Pipeline"]
