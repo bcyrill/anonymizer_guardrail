@@ -22,8 +22,9 @@ Use it to:
 # Against a guardrail you're already running:
 scripts/detector_bench.sh --config bundled:pentest
 
-# Spawn a fresh test guardrail for the run, tear it down on exit:
-scripts/detector_bench.sh --config bundled:pentest --preset pentest
+# Spawn a fresh test guardrail for the run, tear it down on exit.
+# Run `scripts/launcher.sh --show-presets` for the full preset list.
+scripts/detector_bench.sh --config bundled:pentest --preset regex-pentest
 
 # Your own corpus, against a custom URL:
 BASE_URL=http://my-host:8000 \
@@ -67,16 +68,19 @@ waits for `/health`, runs the corpus, and tears the guardrail down on
 exit (override with `--keep`). Use this for one-shot comparisons:
 
 ```bash
-scripts/detector_bench.sh --config bundled:pentest --preset uuid-debug
-scripts/detector_bench.sh --config bundled:pentest --preset pentest
-scripts/detector_bench.sh --config bundled:pentest --preset regex-only
+scripts/detector_bench.sh --config bundled:pentest --preset regex-default
+scripts/detector_bench.sh --config bundled:pentest --preset regex-pentest
+scripts/detector_bench.sh --config bundled:pentest --preset gliner-pii-service
+scripts/detector_bench.sh --config bundled:pentest --preset regex-pentest-gliner-pii-service
 ```
 
-Each preset bundles a coherent `--type` / `--detector-mode` /
-backend choice — see the `_PRESETS` table in
-`tools/launcher/main.py`. To benchmark a configuration that doesn't
-match any preset (e.g. just `regex,denylist`), use
-the manual approach above.
+Each preset bundles a coherent `--type` / `--detector-mode` / backend
+choice — run `scripts/launcher.sh --show-presets` to see the full set
+and what each one applies. Operator-supplied preset files
+(`LAUNCHER_PRESETS_FILE` / `--presets-file`) work here too; the
+benchmark just shells out to `launcher.sh --preset NAME`. To benchmark
+a configuration that doesn't match any preset (e.g. just
+`regex,denylist`), use the manual approach above.
 
 The corpus's `overrides:` block layers
 [per-request overrides](per-request-overrides.md) on top of either
@@ -469,15 +473,17 @@ Run the same corpus against several configurations to see which mix
 wins for your traffic shape:
 
 ```bash
-# Regex + denylist only (no LLM round-trip, sub-millisecond per case)
-DETECTOR_MODE=regex,denylist \
-  scripts/detector_bench.sh --config bundled:pentest --preset regex-only
+# Regex only with the pentest pattern set (sub-millisecond per case)
+scripts/detector_bench.sh --config bundled:pentest --preset regex-pentest
 
-# Add the privacy_filter NER (~ms per case, picks up names/addresses)
-scripts/detector_bench.sh --config bundled:pentest --preset pentest
+# Add the gliner-pii NER (~ms per case, picks up names / orgs / IDs)
+scripts/detector_bench.sh --config bundled:pentest \
+  --preset regex-pentest-gliner-pii-service
 
-# Full stack (LLM round-trip per case, picks contextual entities too)
-scripts/detector_bench.sh --config bundled:pentest --preset pentest
+# Privacy-filter (HF variant) replaces gliner — different model, different
+# tradeoffs (see services/privacy_filter_hf/COMPARE.md).
+scripts/detector_bench.sh --config bundled:pentest \
+  --preset privacy-filter-service
 ```
 
 Latency in the per-case rows tells you the cost of each addition;

@@ -162,6 +162,11 @@ def _apply_preset(cfg: LaunchConfig, preset: str) -> dict[str, str | None]:
     cfg.log_level = spec.log_level
     cfg.use_faker = spec.use_faker
     cfg.env_overrides.update(spec.env_overrides)
+    # Service-variant selection (e.g. `privacy_filter` → `hf`). Merge
+    # into LaunchConfig.service_variants so the runner's auto-start
+    # path picks the variant container. Same shape the menu's
+    # variant-edit modal writes; no other plumbing needed.
+    cfg.service_variants.update(spec.service_variants)
     return {
         "llm": spec.llm_backend or None,
         "privacy_filter": spec.pf_backend or None,
@@ -170,11 +175,14 @@ def _apply_preset(cfg: LaunchConfig, preset: str) -> dict[str, str | None]:
 
 
 def _render_presets_table() -> "Table":
-    """Build a rich Table comparing every loaded preset side by side.
-    Used by `--show-presets`. One column per preset, one row per
-    knob — easier to scan "how do these differ?" than per-preset blocks.
+    """Build a rich Table comparing every loaded preset. One row per
+    preset, one column per setting — earlier versions used the inverse
+    layout (preset-per-column) but that scaled poorly past ~3 presets
+    and made "find the preset that auto-starts gliner" a horizontal-
+    scroll exercise. Reading down a name column is the operator's
+    typical entry point.
 
-    A "Source" row indicates whether each column was loaded from the
+    A "Source" column indicates whether each row was loaded from the
     bundled YAML or from the operator's `LAUNCHER_PRESETS_FILE`. Useful
     when an operator's file replaces a bundled preset by name — the
     operator can verify their override actually took effect.
@@ -182,60 +190,78 @@ def _render_presets_table() -> "Table":
     from rich.table import Table
 
     presets = load_presets()
-    preset_names = list(presets.keys())
 
     table = Table(
         title="Launcher presets",
         title_style="bold",
         header_style="bold",
-        # Soft border + padding match the print_plan rendering style
-        # used elsewhere in the launcher.
         padding=(0, 1),
     )
-    table.add_column("Setting", style="dim", no_wrap=True)
-    for name in preset_names:
-        # `overflow="fold"` so long values (e.g. multi-detector
-        # `detector_mode`, `bundled:regex_pentest.yaml` paths) wrap
-        # within the cell instead of getting ellipsis-truncated.
-        table.add_column(name, style="green", overflow="fold")
+    # First column = preset name with an inline source annotation
+    # (`(bundled)` / `(operator)`). Cheaper than a dedicated Source
+    # column — keeps the most operator-relevant info on the same row
+    # head, and reclaims one column of horizontal space for the
+    # value cells. Remaining columns = settings; `overflow="fold"`
+    # on every value column so long values (multi-detector lists,
+    # bundle paths) wrap inside the cell instead of ellipsis-truncating.
+    table.add_column("Preset", style="bold cyan", no_wrap=True)
+    table.add_column("Detector mode", style="green", overflow="fold")
+    table.add_column("Log", style="green", no_wrap=True)
+    table.add_column("Faker", style="green", no_wrap=True)
+    table.add_column("LLM", style="green", no_wrap=True)
+    table.add_column("PF", style="green", no_wrap=True)
+    table.add_column("GLiNER", style="green", no_wrap=True)
+    table.add_column("Service variants", style="green", overflow="fold")
+    table.add_column("Env overrides", style="green", overflow="fold")
 
     def _backend_cell(spec, attr: str) -> str:
         v = getattr(spec, attr)
         if not v:
             return "[dim]—[/dim]"
         if v == "service":
-            return "service [dim](auto-start)[/dim]"
+            return "service"  # `(auto-start)` annotation removed —
+                              # column is named "LLM"/"PF"/"GLiNER"
+                              # so backend type is the only signal
+                              # the cell needs to carry. The plan
+                              # printer (print_plan) shows the
+                              # auto-start status at run-time.
         return str(v)
 
     def _env_overrides_cell(spec) -> str:
         if not spec.env_overrides:
             return "[dim]—[/dim]"
-        # One KEY=VALUE per line so long bundle paths don't blow the
-        # column out horizontally.
         return "\n".join(f"{k}={v}" for k, v in spec.env_overrides.items())
 
-    def _source_cell(loaded: LoadedPreset) -> str:
-        if loaded.source == "bundled":
-            return "[dim]bundled[/dim]"
-        return "[yellow]operator[/yellow]"
+    def _service_variants_cell(spec) -> str:
+        if not spec.service_variants:
+            return "[dim]—[/dim]"
+        return "\n".join(f"{k}={v}" for k, v in spec.service_variants.items())
 
-    rows: list[tuple[str, callable]] = [
-        ("Source",            lambda lp: _source_cell(lp)),
-        ("Image flavour",     lambda lp: lp.spec.flavour),
-        ("Detector mode",     lambda lp: lp.spec.detector_mode),
-        ("Log level",         lambda lp: lp.spec.log_level),
-        (
-            "Faker surrogates",
-            lambda lp: "enabled" if lp.spec.use_faker else "disabled [dim](opaque tokens)[/dim]",
-        ),
-        ("LLM backend",       lambda lp: _backend_cell(lp.spec, "llm_backend")),
-        ("Privacy-filter backend", lambda lp: _backend_cell(lp.spec, "pf_backend")),
-        ("GLiNER-PII backend", lambda lp: _backend_cell(lp.spec, "gliner_backend")),
-        ("Env overrides",     lambda lp: _env_overrides_cell(lp.spec)),
-    ]
+    def _name_cell(name: str, loaded: LoadedPreset) -> str:
+        # Bundled is the common case → no prefix, just the name.
+        # Operator-supplied entries get a yellow `operator:` prefix so
+        # an override is conspicuously NOT a bundled default — the
+        # only signal an operator needs ("did my file's entry land?").
+        if loaded.source == "operator":
+            return f"[yellow]operator:[/yellow] {name}"
+        return name
 
-    for label, extractor in rows:
-        table.add_row(label, *(extractor(presets[n]) for n in preset_names))
+    def _faker_cell(spec) -> str:
+        return "enabled" if spec.use_faker else "opaque"
+
+    for name, loaded in presets.items():
+        spec = loaded.spec
+        table.add_row(
+            _name_cell(name, loaded),
+            spec.detector_mode,
+            spec.log_level,
+            _faker_cell(spec),
+            _backend_cell(spec, "llm_backend"),
+            _backend_cell(spec, "pf_backend"),
+            _backend_cell(spec, "gliner_backend"),
+            _service_variants_cell(spec),
+            _env_overrides_cell(spec),
+        )
 
     return table
 

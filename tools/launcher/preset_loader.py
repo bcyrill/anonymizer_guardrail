@@ -77,6 +77,16 @@ class LauncherPreset(BaseModel):
     pf_backend: Literal["service", "external", ""] = ""
     gliner_backend: Literal["service", "external", ""] = ""
 
+    # Per-detector service-variant selection. Mirrors LaunchConfig's
+    # `service_variants` dict — keys are detector names, values are
+    # variant names declared in the matching `LauncherSpec.service_variants`.
+    # Today only `privacy_filter` has variants (default opf-only or
+    # `hf` for the HF-pipeline build). Unknown variants fall back to
+    # the default at `resolve_service()` time, but operators expect
+    # the named variant to actually fire — typos surface as silent
+    # default-fallback otherwise.
+    service_variants: dict[str, str] = Field(default_factory=dict)
+
     # Env vars to set on the guardrail container. Merged into
     # `cfg.env_overrides` AFTER the per-field copy above, BEFORE
     # explicit CLI flags. Use this for prompt/pattern path overrides

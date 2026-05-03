@@ -30,9 +30,10 @@ End-to-end tests exercise the full HTTP path against an actual
 container (builds + runs + asserts via `launcher.sh --preset`):
 
 ```bash
-scripts/test-examples.sh --preset uuid-debug   # guardrail + regex,llm + fake-llm
-scripts/test-examples.sh --preset pentest      # guardrail + regex,privacy_filter,llm + pf-service + fake-llm + pentest config
-scripts/test-examples.sh                       # connect to BASE_URL (already-running guardrail)
+# Run `scripts/launcher.sh --show-presets` for the full preset list.
+scripts/test-examples.sh --preset regex-default                       # regex only
+scripts/test-examples.sh --preset regex-pentest-gliner-pii-service    # regex + gliner combo
+scripts/test-examples.sh                                              # connect to BASE_URL (already-running guardrail)
 ```
 
 ## Repo layout

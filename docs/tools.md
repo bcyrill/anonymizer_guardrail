@@ -64,11 +64,15 @@ are appended.
 ```yaml
 # ~/anonymizer-presets.yaml
 presets:
-  # Replace the bundled "regex-only" with stricter logging.
-  regex-only:
+  # Replace the bundled "regex-default" with the pentest pattern set
+  # plus debug logging — useful as an org-internal default.
+  regex-default:
     detector_mode: regex
     log_level: debug
     use_faker: false
+    env_overrides:
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml
 
   # Add a new "compliance" preset for org-internal scans.
   compliance:
@@ -76,6 +80,8 @@ presets:
     log_level: warning
     use_faker: true
     pf_backend: service
+    service_variants:
+      privacy_filter: hf
     env_overrides:
       DENYLIST_PATH: /etc/anon/compliance-deny.yaml
 ```

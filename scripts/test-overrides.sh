@@ -7,13 +7,13 @@
 # skipped when the running guardrail's DETECTOR_MODE doesn't include
 # the relevant detector.
 #
-# Default preset is `uuid-debug` (default flavour + regex,llm + fake-llm,
-# USE_FAKER=false at startup). The override tests then flip these
-# per call to verify each path.
+# Default preset is `regex-llm-debug` (default flavour + regex,llm +
+# fake-llm, USE_FAKER=false at startup). The override tests then flip
+# these per call to verify each path.
 #
 # Usage:
-#   scripts/test-overrides.sh                       # against $BASE_URL
-#   scripts/test-overrides.sh --preset uuid-debug   # self-host
+#   scripts/test-overrides.sh                            # against $BASE_URL
+#   scripts/test-overrides.sh --preset regex-llm-debug   # self-host
 
 set -uo pipefail
 
@@ -41,7 +41,8 @@ With --preset NAME:
   tests, tears it down. Default port ${TEST_PORT}, container name "${TEST_NAME}".
 
 Options:
-  --preset NAME   uuid-debug (recommended) | pentest | regex-only.
+  --preset NAME   regex-llm-debug (recommended for override tests).
+                  Run \`scripts/launcher.sh --show-presets\` for the full list.
   --port N        Host port (default ${TEST_PORT}).
   --keep          Don't tear down on exit.
   -h, --help      Show this help.
@@ -206,8 +207,8 @@ fi
 say ""
 say "${c_bld}2. use_faker override${c_rst}"
 
-# uuid-debug preset starts with USE_FAKER=false. Override to true should
-# produce a realistic surrogate (no [EMAIL_ADDRESS_…] opaque marker).
+# regex-llm-debug preset starts with USE_FAKER=false. Override to true
+# should produce a realistic surrogate (no [EMAIL_ADDRESS_…] opaque marker).
 r=$(post "$(mkbody 'Email me at bob@corp.example.' 'uf-true' '{"use_faker": true}')")
 m=$(printf '%s' "$r" | jget '["texts"][0]')
 if [[ "$m" != *"bob@corp.example"* && "$m" != *"[EMAIL_ADDRESS_"* && "$m" == *"@"* ]]; then
@@ -216,8 +217,8 @@ else
   ffail "use_faker=true" "got: $m"
 fi
 
-# Override to false (no-op for uuid-debug since it's already false, but
-# the path runs). Should produce an opaque token.
+# Override to false (no-op for regex-llm-debug since it's already false,
+# but the path runs). Should produce an opaque token.
 r=$(post "$(mkbody 'Email me at carol@corp.example.' 'uf-false' '{"use_faker": false}')")
 m=$(printf '%s' "$r" | jget '["texts"][0]')
 if [[ "$m" == *"[EMAIL_ADDRESS_"* ]]; then

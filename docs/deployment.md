@@ -19,14 +19,18 @@ scripts/image_builder.sh --preset all
 # setting visible at once, drill in to edit, hit Launch.
 scripts/launcher.sh --ui
 
-# Flag-driven launcher with bundled presets:
-scripts/launcher.sh --preset uuid-debug      # guardrail + regex,llm + fake-llm + LOG_LEVEL=debug
-scripts/launcher.sh --preset pentest         # guardrail + regex,privacy_filter,llm + pf-service + fake-llm + pentest patterns/prompt
-scripts/launcher.sh --preset regex-only      # guardrail + regex only — no LLM creds needed
+# Flag-driven launcher with bundled presets. Run `--show-presets` to
+# see the full set + every preset's configuration.
+scripts/launcher.sh --show-presets
+scripts/launcher.sh --preset regex-default                       # regex only, default patterns
+scripts/launcher.sh --preset regex-pentest                       # regex only, pentest patterns
+scripts/launcher.sh --preset privacy-filter-service              # PF (HF variant) auto-started
+scripts/launcher.sh --preset gliner-pii-service                  # gliner-pii auto-started
+scripts/launcher.sh --preset regex-pentest-gliner-pii-service    # regex (pentest) + gliner combo
 
 # Exercise the curl recipes against a running guardrail
 # (or pass --preset to spin one up + tear it down):
-scripts/test-examples.sh --preset uuid-debug
+scripts/test-examples.sh --preset regex-default
 ```
 
 When the chosen `DETECTOR_MODE` includes `llm` and the LLM backend is

@@ -10,40 +10,128 @@
 # the bundled entry; new names are appended.
 #
 # Field reference (all optional except where the validator requires them):
-#   flavour          Image flavour. Default: "default".
-#   detector_mode    Comma-separated detector list (regex, denylist,
-#                    privacy_filter, gliner_pii, llm). Required.
-#   log_level        debug | info | warning | error. Default: "info".
-#   use_faker        true → Faker surrogates; false → opaque tokens.
-#   llm_backend      "service" → auto-start fake-llm; "external" →
-#                    operator-supplied LLM_API_BASE; omit → no LLM.
-#   pf_backend       Same shape, for privacy_filter.
-#   gliner_backend   Same shape, for gliner_pii.
-#   env_overrides    Map of env-var name → value, merged into the
-#                    guardrail's environment after preset apply but
-#                    before per-flag overrides.
+#   flavour            Image flavour. Default: "default".
+#   detector_mode      Comma-separated detector list (regex, denylist,
+#                      privacy_filter, gliner_pii, llm). Required.
+#   log_level          debug | info | warning | error. Default: "info".
+#   use_faker          true → Faker surrogates; false → opaque tokens.
+#   llm_backend        "service" → auto-start fake-llm; "external" →
+#                      operator-supplied LLM_API_BASE; omit → no LLM.
+#   pf_backend         Same shape, for privacy_filter.
+#   gliner_backend     Same shape, for gliner_pii.
+#   service_variants   Map of detector name → variant name (e.g.
+#                      `privacy_filter: hf` for the HF-pipeline build).
+#   env_overrides      Map of env-var name → value, merged into the
+#                      guardrail's environment after preset apply but
+#                      before per-flag overrides.
 
 presets:
-  uuid-debug:
-    flavour: default
+
+  # ── Regex-only flavours ────────────────────────────────────────────────
+  # Fastest path; no auto-started service, no model deps. Useful as a
+  # smoke test of the pipeline / pattern set without paying ML startup.
+
+  regex-default:
+    detector_mode: regex
+    use_faker: false
+    env_overrides:
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_default.yaml
+
+  regex-pentest:
+    detector_mode: regex
+    use_faker: false
+    env_overrides:
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml
+
+  # Regex with the pentest pattern set + log_level=debug — useful when
+  # iterating on regex pattern correctness; surfaces the per-match
+  # decisions. The pentest pattern set is the larger / more interesting
+  # one to debug against; switch via env_overrides if you need the
+  # default set.
+  regex-debug:
+    detector_mode: regex
+    log_level: debug
+    use_faker: false
+    env_overrides:
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml
+
+  # Self-contained regex + LLM stack for the test scripts
+  # (`scripts/test-overrides.sh`, `scripts/test-examples.sh --preset`).
+  # Auto-starts fake-llm so the LLM detector path runs with no API
+  # keys — debug logs surface per-call decisions during test
+  # development. Default regex pattern set (not pentest) so the test
+  # corpus runs the same way it would on a stock guardrail.
+  regex-llm-debug:
     detector_mode: regex,llm
     log_level: debug
     use_faker: false
     llm_backend: service
-
-  pentest:
-    flavour: default
-    detector_mode: regex,privacy_filter,llm
-    log_level: debug
-    use_faker: false
-    llm_backend: service
-    pf_backend: service
     env_overrides:
-      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml
-      LLM_SYSTEM_PROMPT_PATH: bundled:llm_pentest.md
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_default.yaml
 
-  regex-only:
-    flavour: default
-    detector_mode: regex
-    log_level: info
-    use_faker: true
+  # ── Single-detector service flavours ───────────────────────────────────
+  # Auto-start the matching inference container and dial it. Use when
+  # validating the service alone (regex layer not in play, no
+  # cross-detector dedup concerns).
+
+  privacy-filter-service:
+    detector_mode: privacy_filter
+    use_faker: false
+    pf_backend: service
+    # HF-pipeline variant of privacy-filter (port 8003). Distinct from
+    # the opf-only default — see `services/privacy_filter_hf/`.
+    service_variants:
+      privacy_filter: hf
+
+  gliner-pii-service:
+    detector_mode: gliner_pii
+    use_faker: false
+    gliner_backend: service
+
+  # Narrowed-label gliner variants. Each overrides GLINER_PII_LABELS to
+  # restrict the model's vocabulary for a specific domain. Smaller
+  # label list = slightly faster inference (fewer label embeddings to
+  # score) and cleaner output (no false-positive matches against
+  # entity types you don't care about). The full default set is on
+  # `gliner-pii-service`; pick one of these when you've narrowed the
+  # use case.
+
+  gliner-pii-minimal:
+    detector_mode: gliner_pii
+    use_faker: false
+    gliner_backend: service
+    env_overrides:
+      GLINER_PII_LABELS: person,email,phone_number,address
+
+  gliner-pii-financial:
+    detector_mode: gliner_pii
+    use_faker: false
+    gliner_backend: service
+    env_overrides:
+      GLINER_PII_LABELS: person,credit_card,iban,ssn,account_number
+
+  gliner-pii-healthcare:
+    detector_mode: gliner_pii
+    use_faker: false
+    gliner_backend: service
+    env_overrides:
+      GLINER_PII_LABELS: person,date_of_birth,ssn,medical_record_number,address
+
+  # ── Combined flavours ──────────────────────────────────────────────────
+  # Regex (deterministic shape-classifier; first in priority order so
+  # its types win the dedup pass) layered with gliner-pii (semantic /
+  # zero-shot) for richer coverage. Pentest pattern set on the regex
+  # side because that's where this combination lights up — the regex
+  # default set already overlaps gliner's PERSON / EMAIL coverage.
+
+  regex-pentest-gliner-pii-service:
+    detector_mode: regex,gliner_pii
+    use_faker: false
+    gliner_backend: service
+    env_overrides:
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml

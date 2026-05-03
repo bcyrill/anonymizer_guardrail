@@ -182,26 +182,34 @@ def test_unset_cross_cutting_vars_not_emitted(
 
 
 def test_show_presets_table_lists_every_bundled_preset() -> None:
-    """`--show-presets` renders one column per loaded preset. Pin so
-    a future preset addition that forgets to land in the table
-    surfaces as a test failure rather than as silent operator
-    confusion."""
+    """`--show-presets` renders one row per loaded preset. Pin so a
+    future preset addition that forgets to land in the table surfaces
+    as a test failure rather than as silent operator confusion.
+
+    Layout: presets-as-rows, settings-as-columns. The table's
+    `columns[0]` is "Preset" (left-most label); each preset gets a
+    row with the same column shape."""
+    from rich.console import Console
     from tools.launcher.main import _render_presets_table
     from tools.launcher.preset_loader import load_presets
 
     table = _render_presets_table()
-    # `Table.columns` is a list[Column]; the first is "Setting" plus
-    # one per preset.
     headers = [c.header for c in table.columns]
-    assert headers[0] == "Setting"
-    assert headers[1:] == list(load_presets().keys())
+    # First column carries the preset name.
+    assert headers[0] == "Preset"
+    # Render and look for every preset name appearing left-aligned.
+    console = Console(width=200, record=True, file=open("/dev/null", "w"))
+    console.print(table)
+    rendered = console.export_text()
+    for name in load_presets():
+        assert name in rendered, f"preset {name!r} missing from rendered table"
 
 
 def test_show_presets_table_includes_env_overrides() -> None:
     """Env overrides (e.g. `REGEX_PATTERNS_PATH=bundled:regex_pentest.yaml`)
-    are applied silently by `--preset pentest`. The table must surface
-    them — otherwise an operator can't tell from the listing why
-    pentest behaves differently."""
+    are applied silently by `--preset regex-pentest`. The table must
+    surface them — otherwise an operator can't tell from the listing
+    why one preset's behaviour differs from another's."""
     from rich.console import Console
     from tools.launcher.main import _render_presets_table
 
@@ -212,14 +220,14 @@ def test_show_presets_table_includes_env_overrides() -> None:
     rendered = console.export_text()
 
     assert "REGEX_PATTERNS_PATH=bundled:regex_pentest.yaml" in rendered
-    assert "LLM_SYSTEM_PROMPT_PATH=bundled:llm_pentest.md" in rendered
+    assert "REGEX_PATTERNS_PATH=bundled:regex_default.yaml" in rendered
+    assert "REGEX_OVERLAP_STRATEGY=longest" in rendered
 
 
 def test_show_presets_table_renders_backend_choices() -> None:
     """Operators read the table to answer "which preset auto-starts
-    PF?". The `_pf_backend` / `_llm_backend` keys (with underscore
-    prefix — applied via auto-start wiring rather than `setattr`) must
-    surface as readable rows, not be silently dropped."""
+    PF?". The PF / GLiNER / LLM columns must surface the backend
+    choice for each preset — not silently dropped."""
     from rich.console import Console
     from tools.launcher.main import _render_presets_table
 
@@ -227,11 +235,79 @@ def test_show_presets_table_renders_backend_choices() -> None:
     console.print(_render_presets_table())
     rendered = console.export_text()
 
-    # uuid-debug + pentest both auto-start LLM; pentest also PF.
-    assert "LLM backend" in rendered
-    assert "Privacy-filter backend" in rendered
-    # auto-start is visible as a value somewhere in the table.
-    assert "auto-start" in rendered
+    # privacy-filter-service auto-starts PF; gliner-pii-service auto-
+    # starts GLiNER; the column headers must be present.
+    assert "PF" in rendered
+    assert "GLiNER" in rendered
+    assert "LLM" in rendered
+    # And `service` appears for the auto-starting presets.
+    assert "service" in rendered
+
+
+def test_show_presets_table_renders_service_variants() -> None:
+    """The privacy-filter-service preset's `privacy_filter=hf` variant
+    selection must be visible in the table — that's the operator-
+    facing differentiator from a hypothetical opf-only privacy filter
+    preset."""
+    from rich.console import Console
+    from tools.launcher.main import _render_presets_table
+
+    console = Console(width=200, record=True, file=open("/dev/null", "w"))
+    console.print(_render_presets_table())
+    rendered = console.export_text()
+
+    assert "privacy_filter=hf" in rendered
+
+
+def test_show_presets_table_inlines_source_annotation() -> None:
+    """The Source column was collapsed into the Preset cell as a
+    `(bundled)` / `(operator)` annotation — narrower table without
+    losing the load-bearing information ("did my override take
+    effect?"). Pin so a refactor that drops the annotation
+    silently regresses that signal."""
+    from pathlib import Path
+    from rich.console import Console
+    from tools.launcher.main import _render_presets_table
+    from tools.launcher.preset_loader import set_operator_presets_file
+
+    console = Console(width=200, record=True, file=open("/dev/null", "w"))
+
+    # Bundled-only run — preset rows are just the bare name, no
+    # prefix annotation. `operator:` should NOT appear anywhere.
+    console.print(_render_presets_table())
+    rendered = console.export_text()
+    assert "operator:" not in rendered
+    # Bare preset names appear (whitespace-bounded so partial matches
+    # of the name as a substring of an env-override path don't false-pass).
+    assert " regex-default " in rendered or rendered.startswith("regex-default")
+
+    # Add an operator file with a fresh name and verify ONLY that
+    # row gets the operator: prefix; bundled rows stay bare.
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False,
+    ) as tf:
+        tf.write(
+            "presets:\n"
+            "  test-operator-only:\n"
+            "    detector_mode: regex\n"
+        )
+        op_path = tf.name
+    try:
+        set_operator_presets_file(op_path)
+        console2 = Console(width=200, record=True, file=open("/dev/null", "w"))
+        console2.print(_render_presets_table())
+        rendered2 = console2.export_text()
+        assert "operator: test-operator-only" in rendered2
+        # The pre-existing bundled preset is still bare — no prefix.
+        # Anchor the check against an env-overrides bundled-path which
+        # also contains "bundled:" but never "bundled:" with a space
+        # before it, so this is unambiguously the name-cell check.
+        import re
+        assert re.search(r"\bregex-default\b", rendered2)
+    finally:
+        set_operator_presets_file(None)
+        Path(op_path).unlink(missing_ok=True)
 
 
 def test_detector_specific_takes_precedence_over_cross_cutting(

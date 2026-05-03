@@ -52,7 +52,10 @@ With --preset NAME:
 Tests whose required detection layer isn't enabled are skipped.
 
 Options:
-  --preset NAME   Bundled launcher.sh preset (uuid-debug | pentest | regex-only).
+  --preset NAME   Bundled launcher.sh preset. Run `scripts/launcher.sh
+                  --show-presets` to list. Common picks for this script:
+                  regex-default, regex-pentest, gliner-pii-service,
+                  privacy-filter-service.
   --port N        Host port for the test guardrail (default: ${TEST_PORT}).
   --keep          Don't tear down the test guardrail on exit.
   -h, --help      Show this help.

@@ -9,8 +9,10 @@
 #
 # Usage:
 #   scripts/detector_bench.sh --config bundled:pentest
-#   scripts/detector_bench.sh --config bundled:pentest --preset pentest
+#   scripts/detector_bench.sh --config bundled:pentest --preset regex-pentest
 #   scripts/detector_bench.sh --config tests/corpus/legal.yaml
+#
+# Run `scripts/launcher.sh --show-presets` to list bundled presets.
 #
 # See `scripts/detector_bench.sh --help` for the full flag list.
 

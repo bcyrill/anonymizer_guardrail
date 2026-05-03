@@ -48,36 +48,109 @@ def test_bundled_presets_load() -> None:
     from tools.launcher.preset_loader import load_presets
 
     presets = load_presets()
-    # The 3 bundled presets shipped with the launcher must be present.
-    assert {"uuid-debug", "pentest", "regex-only"}.issubset(presets.keys())
+    # The 10 bundled presets shipped with the launcher today.
+    expected = {
+        "regex-default",
+        "regex-pentest",
+        "regex-debug",
+        "regex-llm-debug",
+        "privacy-filter-service",
+        "gliner-pii-service",
+        "gliner-pii-minimal",
+        "gliner-pii-financial",
+        "gliner-pii-healthcare",
+        "regex-pentest-gliner-pii-service",
+    }
+    assert expected.issubset(presets.keys())
     for lp in presets.values():
         assert lp.source == "bundled"
 
 
-def test_bundled_pentest_preserves_env_overrides() -> None:
-    """Pentest carries non-trivial env_overrides (regex pattern path,
-    LLM prompt path). Pin those — the pentest presets is the most
-    operator-visible "complicated" preset, so a refactor that drops
-    its env_overrides silently would be a real regression."""
+def test_bundled_regex_pentest_pins_pattern_path() -> None:
+    """The regex-pentest preset switches REGEX_PATTERNS_PATH to the
+    pentest set via env_overrides. Pin so a refactor that drops the
+    pattern-path override silently regresses to the default set."""
     from tools.launcher.preset_loader import load_presets
 
-    pentest = load_presets()["pentest"].spec
+    pentest = load_presets()["regex-pentest"].spec
     assert pentest.env_overrides["REGEX_PATTERNS_PATH"] == "bundled:regex_pentest.yaml"
-    assert pentest.env_overrides["LLM_SYSTEM_PROMPT_PATH"] == "bundled:llm_pentest.md"
-    assert pentest.llm_backend == "service"
-    assert pentest.pf_backend == "service"
+    assert pentest.env_overrides["REGEX_OVERLAP_STRATEGY"] == "longest"
+    assert pentest.detector_mode == "regex"
+    assert pentest.use_faker is False
 
 
-def test_bundled_uuid_debug_does_not_set_pf_backend() -> None:
-    """Empty backend fields stay empty after schema parse — they
-    don't auto-fill to "service" or anything else. uuid-debug
-    auto-starts LLM only; PF stays unset."""
+def test_bundled_privacy_filter_service_pins_hf_variant() -> None:
+    """The privacy-filter-service preset must select the `hf` service
+    variant — that's the operator-facing differentiator. A refactor
+    that drops `service_variants` would silently start the opf-only
+    privacy-filter-service:8001 instead of privacy-filter-hf-service:8003,
+    which is exactly the bug this preset exists to prevent."""
     from tools.launcher.preset_loader import load_presets
 
-    uuid_debug = load_presets()["uuid-debug"].spec
-    assert uuid_debug.llm_backend == "service"
-    assert uuid_debug.pf_backend == ""
-    assert uuid_debug.gliner_backend == ""
+    pf = load_presets()["privacy-filter-service"].spec
+    assert pf.detector_mode == "privacy_filter"
+    assert pf.pf_backend == "service"
+    assert pf.service_variants == {"privacy_filter": "hf"}
+
+
+def test_bundled_regex_default_does_not_auto_start_anything() -> None:
+    """Pure-regex presets must not pre-pick any backend — there's
+    nothing to auto-start. Pin so a future contributor copy-pasting
+    the privacy-filter-service preset doesn't accidentally inherit
+    `pf_backend: service`."""
+    from tools.launcher.preset_loader import load_presets
+
+    rd = load_presets()["regex-default"].spec
+    assert rd.llm_backend == ""
+    assert rd.pf_backend == ""
+    assert rd.gliner_backend == ""
+    assert rd.service_variants == {}
+
+
+def test_bundled_gliner_label_overrides_carry_through() -> None:
+    """The narrowed-label gliner presets (`gliner-pii-minimal`,
+    `gliner-pii-financial`, `gliner-pii-healthcare`) restrict the
+    model's vocabulary via `GLINER_PII_LABELS` in env_overrides.
+    Pin so a refactor that drops the env_overrides silently regresses
+    these presets to the broad default label set — operator who
+    picked `gliner-pii-financial` would silently start getting
+    person/email/phone hits they didn't ask for."""
+    from tools.launcher.preset_loader import load_presets
+
+    presets = load_presets()
+    minimal = presets["gliner-pii-minimal"].spec
+    financial = presets["gliner-pii-financial"].spec
+    healthcare = presets["gliner-pii-healthcare"].spec
+
+    # Each must auto-start the gliner service AND set a non-empty
+    # GLINER_PII_LABELS that's distinct from the others — otherwise
+    # they collapse into duplicates of `gliner-pii-service`.
+    for spec in (minimal, financial, healthcare):
+        assert spec.detector_mode == "gliner_pii"
+        assert spec.gliner_backend == "service"
+        assert "GLINER_PII_LABELS" in spec.env_overrides
+        assert spec.env_overrides["GLINER_PII_LABELS"]
+
+    label_sets = {
+        minimal.env_overrides["GLINER_PII_LABELS"],
+        financial.env_overrides["GLINER_PII_LABELS"],
+        healthcare.env_overrides["GLINER_PII_LABELS"],
+    }
+    assert len(label_sets) == 3, "label sets must be distinct across the three presets"
+
+
+def test_bundled_combined_preset_includes_both_detectors() -> None:
+    """regex-pentest-gliner-pii-service must list BOTH detectors in
+    detector_mode AND auto-start gliner. The `regex` half adds the
+    deterministic shape-classifier layer; the `gliner_pii` half adds
+    semantic NER. Pin both so a refactor doesn't drop one half
+    silently."""
+    from tools.launcher.preset_loader import load_presets
+
+    combined = load_presets()["regex-pentest-gliner-pii-service"].spec
+    assert combined.detector_mode == "regex,gliner_pii"
+    assert combined.gliner_backend == "service"
+    assert combined.env_overrides["REGEX_PATTERNS_PATH"] == "bundled:regex_pentest.yaml"
 
 
 # ── Operator extension ─────────────────────────────────────────────────
@@ -103,8 +176,8 @@ def test_operator_file_appends_new_preset(tmp_path: Path) -> None:
     assert presets["custom-compliance"].source == "operator"
     assert presets["custom-compliance"].spec.detector_mode == "regex,denylist"
     # Bundled set is still intact.
-    assert "uuid-debug" in presets
-    assert presets["uuid-debug"].source == "bundled"
+    assert "regex-default" in presets
+    assert presets["regex-default"].source == "bundled"
 
 
 def test_operator_file_replaces_bundled_by_name(tmp_path: Path) -> None:
@@ -115,17 +188,20 @@ def test_operator_file_replaces_bundled_by_name(tmp_path: Path) -> None:
     from tools.launcher.preset_loader import load_presets, set_operator_presets_file
 
     op_file = tmp_path / "ops.yaml"
+    # Replace `regex-pentest` (bundled) — drop its env_overrides
+    # entirely and flip use_faker. The full-replace contract means
+    # NONE of the bundled fields bleed through.
     op_file.write_text(
         "presets:\n"
-        "  pentest:\n"
-        "    detector_mode: regex\n"           # very different from bundled
+        "  regex-pentest:\n"
+        "    detector_mode: regex\n"           # narrower than bundled
         "    log_level: error\n"
         "    use_faker: true\n"
     )
     set_operator_presets_file(str(op_file))
 
     presets = load_presets()
-    pentest = presets["pentest"]
+    pentest = presets["regex-pentest"]
     assert pentest.source == "operator"
     assert pentest.spec.detector_mode == "regex"
     assert pentest.spec.log_level == "error"
@@ -293,8 +369,25 @@ def test_apply_preset_normalizes_backend_choices() -> None:
     from tools.launcher.runner import LaunchConfig
 
     cfg = LaunchConfig()
-    backends = _apply_preset(cfg, "regex-only")
-    # regex-only has no backends — all None.
+    # regex-default has no auto-start backends — all None.
+    backends = _apply_preset(cfg, "regex-default")
     assert backends == {"llm": None, "privacy_filter": None, "gliner_pii": None}
     assert cfg.detector_mode == "regex"
-    assert cfg.use_faker is True
+    assert cfg.use_faker is False
+    # And no service variants on a pure-regex preset.
+    assert cfg.service_variants == {}
+
+
+def test_apply_preset_writes_service_variants() -> None:
+    """privacy-filter-service must propagate `privacy_filter=hf` into
+    `cfg.service_variants` so the runner's auto-start path picks the
+    HF-pipeline service container (port 8003) rather than the opf-only
+    default (port 8001). Pin so a refactor that drops the service-
+    variants apply step silently regresses to the wrong service."""
+    from tools.launcher.main import _apply_preset
+    from tools.launcher.runner import LaunchConfig
+
+    cfg = LaunchConfig()
+    backends = _apply_preset(cfg, "privacy-filter-service")
+    assert backends["privacy_filter"] == "service"
+    assert cfg.service_variants == {"privacy_filter": "hf"}
