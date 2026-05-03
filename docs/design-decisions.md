@@ -431,12 +431,21 @@ Wire-up summary:
 - A workload's `<prefix>_cache_misses` counter on `/health`
   shows the assistant-message miss is a measurable share of
   detection cost AND the override-staleness caveat is biting
-  (heavy override fragmentation in mixed traffic). Time to
-  consider Option 3.
+  (heavy override fragmentation in mixed traffic).
+- A deployment wants prewarm + Faker simultaneously (today's
+  Option 2 forbids the combination via the boot validator).
 - A deployment wants a single cache layer for both user and
   response text (text-level repeats independent of provenance).
-  Time to consider Option 1's bidirectional pipeline cache,
-  with the pipeline cache as primary tier and per-detector
-  caches as the override-fragmentation backup tier. The task
-  expansion is tracked in
-  [TASKS.md → Bidirectional pipeline-level result cache](../TASKS.md#bidirectional-pipeline-level-result-cache).
+- An operator reading per-detector cache hit/miss stats needs
+  them to actually mean something for capacity planning —
+  Option 2's "every detector found everything" inflation
+  breaks that signal.
+
+Any of those triggers points at the same task expansion:
+[TASKS.md → Bidirectional pipeline-level result cache](../TASKS.md#bidirectional-pipeline-level-result-cache).
+That task bundles Option 1's bidirectional pipeline cache AND
+Option 3's per-detector source tracking together — the vault
+schema migration covers both, and the dual-write prewarm hook
+populates the pipeline cache (text-level repeats) AND each
+per-detector cache honestly (filtered by source_detectors per
+surrogate). One migration, full fidelity.

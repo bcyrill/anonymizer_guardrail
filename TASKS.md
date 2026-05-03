@@ -281,13 +281,128 @@ per-text cache when `input_mode="merged"`.
 
 ---
 
+## Per-detector contribution metrics
+
+**Priority:** low.
+
+**What:** track and surface on `/health` per-detector "pull its
+weight" stats — how many matches each active detector contributed
+to a request, and (more importantly) how many of those were
+*unique* finds vs ones already caught by an earlier-priority
+detector. Today the per-detector cache hit/miss counters tell
+operators whether each detector's *cache* is firing; they don't
+tell them whether each detector is *finding things the others
+miss*.
+
+**Why:** detectors are layered on the assumption that each adds
+something the others don't. Regex catches shape-anchored types,
+LLM catches semantic / contextual entities, gliner catches
+zero-shot NER. In practice the layers overlap heavily — an
+EMAIL_ADDRESS could come from regex, LLM, gliner, or PF. Without
+per-detector contribution stats, an operator can't easily answer
+"is gliner actually catching things regex doesn't already, or am
+I just paying for redundant detection?". The dedup pass collapses
+the per-detector lists into one before the pipeline returns —
+the contribution info is computed implicitly but never surfaced.
+
+This is also a *prerequisite signal* for deciding whether to
+invest in the deferred Option 3 / source-tracking work — see
+[Bidirectional pipeline-level result cache](#bidirectional-pipeline-level-result-cache).
+Operators measuring high overlap rates probably don't need
+per-detector prewarm fidelity; operators measuring low overlap
+(every detector contributes unique entities) get more value
+from the source-tracking prewarm path.
+
+**Why deferred (low priority):** today's deployments are mostly
+"trust the canonical priority order, run the full stack". The
+contribution question becomes load-bearing when:
+
+  * An operator wants to drop a detector from the mode for cost
+    reasons (LLM detection is the expensive one) and needs data
+    to decide if the loss is acceptable.
+  * Per-detector capacity tuning matters (e.g. "should I bump
+    LLM_MAX_CONCURRENCY?") and the operator wants to know what
+    fraction of LLM's load was actually contributing unique
+    entities.
+  * The Option 3 / source-tracking decision in the bidirectional
+    pipeline cache task needs evidence to commit (or not commit)
+    to the schema migration.
+
+**Concrete trigger:** any of the above shows up.
+
+**Sketch:**
+
+1. **Pipeline-local counters.** Three new counter dicts on
+   `Pipeline.__init__`, all keyed by detector name:
+     * `_matches_total: dict[str, int]` — every match each
+       detector returned, counted before dedup.
+     * `_matches_unique: dict[str, int]` — matches this detector
+       found that no earlier-priority detector also found.
+     * `_matches_redundant: dict[str, int]` — matches this
+       detector found that an earlier detector already had.
+   Initialised to 0 for every name in `REGISTERED_SPECS`. Same
+   shape and lifecycle as the existing `_inflight_counters`.
+
+2. **Instrumentation point.** In `pipeline._run_detection` (or
+   wherever the per-detector match lists are collected before
+   `_dedup` runs), walk each detector's match list:
+     * For each match, increment `_matches_total[detector_name]`.
+     * If the match's `(text, entity_type)` pair is already
+       claimed by an earlier-priority detector in the same
+       request, increment `_matches_redundant[detector_name]`.
+     * Otherwise increment `_matches_unique[detector_name]` and
+       record the pair as claimed.
+   Track claims in a per-request set so the unique/redundant
+   distinction is request-local — the pipeline-level counters
+   accumulate across requests.
+
+3. **/health stats.** Extend `Pipeline.stats()`:
+     * `<prefix>_matches_total: int`
+     * `<prefix>_matches_unique: int`
+     * `<prefix>_matches_redundant: int`
+   Same key-prefix convention as the existing per-detector
+   stats. Operators can compute `unique / total` to get the
+   "pull its weight" ratio per detector.
+
+4. **Tests.**
+   * Layered detection where two detectors find the same entity:
+     the higher-priority detector's `_matches_unique` increments;
+     the lower-priority's `_matches_redundant` does. Pin the
+     priority-order semantics — first-listed in `DETECTOR_MODE`
+     wins the unique credit.
+   * Single-detector mode: every match is unique by definition.
+   * Counters survive across multiple requests in one process.
+
+**Non-goals:**
+
+- **Don't store per-match source info anywhere persistent.** The
+  contribution metrics live in process-local counters; nothing
+  goes to the vault. The operator-facing question is "what did
+  this process do over its lifetime?", not "which detector
+  found this specific entity in this specific call". The
+  latter question is what the deferred Option 3 / source-tracking
+  work would address — see the bidirectional pipeline cache
+  entry below.
+- **Don't break the dedup pass.** The instrumentation walks the
+  per-detector lists in the same order `_dedup` does and uses
+  the same `(text, entity_type)` claim semantics. A future
+  change to dedup priority should keep the contribution
+  counters consistent — the test should pin that.
+
+---
+
 ## Bidirectional pipeline-level result cache
 
 **Related to:** the implemented design-decision
 [Detector cache pre-warm from deanonymize-derived matches](docs/design-decisions.md#detector-cache-pre-warm-from-deanonymize-derived-matches),
 which lists this work as the "Option 1" variation that was
-considered and dismissed. This entry is the formal task expansion
-of that variation for if/when the trigger fires.
+considered and dismissed alongside "Option 3" (per-detector
+pre-warm with detector-source tracking). This entry is the
+formal task expansion of *both* variations: shipping them
+together pays the vault schema cost once and unlocks the full
+spectrum of cache fidelity (pipeline cache covers text-level
+repeats; per-detector cache prewarm covers override-fragmented
+workloads with honest source attribution).
 
 **Priority:** low.
 
@@ -326,46 +441,65 @@ signal). To make the bidirectional cache work under both
 deanonymize-side prewarm can synthesise typed Match objects
 without inspecting the surrogate.
 
-That vault change is the same foundation the dismissed Option 3
-("per-detector pre-warm with detector-source tracking") would
-need — implementing it here unblocks both paths. See "Vault
-schema change required" below.
+**Hard requirement: per-detector source tracking.** Beyond
+Faker support, this task also ships *honest* per-detector cache
+prewarm — Option 3's contribution. The deanonymize hook
+populates not just the pipeline cache but also each
+per-detector cache with that detector's actual matches (filtered
+by `source_detectors` per surrogate, see vault schema below).
+Per-detector cache hit/miss stats stay meaningful; override-
+fragmented workloads (some detectors' kwargs change per request,
+others stable) hit per-detector slots when the pipeline cache
+misses. This makes the per-detector cache layer a structural
+backup tier rather than dead weight when the pipeline cache
+takes over the hot path.
 
 **Why:** completes the deanonymize-prewarm story by making
 pre-warm a special case of a general "we've seen this text
-before" cache. Today's Option 2 implementation pre-warms
-per-detector caches with deduped matches keyed at default
-overrides; that's correct for stable-overrides workloads but
-mis-attributes hit/miss across detectors. The pipeline cache
-attributes hits to "the deduped result for this exact request
-shape" — semantically clean and correct.
+before" cache, AND by making the per-detector caches absorb
+the override-fragmentation gap honestly. Today's Option 2
+implementation pre-warms per-detector caches with the deduped
+union, which mis-attributes hit/miss across detectors and
+produces lying capacity-planning signals. Source-tracked prewarm
+fixes that.
 
 **Why deferred (low priority):** Option 2 is already shipped and
 covers the common case (multi-turn conversations where turn N's
-assistant message lands in turn N+1's prompt). The pipeline cache
-is a layered upgrade: bigger surface area (new cache Protocol,
-factory, two backends, /health stats, merged-mode warning
-update), with the primary win the same one Option 2 already
-delivers. Premature until override fragmentation OR per-detector
-stats fidelity become load-bearing for an actual deployment.
+assistant message lands in turn N+1's prompt). The bidirectional
+pipeline cache + source-tracked per-detector prewarm is a
+substantial layered upgrade — new cache Protocol + factory + two
+backends + vault schema migration + dual-write prewarm hook —
+with primary wins (Faker support, override-sensitive caching,
+per-detector fidelity) that only become load-bearing when the
+deployment shape demands them. Premature until override
+fragmentation, Faker-with-prewarm need, OR per-detector stats
+fidelity become measurable concerns for an actual deployment.
 
 **Concrete trigger:** any of:
 
-- An operator's per-detector hit/miss stats become misleading
-  enough that capacity planning is hard. The pipeline cache's
-  per-shape stats (`pipeline_cache_hits/misses`) replace the
-  multi-detector confusion with one number.
+- An operator wants prewarm + Faker simultaneously (today's
+  Option 2 forbids the combination).
 - A workload with stable per-call overrides where Option 2's
   default-slot pre-warm misses the textually-identical-but-
   override-different requests. The pipeline cache's
   `(text, detector_mode, kwargs)` key handles this naturally.
-- Operators measuring text-level repeat rate find that a
-  unified cache layer would absorb traffic that today
-  fragments across N per-detector slots.
+- A workload with per-tenant or per-call override fragmentation
+  (different LLM prompts, gliner labels, regex pattern sets per
+  request) where the pipeline cache's union-sensitive key
+  misses too often, but per-detector caches *would* hit if they
+  were prewarmed honestly. Source-tracked prewarm handles this.
+- Operators reading per-detector cache hit/miss stats need them
+  to actually mean something for capacity planning. Source
+  tracking eliminates the misleading "every detector found
+  everything" inflation that Option 2 has today.
+- The contribution-metrics task above (per-detector pull-its-
+  weight stats) is shipped, the operator measures the
+  contribution rates, and decides honest per-detector caching
+  is worth the schema cost.
 
 **Vault schema change required.** Today both vault backends store
 `dict[str, str]` (surrogate → original) per call_id. The new shape
-captures TWO additions on top of that:
+captures THREE additions on top of that:
 
   1. **Entity type per surrogate** — required for Faker-compatible
      prewarm (we can't recover types from Faker output via prefix
@@ -377,6 +511,18 @@ captures TWO additions on top of that:
      matching anonymize call used. Without this, prewarm would
      have to fall back to writing the default-overrides slot —
      same override-staleness issue the implemented Option 2 has.
+  3. **Source detectors per surrogate** — which detector(s)
+     independently found this entity, captured before `_dedup`
+     collapses the per-detector match lists. Required for
+     Option-3-style per-detector prewarm: the deanonymize hook
+     can rebuild *each detector's* match list (filtered by
+     `source_detectors`) and seed each detector's own cache slot
+     with what that detector actually produced — not the deduped
+     union. Without this field, the prewarm path either falls
+     back to "every detector cache gets the deduped union" (the
+     misleading-stats problem implemented Option 2 has) or only
+     writes the pipeline cache (per-detector caches stay cold
+     until real detection re-populates them).
 
 The natural shape is a structured value per call_id, not a flat
 dict:
@@ -387,11 +533,17 @@ VaultEntry = dict[str, str]                # surrogate → original
 
 # After:
 class VaultEntry:
-    surrogates: dict[str, tuple[str, str]] # surrogate → (original, entity_type)
+    surrogates: dict[str, VaultSurrogate]  # surrogate → (original, type, sources)
     detector_mode: tuple[str, ...]         # detector names active at anonymize time
     kwargs: tuple[tuple[str, tuple], ...]  # frozen per-detector kwargs
                                            #   e.g. (("llm", ("model", "default")),
                                            #         ("gliner_pii", (("person",), 0.5)))
+
+class VaultSurrogate:
+    original: str
+    entity_type: str
+    source_detectors: tuple[str, ...]      # detectors that independently
+                                           # found this entity (pre-dedup)
 ```
 
   * **In-memory backend** (`vault_memory.py`): replace the
@@ -402,29 +554,32 @@ class VaultEntry:
     with three keys:
     ```json
     {
-      "surrogates": {"sur1": ["orig1", "TYPE1"], ...},
+      "surrogates": {
+        "sur1": ["orig1", "TYPE1", ["regex", "llm"]],
+        "sur2": ["orig2", "TYPE2", ["llm"]]
+      },
       "detector_mode": ["regex", "llm"],
       "kwargs": [["llm", ["anonymize", "default"]], ...]
     }
     ```
-    `redis-cli GET vault:<id>` still produces readable JSON.
-    The `_KEY_PREFIX = "vault:"` and GETDEL atomicity are
-    unchanged.
+    Each surrogate value is `[original, entity_type, source_detectors]`.
+    `redis-cli GET vault:<id>` still produces readable JSON. The
+    `_KEY_PREFIX = "vault:"` and GETDEL atomicity are unchanged.
   * **Backward compatibility on read**: detect the legacy shape
     on `vault.pop` (top-level value is a string-valued dict
     rather than the new object) and convert to the new shape
-    with empty kwargs + empty entity_types. Pipeline.deanonymize
-    substring-replace still works on the recovered surrogates;
-    the prewarm path skips entries that lack entity_type or
-    kwargs (the missing data would force a default-slot write,
-    which silently re-introduces the override-staleness Option
-    2 had — strict skip is the cleaner contract).
-  * Operators on the redis backend with TTL'd legacy entries
-    see them age out naturally over `VAULT_TTL_S` seconds; no
-    migration job needed.
+    with empty kwargs, empty entity_types, and empty
+    source_detectors. Pipeline.deanonymize substring-replace
+    still works on the recovered surrogates; the prewarm path
+    skips entries that lack entity_type or kwargs (the missing
+    data would force a default-slot write, which silently
+    re-introduces the override-staleness Option 2 had — strict
+    skip is the cleaner contract). Operators on the redis backend
+    with TTL'd legacy entries see them age out naturally over
+    `VAULT_TTL_S` seconds; no migration job needed.
 
 **`pipeline.anonymize` change**: where `_run_detection` produces
-the per-detector match lists, capture two additional things in
+the per-detector match lists, capture three additional things in
 parallel:
   1. The Match objects' entity_types (already known — Match
      carries it).
@@ -432,19 +587,43 @@ parallel:
      — `spec.prepare_call_kwargs(overrides, api_key)` already
      produces this dict; freeze it into the
      `tuple[tuple[str, tuple], ...]` shape the cache key uses.
+  3. Per-surrogate source_detectors — track which detectors
+     independently found each `(text, entity_type)` pair *before*
+     `_dedup` collapses the per-detector lists. A simple
+     accumulator on the same loop that builds the
+     original_to_surrogate mapping; no extra detector traversal.
+
 `Pipeline._vault.put` accepts the structured entry; the vault
 backend serialises accordingly.
 
 **`pipeline.deanonymize` change**: `vault.pop` returns the
 structured entry. The substring replacer reads `surrogates` for
 the (surrogate, original) pairs and ignores the rest. The prewarm
-hook reads `surrogates` for the typed Match objects AND
-`detector_mode` + `kwargs` to build the precise pipeline cache
-key the matching anonymize call would have populated on a cache
-miss. Writing to that exact slot makes the prewarm correct under
-override fragmentation: a future request with the same overrides
-hits the prewarmed slot; a different-overrides request hits a
-different slot and runs detection. No staleness. No mis-attribution.
+hook does TWO writes:
+
+  1. **Pipeline cache write**: synthesises the deduped Match
+     list from `surrogates` (typed, no surrogate-prefix recovery
+     needed) and writes to the pipeline cache slot keyed by
+     `(restored_text, detector_mode, kwargs)` reconstructed from
+     the same vault entry. Future identical-overrides requests
+     for the same restored text hit. No staleness. No
+     mis-attribution.
+  2. **Per-detector cache writes** (Option 3 path): for each
+     active cache-using detector, filter the synthesised Match
+     list by `source_detectors` (only entities that detector
+     independently found), build that detector's cache key
+     using its own kwargs from the vault entry, and write the
+     filtered list. Per-detector caches get *honest* per-detector
+     match lists — what the detector actually produced, not the
+     deduped union. Per-detector hit/miss stats stay meaningful;
+     subsequent override-fragmented requests where some
+     detectors' kwargs match this call's hit per-detector caches
+     even when the pipeline cache misses.
+
+Both writes use `get_or_compute`'s "compute on miss, return
+cached on hit" semantics — real-detection results aren't
+overwritten by synthesised ones if both paths happen to fire
+for the same key.
 
 The existing `surrogate.opaque_token_entity_type` helper stays in
 the codebase for any other consumer, but the prewarm path goes
@@ -502,33 +681,51 @@ any change to any detector's overrides invalidates the slot
 **Sketch:**
 
 1. **Vault schema change.** Extend the `VaultBackend` Protocol's
-   `put`/`pop` signatures to round-trip
-   `dict[str, tuple[str, str]]`. Update both backends:
-     * `vault_memory.py`: widen the OrderedDict's value type;
-       no other change.
-     * `vault_redis.py`: switch the JSON value from
-       `dict[str, str]` to `dict[str, list[str]]` (list-of-pair
-       per surrogate). On read, detect the legacy shape by type
-       (`isinstance(v, str)` per entry) and convert to
-       `(original, "")` so deanonymize substring-replace still
-       works for in-flight legacy entries; the prewarm path
-       skips entries with empty entity_type.
+   `put`/`pop` signatures to round-trip the structured
+   `VaultEntry` shape (surrogates with type + source_detectors,
+   plus call-level detector_mode + kwargs — see
+   "Vault schema change required" above). Update both backends:
+     * `vault_memory.py`: replace the `dict[str, str]` value-type
+       with the structured form. Lock semantics + LRU pop /
+       expiry policy unchanged.
+     * `vault_redis.py`: switch the JSON wire format to the
+       three-key top-level object. On read, detect the legacy
+       shape (top-level value is a flat string→string dict) and
+       convert to the new shape with empty type / kwargs /
+       sources, so deanonymize substring-replace still works
+       for in-flight legacy entries. The prewarm path skips
+       entries that lack entity_type, kwargs, or source_detectors
+       (any of those missing makes the prewarm partial; strict
+       skip is the cleaner contract).
      * Update `tests/test_vault_*.py` to pin the new wire format
        on both backends + the legacy-read backward-compat path.
-   * `pipeline.anonymize` threads entity_type from Match into
-     `vault.put`; `pipeline.deanonymize` reads it from
-     `vault.pop`'s typed mapping.
+   * `pipeline.anonymize` captures (text, entity_type, source_detectors)
+     per match before `_dedup` runs (see step 2 below for the
+     accumulator shape) and threads them into `vault.put`
+     alongside the resolved per-detector kwargs;
+     `pipeline.deanonymize` reads the structured entry from
+     `vault.pop`.
 
-2. **Schema + Protocol.** New `pipeline_cache.py` defines
-   `PipelineResultCache` Protocol + `build_pipeline_cache(backend,
-   max_size, ttl_s)` factory. Two backend modules
-   (`pipeline_cache_memory.py`, `pipeline_cache_redis.py`). Same
-   shape as detector cache; reuse `_resolve_cache_salt` from
-   `detector/cache.py` (export it) so vault, detector cache,
-   and pipeline cache all derive their digest key from the
-   same operator-provided `CACHE_SALT`.
+2. **Source-detector accumulator on the anonymize path.** The
+   per-detector match lists are computed in `_run_detection` but
+   discarded by `_dedup`. Insert a small accumulator before
+   dedup: walk each `(detector_name, matches)` pair and build
+   `dict[(text, entity_type), set[str]]` mapping each entity to
+   the set of detectors that found it. Pass this through to the
+   vault.put call so each surrogate's vault entry carries its
+   source_detectors. No change to the dedup pass itself —
+   first-listed-detector still wins type-resolution conflicts.
 
-3. **Pipeline integration.**
+3. **Pipeline cache schema + Protocol.** New `pipeline_cache.py`
+   defines `PipelineResultCache` Protocol +
+   `build_pipeline_cache(backend, max_size, ttl_s)` factory. Two
+   backend modules (`pipeline_cache_memory.py`,
+   `pipeline_cache_redis.py`). Same shape as detector cache;
+   reuse `_resolve_cache_salt` from `detector/cache.py` (export
+   it) so vault, detector cache, and pipeline cache all derive
+   their digest key from the same operator-provided `CACHE_SALT`.
+
+4. **Pipeline integration.**
    * `Pipeline.__init__` constructs the pipeline cache via
      factory, stores on `self._pipeline_cache`.
    * `_detect_one(text, ...)` (the per-text dispatch) checks
@@ -536,13 +733,21 @@ any change to any detector's overrides invalidates the slot
      where `compute` is the existing per-detector dispatch chain.
      On hit, the pipeline cache absorbs it; on miss, detectors
      run as today and the result lands in the pipeline cache.
-   * Replace `_prewarm_detector_caches` with
-     `_prewarm_pipeline_cache` on the deanonymize side. The
-     synthesised Match list is built directly from the typed
+   * Replace `_prewarm_detector_caches` with the dual-write
+     prewarm hook described above:
+       1. Pipeline cache write — synthesised Match list keyed
+          by `(text, detector_mode, kwargs)` from the vault entry.
+       2. Per-detector cache writes — for each active cache-using
+          detector, filter the synthesised Match list by
+          `source_detectors` and write to that detector's cache
+          slot using the detector-specific kwargs from the
+          vault entry. Each detector gets its own honest match
+          list (not the deduped union).
+     The synthesised Match list is built directly from the typed
      vault mapping (no surrogate-prefix recovery), so
      `USE_FAKER=true` is fully supported.
 
-4. **Config knobs (central Config):**
+5. **Config knobs (central Config):**
    * `PIPELINE_CACHE_BACKEND: Literal["memory", "redis", "none"] = "none"`
      — three-way: memory, redis, or off entirely. Off is the
      default to keep behaviour unchanged for existing deployments.
@@ -556,25 +761,26 @@ any change to any detector's overrides invalidates the slot
      `_cache_redis_url_required_when_any_detector_picks_redis`
      validator — extend it or add a sibling.
 
-5. **/health stats.** Add `pipeline_cache_size`,
+6. **/health stats.** Add `pipeline_cache_size`,
    `pipeline_cache_max`, `pipeline_cache_hits`,
    `pipeline_cache_misses`, `pipeline_cache_backend` to
    `Pipeline.stats()`. Same pattern the per-detector caches
    already use.
 
-6. **Merged-mode warning extension.** The existing pipeline-init
+7. **Merged-mode warning extension.** The existing pipeline-init
    warning flags `input_mode=merged` + per-detector cache-on as
    wasted work. With a pipeline cache, merged mode ALSO produces
    unique-by-construction blobs → the pipeline cache writes
    one-shot entries. Warn on `input_mode=merged` +
    `PIPELINE_CACHE_BACKEND != "none"`, same wording shape.
 
-7. **Retire `DETECTOR_CACHE_PREWARM`.** This task fully
+8. **Retire `DETECTOR_CACHE_PREWARM`.** This task fully
    supersedes the implemented per-detector prewarm — the
-   pipeline cache covers the same case AND the additional cases
-   that motivated the migration (override-sensitive cache-key,
-   semantically clean per-shape stats, full Faker support
-   without the USE_FAKER mutual-exclusion). Migration policy:
+   pipeline cache + dual-write prewarm covers the same case
+   AND the additional cases that motivated the migration
+   (override-sensitive cache-key, honest per-detector match
+   lists via source_detectors, full Faker support without the
+   USE_FAKER mutual-exclusion). Migration policy:
      * Boot warning when `DETECTOR_CACHE_PREWARM=true` is set —
        pointing the operator at `PIPELINE_CACHE_BACKEND`.
      * Per-detector prewarm path becomes a no-op when the
@@ -588,7 +794,7 @@ any change to any detector's overrides invalidates the slot
        for historical context, with a "superseded by" note
        pointing at the bidirectional cache.
 
-8. **Tests:**
+9. **Tests:**
    * Round-trip: detection populates pipeline cache; second
      identical request hits the pipeline cache (no detector
      dispatch, observable via mocked HTTP-call counters).
@@ -605,21 +811,32 @@ any change to any detector's overrides invalidates the slot
      reads them back and writes typed Match objects to the
      pipeline cache; subsequent anonymize on the same restored
      text hits.
+   * **Source-detector-driven per-detector prewarm**: an
+     anonymize call where regex finds an EMAIL_ADDRESS but LLM
+     doesn't (e.g. fake-llm returns no entities for that text)
+     writes the entity to the regex per-detector cache slot
+     ONLY, NOT the LLM slot. Pin the Option-3-fidelity
+     property — a future request that hits the regex slot
+     returns the email; an LLM-only future request still has to
+     run real detection (LLM-cache miss). This is the load-
+     bearing distinction from Option 2's "spray to every
+     detector cache" semantics.
    * **Vault legacy-read compatibility**: a mapping written by
-     a pre-upgrade version (string values) round-trips through
-     `vault.pop` correctly for substring-replace, and the
-     prewarm path skips it (empty entity_type). New entries use
-     the typed shape.
+     a pre-upgrade version (flat string→string dict) round-trips
+     through `vault.pop` correctly for substring-replace, and
+     the prewarm path skips it (empty entity_type / kwargs /
+     source_detectors → strict skip). New entries use the
+     structured shape.
 
 **Non-goals:**
 
 - **Don't auto-disable per-detector caches** when the pipeline
-  cache is on. Operators with override-fragmented workloads
-  benefit from the per-detector caches absorbing the unchanged-
-  detector hits the pipeline cache structurally can't reach
-  (its key is union-sensitive — see design-decisions discussion).
-  Per-detector caches remain operator-controlled; the pipeline
-  cache is a separate opt-in layer.
+  cache is on. The dual-write prewarm depends on per-detector
+  caches existing as the secondary tier — that's where the
+  source-tracked filtered match lists land. Operators with
+  override-fragmented workloads hit the per-detector slots when
+  the pipeline cache misses; turning off per-detector caches
+  loses that tier.
 - **Don't conflate this with the per-detector cache redis backend.**
   They're two independent caches that happen to share `CACHE_REDIS_URL`
   + `CACHE_SALT`. Redis namespaces (`cache:<detector>:<digest>`
@@ -627,8 +844,13 @@ any change to any detector's overrides invalidates the slot
   one doesn't wipe the other.
 - **Don't ship a "pipeline-only mode"** that disables per-detector
   caches automatically when the pipeline cache is on. The
-  trade-off (override fragmentation) is workload-dependent;
-  operators pick.
+  trade-off (override fragmentation, source-tracked prewarm
+  fidelity) is workload-dependent; operators pick.
+- **Don't track source_detectors at the request-stats level.**
+  That's what the separate "Per-detector contribution metrics"
+  task does (process-local counters, no vault storage). The
+  vault's source_detectors field is for prewarm correctness
+  per call_id, not for aggregation.
 
 ---
 
