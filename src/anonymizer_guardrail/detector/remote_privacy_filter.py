@@ -364,6 +364,11 @@ class RemotePrivacyFilterDetector(BaseRemoteDetector):
             "(timeout=%ds).", self.url, self.timeout_s,
         )
 
+    def _default_cache_key(self, text: str) -> tuple:
+        """PF has no per-call overrides today, so the default-overrides
+        key is identical to the always-used key — `(text,)`."""
+        return (text,)
+
     async def detect(self, text: str) -> list[Match]:
         """Public entry point. The PF detector has no per-call
         overrides today, so the cache key is just `(text,)`. Single-

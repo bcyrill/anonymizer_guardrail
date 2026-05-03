@@ -259,6 +259,15 @@ class RemoteGlinerPIIDetector(BaseRemoteDetector):
             self.threshold if self.threshold is not None else "<server default>",
         )
 
+    def _default_cache_key(self, text: str) -> tuple:
+        """Default-overrides cache key — must match what `detect()`
+        produces when called with `labels=None, threshold=None`."""
+        return (
+            text,
+            tuple(self.labels) if self.labels is not None else None,
+            self.threshold,
+        )
+
     async def detect(
         self,
         text: str,

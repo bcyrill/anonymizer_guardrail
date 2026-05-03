@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import secrets
 import threading
 from collections import OrderedDict
 from datetime import date
 from typing import Callable
+
+from .detector.base import ENTITY_TYPES
 
 from babel.core import UnknownLocaleError
 from babel.dates import format_date
@@ -110,6 +113,41 @@ def _seed_for(text: str, entity_type: str, salt: bytes) -> int:
         digest_size=8,
     ).digest()
     return int.from_bytes(h, "big")
+
+
+# Inverse of `_opaque` below — recovers the entity_type from an
+# opaque-token surrogate without consulting the vault. The opaque
+# format is `[<TYPE>_<8 uppercase hex>]`. Returns the canonical
+# entity_type when the input is recognisably an opaque token,
+# otherwise None (Faker output, malformed strings, anything else).
+#
+# Used by the deanonymize-side cache pre-warm (gated by
+# `DETECTOR_CACHE_PREWARM=true`, which the central Config validator
+# pins to opaque tokens only — see config.py). Kept here next to
+# `_opaque` so the format invariant lives in one file.
+_OPAQUE_TOKEN_RE = re.compile(r"^\[(.+)_([0-9A-F]{8})\]$")
+
+
+def opaque_token_entity_type(surrogate: str) -> str | None:
+    """Extract the canonical entity_type from an opaque-token
+    surrogate, or return None when the surrogate isn't recognisable
+    as one. The 8-character hex tail is what makes the prefix
+    unambiguously delimited; without it a Faker output like
+    `[Mr. Robert Jones]` (which doesn't actually occur but
+    hypothetically) couldn't be told apart from a real opaque token.
+
+    The recovered TYPE must be one of the canonical `ENTITY_TYPES` —
+    otherwise the surrogate is malformed (or from a future format
+    version) and we treat it as unrecoverable. Same posture as
+    `Match.__post_init__`'s normalisation, which silently maps
+    unknown types to `OTHER`."""
+    m = _OPAQUE_TOKEN_RE.match(surrogate)
+    if m is None:
+        return None
+    candidate = m.group(1)
+    if candidate not in ENTITY_TYPES:
+        return None
+    return candidate
 
 
 def _opaque(prefix: str, salt: bytes) -> Callable[[Faker, str], str]:

@@ -291,6 +291,13 @@ class LLMDetector(BaseRemoteDetector):
         self.api_key = api_key if api_key is not None else CONFIG.api_key
         self.model = model or CONFIG.model
 
+    def _default_cache_key(self, text: str) -> tuple:
+        """Default-overrides cache key shape — must match what
+        `detect()` produces when called with `model=None,
+        prompt_name=None`. Used by the deanonymize-side cache
+        prewarm path."""
+        return (text, self.model, "default")
+
     async def detect(
         self,
         text: str,

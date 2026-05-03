@@ -35,7 +35,7 @@ from .detector import (
     TYPED_UNAVAILABLE_ERRORS,
 )
 from .detector.base import CachingDetector, Detector, Match
-from .surrogate import SurrogateGenerator
+from .surrogate import SurrogateGenerator, opaque_token_entity_type
 from .vault import VaultBackend, build_vault
 
 log = logging.getLogger("anonymizer.pipeline")
@@ -748,6 +748,25 @@ class Pipeline:
         if not texts:
             return [], {}
 
+        # Reject `use_faker=true` per-call overrides when the global
+        # prewarm flag is on. Mutual-exclusion: prewarm needs opaque
+        # tokens to recover entity types from surrogate prefixes, and
+        # a per-call Faker override would punch a hole in that
+        # invariant for the call_id whose vault entry we'd later use.
+        # Cleared (set to None) so the surrogate generator falls
+        # back to config.use_faker (which the boot validator
+        # already pinned to false). Logged at WARNING — silently
+        # ignoring is what bites operators when the override they
+        # set in code "doesn't take".
+        if config.detector_cache_prewarm and overrides.use_faker is True:
+            log.warning(
+                "Per-call use_faker=true override ignored: "
+                "DETECTOR_CACHE_PREWARM=true requires opaque tokens "
+                "across all calls so the deanonymize-side type recovery "
+                "stays reliable. Disable prewarm or drop the override."
+            )
+            overrides = overrides.model_copy(update={"use_faker": None})
+
         per_text_matches, merged_matches = await self._run_detection(
             texts, api_key=api_key, overrides=overrides,
         )
@@ -807,7 +826,89 @@ class Pipeline:
             "deanonymize call_id=%s entities=%d texts=%d",
             call_id, len(mapping), len(texts),
         )
+
+        # Detector cache pre-warm. Synthesises Match objects from the
+        # vault entries (recovering entity_type from the opaque
+        # surrogate prefix — see surrogate.opaque_token_entity_type)
+        # and writes them into each active cache-using detector's
+        # default-override cache slot. The next request that contains
+        # the same restored text gets cache hits instead of running
+        # detection again — primarily targets replayed-history multi-
+        # turn workloads, where turn N's response shows up as part of
+        # turn N+1's prompt.
+        #
+        # Gated by `config.detector_cache_prewarm`. The boot validator
+        # ensures `USE_FAKER=false` when this flag is on, so every
+        # surrogate in the vault is opaque-format and the entity-type
+        # extractor recovers a canonical type for every entry.
+        if config.detector_cache_prewarm:
+            await self._prewarm_detector_caches(restored, mapping)
+
         return restored
+
+    async def _prewarm_detector_caches(
+        self, restored: list[str], mapping: dict[str, str],
+    ) -> None:
+        """Build synthesised Match objects from the vault `mapping`
+        (surrogate → original) and write them into each active
+        cache-using detector's default-override cache slot for each
+        restored text.
+
+        Per the design rationale (see docs/design-decisions.md →
+        "Pre-warm detector cache from deanonymize-derived matches"):
+        the same deduped match list lands in every cache-using
+        detector's slot — Option 2 of the three architectural shapes
+        considered. Per-detector hit/miss stats become misleading as
+        a documented trade-off.
+
+        Surrogates that don't match the opaque-token format are
+        skipped — produce nothing, leak nothing. With the
+        USE_FAKER=false boot invariant this branch shouldn't fire,
+        but the defensive skip keeps a misconfigured deployment
+        from polluting caches with OTHER-typed entries that would
+        break surrogate consistency.
+
+        On a previously-populated cache slot, `warm_cache` does NOT
+        overwrite (`get_or_compute`'s contract is "compute on miss,
+        return cached on hit") — real detection's result wins over
+        synthesised matches when both paths happen to fire on the
+        same text.
+        """
+        # Build a single synthesised Match list from the vault
+        # entries — same list pre-warms every detector's cache slot
+        # (Option 2's deliberate fan-out).
+        synth: list[Match] = []
+        for surrogate, original in mapping.items():
+            etype = opaque_token_entity_type(surrogate)
+            if etype is None:
+                # Either Faker output (validator should have prevented
+                # this) or a malformed surrogate — skip so we don't
+                # silently store an OTHER-typed entry that would
+                # later break the surrogate generator's `(text, type)`
+                # cache key on a cache hit.
+                continue
+            synth.append(Match(text=original, entity_type=etype))
+
+        if not synth:
+            return
+
+        # Walk active cache-using detectors; warm each one's default
+        # cache slot for each restored text. `_detectors` mirrors the
+        # active detector list at __init__ time; restricting to
+        # `SPECS_WITH_CACHE` filters out regex/denylist (no cache).
+        cache_using = {
+            spec.name for spec in SPECS_WITH_CACHE
+        }
+        for det in self._detectors:
+            if det.name not in cache_using:
+                continue
+            warm = getattr(det, "warm_cache", None)
+            if warm is None:
+                # Test stubs that bypass BaseRemoteDetector.__init__
+                # may not have warm_cache. Skip rather than crash.
+                continue
+            for text in restored:
+                await warm(text, synth)
 
 
 __all__ = ["Pipeline"]

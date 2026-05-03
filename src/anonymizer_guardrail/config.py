@@ -119,6 +119,37 @@ class Config(BaseSettings):
     # Independent from `surrogate_salt`. They could share a value, but
     # rotating one shouldn't force a rotation on the other.
     cache_salt: str = ""
+    # Pre-warm the per-detector result caches from the deanonymize-side
+    # vault entries. When enabled, each `pipeline.deanonymize` call
+    # (post_call) seeds the active detectors' caches with a synthetic
+    # Match list derived from what was anonymized in the matching
+    # pre_call. The next request that contains the same response text
+    # — typical for replayed conversation history — gets cache hits
+    # instead of re-detecting.
+    #
+    # Mutually exclusive with USE_FAKER=true (validated below). The
+    # surrogate format `[<TYPE>_<HEX>]` (opaque tokens) is what makes
+    # entity-type recovery possible without storing the type in the
+    # vault — Faker output (`Robert Jones`, `192.0.2.5`) doesn't
+    # carry that signal, so enabling pre-warm with Faker would either
+    # silently fall back to OTHER (breaking surrogate consistency) or
+    # require the vault schema change we're explicitly avoiding here.
+    #
+    # Caveats accepted by the operator who flips this on:
+    #   * **Misleading per-detector hit/miss stats.** The pre-warm
+    #     writes the same deduped match list to every active
+    #     cache-using detector's slot, so every detector's cache
+    #     "found" entities other detectors actually found.
+    #   * **Override-staleness for non-default per-call overrides.**
+    #     The pre-warm writes to each detector's *default-overrides*
+    #     cache slot (the deanonymize side doesn't carry per-call
+    #     overrides). A future request with non-default overrides
+    #     hits a different slot and runs detection normally; a
+    #     future default-overrides request that's textually identical
+    #     to a non-default-overrides request that produced the
+    #     pre-warm gets the non-default-derived matches in its
+    #     default slot. Stable-overrides workloads aren't affected.
+    detector_cache_prewarm: bool = False
 
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     # Backend selection. "memory" (default) is process-local — fine
@@ -174,6 +205,32 @@ class Config(BaseSettings):
                 "(e.g. redis://localhost:6379/0). Either set the URL or "
                 "switch to VAULT_BACKEND=memory for single-replica "
                 "deployments."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _detector_cache_prewarm_requires_opaque_tokens(self) -> "Config":
+        """`DETECTOR_CACHE_PREWARM=true` requires `USE_FAKER=false`.
+        Pre-warm recovers entity types by parsing the surrogate
+        prefix (`[EMAIL_ADDRESS_…]`); Faker output (`bob@corp.example`)
+        carries no such signal. Allowing both would either silently
+        fall back to `OTHER` for every Faker entity (breaking the
+        surrogate generator's `(text, entity_type)` cache key, and
+        producing different surrogates on cache hits than misses),
+        or require storing entity_type on every vault entry —
+        scope creep we explicitly opted out of when picking this
+        implementation.
+
+        Fail loud at boot rather than at first deanonymize call —
+        same posture as the other cross-field validators."""
+        if self.detector_cache_prewarm and self.use_faker:
+            raise ValueError(
+                "DETECTOR_CACHE_PREWARM=true requires USE_FAKER=false. "
+                "The pre-warm path recovers entity types by parsing the "
+                "opaque surrogate prefix `[TYPE_HEX]` — Faker output "
+                "doesn't carry that signal. Either disable pre-warm "
+                "(DETECTOR_CACHE_PREWARM=false) or switch to opaque "
+                "tokens (USE_FAKER=false)."
             )
         return self
 

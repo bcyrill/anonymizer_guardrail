@@ -185,6 +185,19 @@ of which user authenticated. For gliner, label *order* IS part of
 the key — different orderings are treated as different calls
 because the wire request preserves order.
 
+### Pre-warming from deanonymize
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DETECTOR_CACHE_PREWARM` | `false` | When true, `pipeline.deanonymize` synthesises Match objects from the vault entries it just substituted back, then writes them into each active cache-using detector's default-overrides cache slot. The next request that contains the same restored text hits the cache instead of running detection. **Requires `USE_FAKER=false`** — see [design-decisions → Detector cache pre-warm from deanonymize-derived matches](design-decisions.md#detector-cache-pre-warm-from-deanonymize-derived-matches) for the rationale and the documented caveats (misleading per-detector stats, override-staleness for non-default-overrides workloads). The boot validator enforces the mutual exclusion. |
+
+The primary win is the assistant-message-on-turn-N+1 case: today
+the cache hits on every replayed prior user message but always
+misses on the most recent assistant reply (which was never put
+through detection — only deanonymize). Pre-warm closes that
+half, dropping steady-state cost from "two detection calls per
+round-trip" to "one new call per round-trip".
+
 ### When to enable
 
 Worth turning on when you serve multi-turn conversations and the LLM

@@ -103,6 +103,48 @@ class BaseRemoteDetector:
         Satisfies the `CachingDetector` Protocol contract."""
         return self._cache.stats()
 
+    def _default_cache_key(self, text: str) -> Hashable:
+        """Cache key this detector would use for `text` with NO
+        per-call overrides applied. Subclasses MUST override —
+        the key shape is per-detector (LLM uses
+        `(text, model, prompt_name)`, gliner uses
+        `(text, labels_tuple, threshold)`, etc.). Used by the
+        deanonymize-side prewarm path so the synthesized matches
+        land in the slot future default-overrides requests will
+        look up.
+
+        Default raises so a future cache-using detector subclass
+        that forgets to override fails loud rather than silently
+        pre-warming the wrong slot."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must override _default_cache_key "
+            "to support DETECTOR_CACHE_PREWARM."
+        )
+
+    async def warm_cache(self, text: str, matches: list[Match]) -> None:
+        """Pre-warm this detector's cache with `matches` keyed at the
+        default-overrides slot for `text`. No-op when the cache is
+        disabled (`enabled=False`). On a cache that already has the
+        slot populated, the existing entry stays — `get_or_compute`'s
+        contract is "compute on miss, return cached on hit", so we
+        don't overwrite real-detection results with synthesized ones
+        if both paths happen to fire on the same text.
+
+        Empty `text` is a no-op (matches `_detect_via_cache`'s
+        empty-text short-circuit so the cache never holds an entry
+        keyed on empty input)."""
+        if not text or not text.strip():
+            return
+        if not self._cache.enabled:
+            return
+        cache_key = self._default_cache_key(text)
+        # `get_or_compute` returns `list[Match]` but we don't need
+        # the result — we just want the side effect of populating
+        # the slot if missing.
+        async def _synth() -> list[Match]:
+            return list(matches)
+        await self._cache.get_or_compute(cache_key, _synth)
+
     async def aclose(self) -> None:
         """Drain the httpx connection pool AND the cache backend.
         Wired to `Pipeline.aclose()` which fires on FastAPI shutdown
