@@ -94,6 +94,7 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 | **Detector overview + comparison** | [docs/detectors/](docs/detectors/index.md) |
 | Per-detector deep dives | [regex](docs/detectors/regex.md), [denylist](docs/detectors/denylist.md), [privacy-filter](docs/detectors/privacy-filter.md), [gliner-pii](docs/detectors/gliner-pii.md), [llm](docs/detectors/llm.md) |
 | Cross-cutting env vars (HTTP, surrogate, vault) | [docs/configuration.md](docs/configuration.md) |
+| Deployment shapes — picking config for your use case | [docs/deployment-shapes.md](docs/deployment-shapes.md) |
 | Per-request overrides | [docs/per-request-overrides.md](docs/per-request-overrides.md) |
 | LiteLLM wiring | [docs/litellm-integration.md](docs/litellm-integration.md) |
 | Surrogate generation, Faker, salt, locales | [docs/surrogates.md](docs/surrogates.md) |
