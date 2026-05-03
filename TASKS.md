@@ -329,14 +329,60 @@ and the two pipeline call sites. Option 3 needs more (see below).
 **Architectural shape — three alternatives, decide at
 implementation time:**
 
-1. **New pipeline-level cache.** A separate cache, distinct
-   from the per-detector caches, keyed `text → tuple[Match, ...]`
-   that holds the deduped match set. `_detect_one(text)` checks
-   this cache first; on hit, skips ALL detectors and returns the
-   cached set directly. The deanonymize step is a natural
-   producer for this cache; per-detector caches stay focused on
-   their own detector's output. **Cleanest, but adds a new
-   cache type.**
+1. **New pipeline-level cache (bidirectional).** A separate cache,
+   distinct from the per-detector caches, that holds the deduped
+   match set keyed by *(text + every per-call override that affects
+   the result)*. The pipeline cache is consulted AND populated by
+   both code paths:
+     * **Detection writes**: after `_detect_one(text)` runs the
+       active detectors and dedups, the result lands in the
+       pipeline cache so the next request for the same text hits
+       in one shot.
+     * **Deanonymize pre-warm**: `pipeline.deanonymize` synthesises
+       matches from vault entries and writes them into the
+       pipeline cache for the deanonymized output text.
+
+   The two paths use the same write — the deanonymize hook is just
+   pre-warming the cache for text it knows would have produced
+   those matches if detection had run. `_detect_one(text)` checks
+   the pipeline cache first; on hit, skips ALL detectors and
+   returns the cached set directly. Per-detector caches still
+   exist as a fallback for the cold-pipeline-key case (operator
+   evicted, TTL fired) and for capacity tuning of individual
+   detectors, but their hit-rate share drops once the pipeline
+   cache is in play.
+
+   **Why bidirectional and not just deanonymize-fed**: a
+   one-way pipeline cache is asymmetric. A user-typed message that
+   misses the pipeline cache populates only per-detector caches,
+   so the next time the same text appears (whether echoed back in
+   a future turn's history or sent again as a fresh request) it
+   misses the pipeline cache *again* and has to rebuild via
+   per-detector hits. With bidirectional writes, every text-level
+   repeat — whatever its provenance — is one pipeline-cache lookup
+   away. That symmetry is the whole point of having a pipeline
+   cache; restricting it to the deanonymize-fed path leaves the
+   primary repeated-text case (replayed conversation history) on
+   the slower fallback path.
+
+   **Cache-key shape**: must include every per-call override that
+   affects detector output, otherwise the cache returns stale
+   results when overrides change. Concretely:
+
+   ```
+   (text, detector_mode, frozen_per_call_kwargs)
+   ```
+
+   where `frozen_per_call_kwargs` is a hashable
+   tuple-of-tuples version of the per-detector kwargs each active
+   detector's `prepare_call_kwargs` produced for the request (LLM's
+   `(model, prompt_name)`, gliner's `(labels_tuple, threshold)`,
+   etc.). Verbose, but correct — this is the same correctness
+   concern flagged for Option 2's pre-warming, just lifted to the
+   pipeline-cache key. **Cleanest abstraction; adds a new cache
+   type but in exchange the pipeline cache becomes the dominant
+   caching layer and the per-detector caches stop being the
+   first-line lookup.**
 2. **Pre-warm each per-detector cache** with the deduped match
    set. Doesn't add a cache type; reuses the existing
    `DetectorResultCache`. Downside: per-detector hit/miss stats
@@ -391,12 +437,34 @@ implementation time:**
    `<prefix>_cache_hits/misses` for capacity planning or
    detector-mix optimisation.
 
-Option 1 is the cleanest abstraction. Option 2 is the smallest
-diff. Option 3 is the only one whose per-detector cache hits
-match what re-running each detector would produce. Pick based on
-which property — clean separation, small change, or per-detector
-honesty — matters most for the deployment that triggered this
-work.
+Decision matrix:
+
+  * **Option 1 (bidirectional pipeline cache)**: cleanest
+    abstraction. Symmetric — text-level repeats hit the pipeline
+    cache regardless of provenance. Adds a new cache type but
+    in exchange the pipeline cache becomes the dominant caching
+    layer; per-detector caches drop to fallback. Pick this when
+    the deployment cares about cache effectiveness on the whole
+    request, not per-detector slicing.
+  * **Option 2 (deduped pre-warm, no new cache type)**: smallest
+    diff. Reuses existing `DetectorResultCache` infrastructure.
+    Per-detector cache stats lie under this option (every detector
+    appears to "find" everything other detectors found). Pick
+    this when the diff size matters more than the stats fidelity.
+  * **Option 3 (per-detector pre-warm with source tracking)**:
+    only option whose per-detector cache hits match what
+    re-running each detector would produce. Per-detector stats
+    stay meaningful. Larger vault footprint than 1 or 2 (3-10×
+    bytes per entry). Pick this when operators read per-detector
+    `<prefix>_cache_hits/misses` for capacity planning or
+    detector-mix optimisation, and the vault footprint
+    is acceptable.
+
+Options 1 and 3 are not mutually exclusive — a deployment could
+ship both: Option 3 pre-warms per-detector caches honestly, AND
+Option 1's bidirectional pipeline cache catches whole-request
+repeats. The complexity adds up though, so most deployments will
+pick one.
 
 **Concrete trigger:**
 
