@@ -28,9 +28,30 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 
 import pytest
 
-from anonymizer_guardrail.vault import VaultBackend
+from anonymizer_guardrail.vault import VaultBackend, VaultEntry, VaultSurrogate
 from anonymizer_guardrail.vault_memory import MemoryVault
 from anonymizer_guardrail.vault_redis import RedisVault
+
+
+def _entry(**surrogates: tuple[str, str, tuple[str, ...]] | tuple[str, str]) -> VaultEntry:
+    """Helper: build a VaultEntry from a kwargs-style spec.
+
+    Each kwarg is `surrogate=(original, entity_type)` or
+    `surrogate=(original, entity_type, source_detectors)`. Used by
+    the contract tests below to keep test data terse. Real callers
+    construct VaultEntry / VaultSurrogate directly.
+    """
+    out: dict[str, VaultSurrogate] = {}
+    for sur, value in surrogates.items():
+        if len(value) == 2:
+            original, etype = value
+            sources: tuple[str, ...] = ()
+        else:
+            original, etype, sources = value  # type: ignore[misc]
+        out[sur] = VaultSurrogate(
+            original=original, entity_type=etype, source_detectors=sources,
+        )
+    return VaultEntry(surrogates=out)
 
 
 @pytest.fixture(params=["memory", "redis"])
@@ -67,25 +88,28 @@ async def vault(request) -> VaultBackend:
 
 
 async def test_put_and_pop_roundtrip(vault: VaultBackend) -> None:
-    """Basic happy path: put a mapping, get it back via pop. Every
+    """Basic happy path: put an entry, get it back via pop. Every
     backend must satisfy this."""
-    await vault.put("call-1", {"surrogate": "original"})
-    assert await vault.pop("call-1") == {"surrogate": "original"}
+    entry = _entry(surrogate=("original", "PERSON"))
+    await vault.put("call-1", entry)
+    got = await vault.pop("call-1")
+    assert got == entry
 
 
 async def test_pop_after_pop_is_idempotent(vault: VaultBackend) -> None:
-    """A second `pop` for the same call_id returns `{}`. Pins the
+    """A second `pop` for the same call_id returns an empty entry. Pins the
     "pop is destructive" semantics that both backends honour
     (MemoryVault deletes the dict entry; RedisVault uses GETDEL)."""
-    await vault.put("call-1", {"k": "v"})
-    assert await vault.pop("call-1") == {"k": "v"}
-    assert await vault.pop("call-1") == {}
+    entry = _entry(s=("v", "OTHER"))
+    await vault.put("call-1", entry)
+    assert await vault.pop("call-1") == entry
+    assert await vault.pop("call-1") == VaultEntry()
 
 
 async def test_pop_missing_returns_empty(vault: VaultBackend) -> None:
-    """A call_id that was never `put` returns `{}` — the "no-op for
-    requests without a matching pre-call" contract."""
-    assert await vault.pop("never-stored") == {}
+    """A call_id that was never `put` returns an empty entry — the
+    "no-op for requests without a matching pre-call" contract."""
+    assert await vault.pop("never-stored") == VaultEntry()
 
 
 # ── Contract: defensive no-ops on degenerate input ──────────────────────
@@ -93,19 +117,49 @@ async def test_pop_missing_returns_empty(vault: VaultBackend) -> None:
 
 async def test_empty_call_id_is_noop(vault: VaultBackend) -> None:
     """Empty call_id on `put` doesn't store anything; on `pop`
-    returns `{}`. Both backends must honour this — without it a
+    returns empty. Both backends must honour this — without it a
     misconfigured caller could overwrite a "" entry across requests."""
-    await vault.put("", {"k": "v"})
-    assert await vault.pop("") == {}
+    await vault.put("", _entry(s=("v", "OTHER")))
+    assert await vault.pop("") == VaultEntry()
 
 
-async def test_empty_mapping_is_noop(vault: VaultBackend) -> None:
-    """Empty mapping on `put` doesn't roundtrip a placeholder entry.
-    Important so a request with no detected entities (mapping={}) doesn't
-    pollute the vault with empty entries that the matching post_call
-    would then need to interpret."""
-    await vault.put("call-empty-map", {})
-    assert await vault.pop("call-empty-map") == {}
+async def test_empty_entry_is_noop(vault: VaultBackend) -> None:
+    """Empty entry on `put` doesn't roundtrip a placeholder. Important
+    so a request with no detected entities doesn't pollute the vault
+    with empty entries that the matching post_call would then need to
+    interpret."""
+    await vault.put("call-empty", VaultEntry())
+    assert await vault.pop("call-empty") == VaultEntry()
+
+
+# ── Contract: structured fields ─────────────────────────────────────────
+
+
+async def test_full_entry_roundtrip(vault: VaultBackend) -> None:
+    """All three structured additions (entity_type, source_detectors,
+    detector_mode + kwargs) survive the round-trip on every backend."""
+    entry = VaultEntry(
+        surrogates={
+            "[PERSON_ABCD1234]": VaultSurrogate(
+                original="Alice Smith",
+                entity_type="PERSON",
+                source_detectors=("regex", "llm"),
+            ),
+            "[EMAIL_ADDRESS_DEADBEEF]": VaultSurrogate(
+                original="alice@example.com",
+                entity_type="EMAIL_ADDRESS",
+                source_detectors=("regex",),
+            ),
+        },
+        detector_mode=("regex", "llm"),
+        kwargs=(
+            ("llm", (("model", "anonymize"), ("prompt_name", "default"))),
+            ("regex", (("overlap_strategy", None), ("patterns_name", None))),
+        ),
+    )
+    await vault.put("call-full", entry)
+    got = await vault.pop("call-full")
+    assert got == entry
 
 
 # ── Contract: aclose ────────────────────────────────────────────────────

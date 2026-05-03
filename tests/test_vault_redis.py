@@ -23,7 +23,18 @@ os.environ.setdefault("DETECTOR_MODE", "regex")
 
 import pytest
 
+from anonymizer_guardrail.vault import VaultEntry, VaultSurrogate
 from anonymizer_guardrail.vault_redis import RedisVault, RedisVaultError
+
+
+def _entry(surrogate: str = "sur", original: str = "orig") -> VaultEntry:
+    """Test helper — single-surrogate entry. Backend-specific tests
+    don't care about the structured fields."""
+    return VaultEntry(
+        surrogates={
+            surrogate: VaultSurrogate(original=original, entity_type="OTHER"),
+        },
+    )
 
 
 @pytest.fixture
@@ -54,20 +65,21 @@ async def vault() -> RedisVault:
 
 async def test_getdel_only_one_pop_wins(vault: RedisVault) -> None:
     """Two concurrent pops on the same call_id: one wins (gets the
-    mapping), the other gets `{}`. GETDEL is atomic, so the race is
+    entry), the other gets empty. GETDEL is atomic, so the race is
     won by the first server-side request — not partially observed."""
-    await vault.put("call-race", {"k": "v"})
+    entry = _entry("k", "v")
+    await vault.put("call-race", entry)
 
     # Run two pops in parallel against the same key.
     results = await asyncio.gather(
         vault.pop("call-race"),
         vault.pop("call-race"),
     )
-    # Exactly one should have the mapping; the other should be empty.
-    non_empty = [r for r in results if r]
-    empty = [r for r in results if not r]
+    # Exactly one should have the entry; the other should be empty.
+    non_empty = [r for r in results if not r.is_empty]
+    empty = [r for r in results if r.is_empty]
     assert len(non_empty) == 1
-    assert non_empty[0] == {"k": "v"}
+    assert non_empty[0] == entry
     assert len(empty) == 1
 
 
@@ -82,7 +94,7 @@ async def test_ttl_set_on_put() -> None:
     with patch("redis.asyncio.from_url", return_value=fake_client):
         v = RedisVault(url="redis://fake/0", ttl_s=10)
 
-    await v.put("call-ttl", {"k": "v"})
+    await v.put("call-ttl", _entry("k", "v"))
     # Inspect TTL via the underlying fakeredis client. -1 = no expire,
     # -2 = key doesn't exist, positive = seconds remaining.
     ttl = await fake_client.ttl("vault:call-ttl")
@@ -103,7 +115,7 @@ async def test_re_put_refreshes_ttl() -> None:
     with patch("redis.asyncio.from_url", return_value=fake_client):
         v = RedisVault(url="redis://fake/0", ttl_s=60)
 
-    await v.put("call-refresh", {"k": "v1"})
+    await v.put("call-refresh", _entry("k", "v1"))
     # Manually wind the TTL down (fakeredis supports EXPIRE) so we can
     # tell whether the second put resets it.
     await fake_client.expire("vault:call-refresh", 5)
@@ -111,35 +123,54 @@ async def test_re_put_refreshes_ttl() -> None:
     assert ttl_before <= 5
 
     # Second put — should reset TTL to the full window.
-    await v.put("call-refresh", {"k": "v2"})
+    await v.put("call-refresh", _entry("k", "v2"))
     ttl_after = await fake_client.ttl("vault:call-refresh")
     assert ttl_after > 5  # refreshed
     assert ttl_after <= 60
 
     # And the value was overwritten.
-    assert await v.pop("call-refresh") == {"k": "v2"}
+    assert await v.pop("call-refresh") == _entry("k", "v2")
     await v.aclose()
 
 
 # ── JSON serialization ──────────────────────────────────────────────────
 
 
-async def test_value_is_json_encoded() -> None:
-    """The wire format is JSON, not pickle / msgpack. Operators
-    debugging from `redis-cli GET vault:<id>` should see readable
-    JSON — pin that contract."""
+async def test_value_is_json_encoded_with_full_shape() -> None:
+    """The wire format is JSON with the three-key top-level object
+    (surrogates / detector_mode / kwargs). Operators debugging from
+    `redis-cli GET vault:<id>` should see readable structured JSON —
+    pin that contract."""
     import fakeredis.aioredis as fakeredis
 
     fake_client = fakeredis.FakeRedis(decode_responses=True)
     with patch("redis.asyncio.from_url", return_value=fake_client):
         v = RedisVault(url="redis://fake/0", ttl_s=60)
 
-    mapping = {"sur1": "orig1", "sur2": "orig2"}
-    await v.put("call-json", mapping)
+    entry = VaultEntry(
+        surrogates={
+            "[PERSON_ABCD1234]": VaultSurrogate(
+                original="Alice", entity_type="PERSON",
+                source_detectors=("regex", "llm"),
+            ),
+        },
+        detector_mode=("regex", "llm"),
+        kwargs=(("llm", (("model", "anon"),)),),
+    )
+    await v.put("call-json", entry)
 
     raw = await fake_client.get("vault:call-json")
     assert isinstance(raw, str)
-    assert json.loads(raw) == mapping
+    decoded = json.loads(raw)
+    # Structured shape — pin each top-level key so a future refactor
+    # that flattens or renames the wire format breaks loud.
+    assert decoded == {
+        "surrogates": {
+            "[PERSON_ABCD1234]": ["Alice", "PERSON", ["regex", "llm"]],
+        },
+        "detector_mode": ["regex", "llm"],
+        "kwargs": [["llm", [["model", "anon"]]]],
+    }
     await v.aclose()
 
 
@@ -147,8 +178,8 @@ async def test_corrupted_json_returns_empty_logs_error(
     vault: RedisVault, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If a vault entry is corrupted (e.g. another process wrote the
-    key with a non-JSON value), pop should return {} and log ERROR
-    — same severity contract as MemoryVault's TTL-expiry case."""
+    key with a non-JSON value), pop should return an empty entry and
+    log ERROR — same severity contract as MemoryVault's TTL-expiry case."""
     import logging
 
     # Inject a non-JSON value directly via the underlying client.
@@ -156,8 +187,33 @@ async def test_corrupted_json_returns_empty_logs_error(
 
     with caplog.at_level(logging.ERROR, logger="anonymizer.vault.redis"):
         result = await vault.pop("call-corrupt")
-    assert result == {}
+    assert result == VaultEntry()
     assert any("non-JSON" in r.message for r in caplog.records)
+
+
+async def test_unexpected_json_shape_returns_empty_logs_error(
+    vault: RedisVault, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A JSON value with the wrong shape (not the three-key object)
+    surfaces as ERROR + empty entry, same contract as raw-JSON
+    corruption. Pins the decoder's defensive guarding so a malformed
+    write from a different process version doesn't crash the
+    deanonymize path."""
+    import logging
+
+    # Legacy flat shape (just a string→string dict — what the previous
+    # vault wrote) — must not silently round-trip; the new decoder
+    # treats it as corrupted and returns empty.
+    await vault._client.set(
+        "vault:call-legacy",
+        json.dumps({"sur1": "orig1"}),
+        ex=60,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="anonymizer.vault.redis"):
+        result = await vault.pop("call-legacy")
+    assert result == VaultEntry()
+    assert any("unexpected JSON shape" in r.message for r in caplog.records)
 
 
 # ── Key namespacing ─────────────────────────────────────────────────────
@@ -166,7 +222,7 @@ async def test_corrupted_json_returns_empty_logs_error(
 async def test_key_is_prefixed_with_vault(vault: RedisVault) -> None:
     """Keys go under the `vault:` prefix so the backend can share a
     Redis instance with other consumers without colliding."""
-    await vault.put("my-call", {"k": "v"})
+    await vault.put("my-call", _entry())
 
     keys = [k async for k in vault._client.scan_iter()]
     assert any(k == "vault:my-call" for k in keys)
@@ -196,7 +252,7 @@ async def test_redis_failure_on_put_wraps_as_redis_vault_error() -> None:
     v._client.set = boom  # type: ignore[method-assign]
 
     with pytest.raises(RedisVaultError, match="Failed to store"):
-        await v.put("call-1", {"k": "v"})
+        await v.put("call-1", _entry())
 
 
 async def test_redis_failure_on_pop_wraps_as_redis_vault_error() -> None:
@@ -234,6 +290,6 @@ async def test_size_returns_zero(vault: RedisVault) -> None:
     """`size()` is sync (it's a /health accessor) and the SCAN it
     would need is async; we return 0 as a documented placeholder.
     Operators query Redis directly for the actual count."""
-    await vault.put("call-1", {"k": "v"})
-    await vault.put("call-2", {"k": "v"})
+    await vault.put("call-1", _entry())
+    await vault.put("call-2", _entry())
     assert vault.size() == 0

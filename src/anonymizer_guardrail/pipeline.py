@@ -1,13 +1,17 @@
 """
 Anonymization pipeline.
 
-Wires the detectors, surrogate generator, and vault together. Two entry points:
+Wires the detectors, surrogate generator, vault, and pipeline-level
+result cache together. Two entry points:
 
-  * anonymize(texts, call_id) → modified texts. Detects entities, generates
-    surrogates, replaces in-place, persists the reverse mapping under call_id.
+  * anonymize(texts, call_id) → modified texts. Detects entities,
+    generates surrogates, replaces in-place, persists the structured
+    `VaultEntry` (typed surrogates + per-detector source attribution
+    + frozen kwargs) under call_id.
 
-  * deanonymize(texts, call_id) → restored texts. Looks up the mapping and
-    substitutes surrogates back to originals.
+  * deanonymize(texts, call_id) → restored texts. Looks up the entry
+    and substitutes surrogates back to originals; optionally pre-warms
+    both cache layers (pipeline + per-detector) from the typed entry.
 
 Detector wiring is driven by `detector.REGISTERED_SPECS` — a list of
 `DetectorSpec` constants, one per DETECTOR_MODE token. The pipeline
@@ -16,6 +20,28 @@ factory dispatch table, exception handlers, and `/health` stats
 payload. Adding a new detector is a one-line append to the registry
 plus the spec definition in the detector's own module — no edits in
 this file. See `detector/spec.py` for the descriptor shape.
+
+# Pipeline-level result cache
+
+When `PIPELINE_CACHE_BACKEND != "none"`, the pipeline caches the
+*deduped* match list per text keyed by `(text, detector_mode,
+frozen_per_call_kwargs)`. The wrap goes around `_detect_one`'s
+per-text fan-out — on a hit, no detector dispatch happens at all.
+The deanonymize-side prewarm hook also writes here, plus per-detector
+caches filtered by `source_detectors` (Option-3-style fidelity — see
+docs/design-decisions.md). Default off; the cache is constructed
+unconditionally and a no-op `_DisabledPipelineCache` keeps the wrap
+hot-path branch-free.
+
+# Vault entry shape
+
+The vault stores a structured `VaultEntry` per call_id (not a flat
+surrogate→original dict): per-surrogate `entity_type` +
+`source_detectors`, plus call-level `detector_mode` + frozen kwargs.
+Required by the deanonymize-side prewarm so synthesised matches
+carry the right type AND so each per-detector cache slot only gets
+*that* detector's matches (not the deduped union). See
+`vault.py` for the shape and the encoding rationale.
 """
 
 from __future__ import annotations
@@ -35,8 +61,21 @@ from .detector import (
     TYPED_UNAVAILABLE_ERRORS,
 )
 from .detector.base import CachingDetector, Detector, Match
-from .surrogate import SurrogateGenerator, opaque_token_entity_type
-from .vault import VaultBackend, build_vault
+from .pipeline_cache import (
+    MatchWithSources,
+    PipelineCacheKey,
+    PipelineResultCache,
+    build_pipeline_cache,
+)
+from .surrogate import SurrogateGenerator
+from .vault import (
+    FrozenCallKwargs,
+    VaultBackend,
+    VaultEntry,
+    VaultSurrogate,
+    build_vault,
+    freeze_kwargs,
+)
 
 log = logging.getLogger("anonymizer.pipeline")
 
@@ -122,23 +161,49 @@ def _build_detectors() -> list[Detector]:
     return detectors
 
 
-def _dedup(matches: Iterable[Match]) -> list[Match]:
-    """Keep one Match per unique text, preferring the first-seen entity_type.
+def _dedup_with_sources(
+    per_detector: list[tuple[str, list[Match]]],
+) -> list[MatchWithSources]:
+    """Dedup per-detector match lists into one list of unique-by-text
+    matches, attributing each to the tuple of detectors that
+    independently produced it.
 
-    Keying on text alone (not `(text, type)`) is intentional: the same
-    span getting flagged by two detectors with different types — e.g.
-    regex says EMAIL_ADDRESS, llm says PERSON — is the *normal* case,
-    and we need exactly one surrogate per substring. The detector
-    listed earlier in DETECTOR_MODE wins type-resolution, which is
-    why operators put deterministic detectors (regex, denylist) first
-    so their shape-based classifications beat the LLM/NER layers'
-    interpretive ones. See `docs/detectors/index.md` →
-    "When detectors disagree" for the worked example.
+    Same dedup semantics as the legacy `_dedup`: key on text alone,
+    first-seen entity_type wins (so a regex,llm order keeps regex's
+    EMAIL_ADDRESS over llm's PERSON for an "alice@…" string).
+    Different here: we record EVERY detector that returned a given
+    text, in order of first appearance, so the vault entry's
+    `source_detectors` field lets the deanonymize-side prewarm filter
+    per-detector cache writes by which detector actually produced
+    which entity.
 
-    Don't "fix" this by keying on `(text, entity_type)` — that
-    produces two surrogates for the same substring, and the
-    replacement regex then can't tell which to use.
+    Returns a list of `(Match, source_detectors)` pairs. Insertion
+    order matches the legacy `_dedup` (first-seen text wins position).
     """
+    seen: dict[str, Match] = {}
+    sources: dict[str, list[str]] = {}
+    for det_name, matches in per_detector:
+        for m in matches:
+            if not m.text:
+                continue
+            if m.text not in seen:
+                seen[m.text] = m
+                sources[m.text] = [det_name]
+            else:
+                # Same text from a second detector — record the
+                # additional source. Order of first appearance is
+                # preserved (de-dup by `not in` rather than `set`).
+                if det_name not in sources[m.text]:
+                    sources[m.text].append(det_name)
+    return [(seen[text], tuple(sources[text])) for text in seen]
+
+
+def _dedup(matches: Iterable[Match]) -> list[Match]:
+    """Legacy dedup helper — same shape as `_dedup_with_sources` but
+    drops the source attribution. Kept for the merged-dispatch path
+    below where we attribute every entity to the merged-mode detector
+    that produced it (one detector per merged blob, no cross-detector
+    dedup needed)."""
     seen: dict[str, Match] = {}
     for m in matches:
         if m.text and m.text not in seen:
@@ -168,6 +233,29 @@ def _build_replacer(mapping: dict[str, str]) -> Callable[[str], str]:
     return apply
 
 
+def _build_call_kwargs(
+    active: list[Detector],
+    overrides: Overrides,
+    api_key: str | None,
+) -> FrozenCallKwargs:
+    """Compute the per-call frozen kwargs for the pipeline cache key
+    AND the vault entry. One tuple per request, shared across every
+    text in the request.
+
+    Each entry is `(detector_name, frozen_kwargs)` for every active
+    detector — even the ones whose `cache_kwargs` is empty (the empty
+    tuple is meaningful: it pins "this detector ran with no
+    overrides"). Order matches the active-detectors list so the
+    cache key is deterministic across calls with the same DETECTOR_MODE.
+    """
+    out: list[tuple[str, tuple[tuple[str, Any], ...]]] = []
+    for det in active:
+        spec = SPECS_BY_NAME[det.name]
+        raw = spec.resolve_cache_kwargs(overrides, api_key)
+        out.append((det.name, freeze_kwargs(raw)))
+    return tuple(out)
+
+
 class Pipeline:
     def __init__(self) -> None:
         self._detectors: list[Detector] = _build_detectors()
@@ -177,6 +265,16 @@ class Pipeline:
         # type so callers don't depend on the concrete implementation —
         # see `vault.build_vault()` for the dispatch.
         self._vault: VaultBackend = build_vault()
+        # Pipeline-level result cache. Default backend is `none` (a
+        # no-op passthrough) so existing deployments don't pay any
+        # storage cost; operators opt in via PIPELINE_CACHE_BACKEND.
+        # Constructed unconditionally so the wrap-around-detect path
+        # stays branch-free.
+        self._pipeline_cache: PipelineResultCache = build_pipeline_cache(
+            backend=config.pipeline_cache_backend,
+            cache_max_size=config.pipeline_cache_max_size,
+            cache_ttl_s=config.pipeline_cache_ttl_s,
+        )
 
         # Concurrency caps and in-flight counters live in dicts keyed
         # by spec name — one entry per detector that opted into a
@@ -208,9 +306,11 @@ class Pipeline:
             for spec in SPECS_WITH_SEMAPHORE
         ]
         log.info(
-            "Pipeline ready — detectors=[%s], vault_ttl=%ds, %s, %s",
+            "Pipeline ready — detectors=[%s], vault_ttl=%ds, "
+            "pipeline_cache=%s, %s, %s",
             ", ".join(d.name for d in self._detectors),
             config.vault_ttl_s,
+            config.pipeline_cache_backend,
             ", ".join(fc_parts),
             ", ".join(cap_parts),
         )
@@ -244,6 +344,29 @@ class Pipeline:
                     upper, upper, upper,
                 )
 
+        # Same warning but for the pipeline cache. A merged-mode
+        # detector produces unique-by-construction blobs, so any text
+        # we'd cache against ends up being unique too — pipeline cache
+        # entries become 100% miss. Only fires when the pipeline cache
+        # is actually live (backend != "none"); otherwise the merged
+        # mode is just merged mode.
+        if config.pipeline_cache_backend != "none":
+            for spec in REGISTERED_SPECS:
+                mode = getattr(spec.config, "input_mode", "per_text")
+                if mode == "merged":
+                    log.warning(
+                        "%s detector configured with input_mode=merged "
+                        "AND PIPELINE_CACHE_BACKEND=%s. Merged-mode "
+                        "detectors run against unique-by-construction "
+                        "blobs, so pipeline cache entries for the "
+                        "merged-blob path will be 100%% miss. The "
+                        "per-text path on the same request still benefits "
+                        "from the cache; switch %s_INPUT_MODE=per_text "
+                        "to extend the win to that detector too.",
+                        spec.name, config.pipeline_cache_backend,
+                        spec.name.upper(),
+                    )
+
     def stats(self) -> dict[str, object]:
         """Snapshot of pipeline-internal counters for the /health probe.
         All reads are cheap and lock-free.
@@ -258,6 +381,16 @@ class Pipeline:
             "surrogate_cache_size": cache_size,
             "surrogate_cache_max": cache_max,
         }
+        # Pipeline-level cache snapshot. Same four-key shape detectors
+        # already use, prefixed with `pipeline_cache_`. Backend reports
+        # the configured value (memory/redis/none) so operators can
+        # verify the selection landed without consulting logs.
+        pc_stats = self._pipeline_cache.stats()
+        out["pipeline_cache_backend"] = config.pipeline_cache_backend
+        out["pipeline_cache_size"]    = pc_stats["size"]
+        out["pipeline_cache_max"]     = pc_stats["max"]
+        out["pipeline_cache_hits"]    = pc_stats["hits"]
+        out["pipeline_cache_misses"]  = pc_stats["misses"]
         # Per-detector concurrency snapshot. Key names use the spec's
         # `stats_prefix` (e.g. `pf_in_flight`) rather than the raw
         # detector name (`privacy_filter_in_flight`) for legacy
@@ -433,24 +566,33 @@ class Pipeline:
         api_key: str | None = None,
         overrides: Overrides = Overrides.empty(),
         detectors: list[Detector] | None = None,
-    ) -> list[Match]:
+        call_kwargs: FrozenCallKwargs | None = None,
+    ) -> list[MatchWithSources]:
         """Run a per-text fan-out: every detector in `detectors` against
-        the same text in parallel, then dedup.
+        the same text in parallel, then dedup with source attribution.
 
-        `detectors=None` → resolve from `overrides.detector_mode` (the
-        default behaviour for direct callers). The merged-dispatch path
-        in `anonymize` passes an explicit subset so it doesn't double-
-        count detectors that already ran in merged mode.
+        Wrapped by the pipeline-level cache: on a hit, no detector
+        dispatch happens at all and the cached
+        `list[(Match, source_detectors)]` is returned directly. Cache
+        key shape = `(text, detector_mode, frozen_call_kwargs)` —
+        detector_mode is the active list at this call (after override
+        resolution); frozen_call_kwargs is supplied by the caller (so
+        the merged-dispatch path and the per-text path share one
+        per-request kwargs computation).
 
-        Regex is CPU-bound and fast; the LLM call dominates total latency.
-        Running them concurrently means the per-text floor is `max(regex,
-        llm)` instead of `regex + llm`. Cheap regardless — and if a second
-        slow detector ever gets added, the win compounds.
+        `detectors=None` → resolve from `overrides.detector_mode`. The
+        merged-dispatch path in `_run_detection` passes an explicit
+        subset so it doesn't double-count detectors that already ran
+        in merged mode.
 
-        Concurrency caps (LLM, privacy_filter, gliner_pii) are independent
-        per-detector semaphores keyed by spec name; throttling one doesn't
-        starve the others. CPU-cheap detectors (regex, denylist) skip
-        gating entirely.
+        Regex is CPU-bound and fast; the LLM call dominates total
+        latency. Running them concurrently means the per-text floor is
+        `max(regex, llm)` instead of `regex + llm`.
+
+        Concurrency caps (LLM, privacy_filter, gliner_pii) are
+        independent per-detector semaphores keyed by spec name;
+        throttling one doesn't starve the others. CPU-cheap detectors
+        (regex, denylist) skip gating entirely.
         """
         active = (
             self._resolve_active_detectors(overrides)
@@ -459,46 +601,54 @@ class Pipeline:
         if not active:
             return []
 
-        # TaskGroup (vs asyncio.gather) cancels in-flight sibling tasks
-        # the moment one detector raises a fail-closed error. Matters
-        # because the request is about to BLOCK; a still-running
-        # privacy_filter call (hundreds of ms locally, seconds remotely)
-        # would just be wasted work. gather() left siblings running
-        # until completion and discarded their results.
-        #
-        # The except* unwrap re-raises the first matching typed exception
-        # so main.py's typed-error handler matches — it wouldn't catch
-        # the BaseExceptionGroup TaskGroup raises by default. The tuple
-        # comes from the registry, so adding a new detector with its
-        # own typed error doesn't require an edit here.
-        try:
-            async with asyncio.TaskGroup() as tg:
-                tasks = [
-                    tg.create_task(
-                        self._run_detector(d, text, api_key=api_key, overrides=overrides)
-                    )
-                    for d in active
-                ]
-        except* TYPED_UNAVAILABLE_ERRORS as eg:
-            raise eg.exceptions[0] from None
+        if call_kwargs is None:
+            call_kwargs = _build_call_kwargs(active, overrides, api_key)
+        detector_mode = tuple(d.name for d in active)
+        cache_key: PipelineCacheKey = (text, detector_mode, call_kwargs)
 
-        results = [t.result() for t in tasks]
-        if log.isEnabledFor(logging.DEBUG):
-            for det, matches in zip(active, results):
+        async def _compute() -> list[MatchWithSources]:
+            # TaskGroup (vs asyncio.gather) cancels in-flight sibling tasks
+            # the moment one detector raises a fail-closed error. Matters
+            # because the request is about to BLOCK; a still-running
+            # privacy_filter call (hundreds of ms locally, seconds remotely)
+            # would just be wasted work. gather() left siblings running
+            # until completion and discarded their results.
+            #
+            # The except* unwrap re-raises the first matching typed
+            # exception so main.py's typed-error handler matches — it
+            # wouldn't catch the BaseExceptionGroup TaskGroup raises by
+            # default. The tuple comes from the registry, so adding a new
+            # detector with its own typed error doesn't require an edit
+            # here.
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tasks = [
+                        tg.create_task(
+                            self._run_detector(d, text, api_key=api_key, overrides=overrides)
+                        )
+                        for d in active
+                    ]
+            except* TYPED_UNAVAILABLE_ERRORS as eg:
+                raise eg.exceptions[0] from None
+
+            per_detector = [(active[i].name, t.result()) for i, t in enumerate(tasks)]
+            if log.isEnabledFor(logging.DEBUG):
+                for det_name, matches in per_detector:
+                    log.debug(
+                        "Detector %s returned %d matches: %s",
+                        det_name, len(matches),
+                        [(m.text, m.entity_type) for m in matches],
+                    )
+            deduped = _dedup_with_sources(per_detector)
+            if log.isEnabledFor(logging.DEBUG):
                 log.debug(
-                    "Detector %s returned %d matches: %s",
-                    det.name, len(matches),
-                    [(m.text, m.entity_type) for m in matches],
+                    "After dedup-with-sources: %d matches: %s",
+                    len(deduped),
+                    [(m.text, m.entity_type, srcs) for m, srcs in deduped],
                 )
-        flat = [m for sub in results for m in sub]
-        deduped = _dedup(flat)
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug(
-                "After dedup: %d matches: %s",
-                len(deduped),
-                [(m.text, m.entity_type) for m in deduped],
-            )
-        return deduped
+            return deduped
+
+        return await self._pipeline_cache.get_or_compute(cache_key, _compute)
 
     @staticmethod
     def _partition_by_input_mode(
@@ -552,19 +702,20 @@ class Pipeline:
         return still_merged, demoted
 
     async def aclose(self) -> None:
-        """Release per-detector resources (httpx connection pools, etc)
-        plus the vault backend (Redis connection pool when applicable).
-        Wired to FastAPI's lifespan in main.py so shutdown is clean.
+        """Release per-detector resources (httpx connection pools, etc),
+        the pipeline cache backend, plus the vault backend (Redis
+        connection pools when applicable). Wired to FastAPI's lifespan
+        in main.py so shutdown is clean.
 
-        Order: detectors first, vault last. The pipeline's own request
-        path is `detect → vault.put` (`anonymize`) and `vault.pop`
-        (`deanonymize`). If a request is mid-anonymize when shutdown
-        fires, the detector path needs the vault to still be live for
-        the put; closing the vault first would leave that put hitting
-        a closed Redis client. Uvicorn drains in-flight requests
-        before the lifespan teardown fires today, but pinning the
-        order defensively here doesn't hurt and removes the implicit
-        dependency on graceful-shutdown ordering.
+        Order: detectors first, pipeline cache, vault last. The
+        pipeline's own request path is `detect → vault.put`
+        (`anonymize`) and `vault.pop` (`deanonymize`). If a request is
+        mid-anonymize when shutdown fires, the detector path needs the
+        vault to still be live for the put; closing the vault first
+        would leave that put hitting a closed Redis client. Uvicorn
+        drains in-flight requests before the lifespan teardown fires
+        today, but pinning the order defensively here doesn't hurt and
+        removes the implicit dependency on graceful-shutdown ordering.
 
         Each `aclose` is wrapped in `asyncio.wait_for` with a 5-second
         budget so a wedged backend (Redis hung, httpx pool stuck on a
@@ -585,6 +736,18 @@ class Pipeline:
                 log.warning("Detector %s aclose failed: %s", det.name, exc)
 
         try:
+            await asyncio.wait_for(
+                self._pipeline_cache.aclose(), timeout=_ACLOSE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "Pipeline cache aclose timed out after %ds; abandoning.",
+                _ACLOSE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Pipeline cache aclose failed: %s", exc)
+
+        try:
             await asyncio.wait_for(self._vault.aclose(), timeout=_ACLOSE_TIMEOUT_S)
         except asyncio.TimeoutError:
             log.warning(
@@ -600,22 +763,26 @@ class Pipeline:
         *,
         api_key: str | None,
         overrides: Overrides,
-    ) -> tuple[list[list[Match]], list[list[Match]]]:
+        call_kwargs: FrozenCallKwargs,
+    ) -> tuple[list[list[MatchWithSources]], list[list[MatchWithSources]]]:
         """Dispatch detection across all active detectors and return
         their match lists, partitioned by dispatch mode.
 
-        Returns `(per_text_matches, merged_matches)` where:
+        Returns `(per_text_with_sources, merged_with_sources)` where:
 
-          * `per_text_matches[i]` is the deduped matches for `texts[i]`
-            from the per_text-mode detectors (one inner list per text).
-          * `merged_matches[j]` is the sentinel-filtered matches from
-            the j-th merged-mode detector (one inner list per detector,
-            *not* per text — each merged detector ran once against the
-            sentinel-joined blob).
+          * `per_text_with_sources[i]` is the deduped
+            `(Match, source_detectors)` list for `texts[i]` from the
+            per_text-mode detectors (one inner list per text).
+          * `merged_with_sources[j]` is the sentinel-filtered
+            `(Match, source_detectors)` list from the j-th merged-mode
+            detector. Each entry's `source_detectors` is just `(detname,)`
+            — merged-mode runs ONE detector per blob, so attribution
+            is unambiguous.
 
-        Both lists are consumed by the caller for mapping construction;
-        cross-source dedup happens at that layer (by value, first-seen
-        wins on entity type).
+        Both lists are consumed by the caller for vault-entry
+        construction; cross-source source_detectors merging happens
+        there (a match found by both per_text and merged-mode
+        detectors gets the union as its `source_detectors`).
 
         Why this lives in its own method: `anonymize` was getting long
         and doing five jobs. The dispatch concern (partition → blob →
@@ -674,6 +841,7 @@ class Pipeline:
                             api_key=api_key,
                             overrides=overrides,
                             detectors=per_text_dets,
+                            call_kwargs=call_kwargs,
                         )
                     )
                     for t in texts
@@ -689,7 +857,7 @@ class Pipeline:
         except* TYPED_UNAVAILABLE_ERRORS as eg:
             raise eg.exceptions[0] from None
 
-        per_text_matches = [t.result() for t in per_text_tasks]
+        per_text_with_sources = [t.result() for t in per_text_tasks]
 
         # Filter sentinel-spanning matches from each merged detector's
         # output. This guards against (a) the model classifying the
@@ -698,10 +866,13 @@ class Pipeline:
         # both filtered out by the contains-check. Done before the
         # caller builds the surrogate mapping so the generator never
         # sees a sentinel-bearing match.
-        merged_matches: list[list[Match]] = []
+        merged_with_sources: list[list[MatchWithSources]] = []
         for det, task in zip(merged_dets, merged_tasks):
             results = task.result()
-            kept = [m for m in results if _MERGE_SENTINEL_MARKER not in m.text]
+            kept = [
+                (m, (det.name,)) for m in results
+                if _MERGE_SENTINEL_MARKER not in m.text
+            ]
             if log.isEnabledFor(logging.DEBUG):
                 dropped = len(results) - len(kept)
                 if dropped:
@@ -709,9 +880,9 @@ class Pipeline:
                         "merged dispatch: dropped %d sentinel-spanning matches "
                         "from %s output", dropped, det.name,
                     )
-            merged_matches.append(kept)
+            merged_with_sources.append(kept)
 
-        return per_text_matches, merged_matches
+        return per_text_with_sources, merged_with_sources
 
     async def anonymize(
         self,
@@ -721,84 +892,110 @@ class Pipeline:
         api_key: str | None = None,
         overrides: Overrides = Overrides.empty(),
     ) -> tuple[list[str], dict[str, str]]:
-        """Anonymize a batch of texts, persist the reverse mapping, return modified texts.
+        """Anonymize a batch of texts, persist the structured vault
+        entry, return modified texts.
 
-        Returns (modified_texts, mapping) so the API layer can include the
-        mapping size in logs/responses without re-reading the vault.
+        Returns (modified_texts, surrogate_to_original_mapping) — the
+        flat dict shape is what the API layer logs as "entities=N";
+        the structured `VaultEntry` (with type + sources + kwargs)
+        lives in the vault itself.
 
-        `api_key`, if given, overrides config.llm_api_key for the LLM detector
-        on this call only — used to forward the caller's own key per-request.
+        `api_key`, if given, overrides config.llm_api_key for the LLM
+        detector on this call only — used to forward the caller's own
+        key per-request. Does NOT enter the cache key (so per-user
+        forwarded keys don't fragment the cache).
 
         `overrides` carries the `additional_provider_specific_params`
         knobs (use_faker, faker_locale, detector_mode,
-        regex_overlap_strategy, llm_model). Each is None by default;
-        the detectors and the surrogate generator pick up only the
-        ones relevant to them.
+        regex_overlap_strategy, llm_model, …). Each is None by
+        default; the detectors and the surrogate generator pick up
+        only the ones relevant to them.
 
         High-level shape:
 
-          1. `_run_detection` → dispatch all active detectors and
-             collect their match lists (per-text + merged).
-          2. Build the process-wide `original → surrogate` mapping by
-             walking both match lists in DETECTOR_MODE order. Same
-             entity in multiple sources collapses to one surrogate.
-          3. Apply replacements, persist the reverse mapping under
-             `call_id` for the post-call deanonymize lookup.
+          1. Compute the per-call frozen kwargs once (used by the
+             pipeline cache key + stored on the vault entry).
+          2. `_run_detection` → dispatch all active detectors and
+             collect their `(Match, source_detectors)` lists
+             (per-text + merged).
+          3. Build the process-wide `original → surrogate` mapping by
+             walking both lists in DETECTOR_MODE order. Same entity
+             in multiple sources unions the source_detectors tuples.
+          4. Apply replacements, persist the structured `VaultEntry`
+             under `call_id` for the post-call deanonymize lookup.
         """
         if not texts:
             return [], {}
 
-        # Reject `use_faker=true` per-call overrides when the global
-        # prewarm flag is on. Mutual-exclusion: prewarm needs opaque
-        # tokens to recover entity types from surrogate prefixes, and
-        # a per-call Faker override would punch a hole in that
-        # invariant for the call_id whose vault entry we'd later use.
-        # Cleared (set to None) so the surrogate generator falls
-        # back to config.use_faker (which the boot validator
-        # already pinned to false). Logged at WARNING — silently
-        # ignoring is what bites operators when the override they
-        # set in code "doesn't take".
-        if config.detector_cache_prewarm and overrides.use_faker is True:
-            log.warning(
-                "Per-call use_faker=true override ignored: "
-                "DETECTOR_CACHE_PREWARM=true requires opaque tokens "
-                "across all calls so the deanonymize-side type recovery "
-                "stays reliable. Disable prewarm or drop the override."
-            )
-            overrides = overrides.model_copy(update={"use_faker": None})
+        active = self._resolve_active_detectors(overrides)
+        call_kwargs = _build_call_kwargs(active, overrides, api_key)
+        detector_mode = tuple(d.name for d in active)
 
-        per_text_matches, merged_matches = await self._run_detection(
-            texts, api_key=api_key, overrides=overrides,
+        per_text_results, merged_results = await self._run_detection(
+            texts, api_key=api_key, overrides=overrides, call_kwargs=call_kwargs,
         )
 
-        # Build one process-wide mapping (original → surrogate) so the same
-        # entity gets the same surrogate across all texts in this request.
-        # Surrogate-side overrides (use_faker, faker_locale) are passed
-        # to for_match — the cache key includes them so different combos
-        # coexist with their own consistency.
+        # Build one process-wide mapping (original → surrogate) so the
+        # same entity gets the same surrogate across all texts in this
+        # request. Surrogate-side overrides (use_faker, faker_locale)
+        # are passed to for_match — the cache key includes them so
+        # different combos coexist with their own consistency.
         original_to_surrogate: dict[str, str] = {}
-        # Iterate per-text first, then merged, so cross-source dedup
-        # follows DETECTOR_MODE priority (per-text-first detectors win
-        # type-resolution over later merged-only detectors when the same
-        # value is matched by both).
-        for matches in (*per_text_matches, *merged_matches):
-            for m in matches:
+        # Track per-original (entity_type, source_detectors) so the
+        # vault entry can record the type + sources for each
+        # surrogate. Iteration order: per-text first, then merged, so
+        # cross-source dedup follows DETECTOR_MODE priority (per-text-
+        # first detectors win type-resolution when the same value is
+        # matched by both).
+        per_original_etype: dict[str, str] = {}
+        per_original_sources: dict[str, list[str]] = {}
+        for results in (*per_text_results, *merged_results):
+            for m, sources in results:
                 if m.text not in original_to_surrogate:
                     original_to_surrogate[m.text] = self._surrogates.for_match(
                         m,
                         use_faker=overrides.use_faker,
                         locale=overrides.faker_locale,
                     )
+                    per_original_etype[m.text] = m.entity_type
+                    per_original_sources[m.text] = list(sources)
+                else:
+                    # Same text seen again — union sources, keep first
+                    # entity_type (matches `_dedup_with_sources`).
+                    existing = per_original_sources[m.text]
+                    for s in sources:
+                        if s not in existing:
+                            existing.append(s)
 
-        # The vault stores the *reverse* direction (surrogate → original) since
-        # that's what deanonymize needs.
+        # The vault stores the *reverse* direction (surrogate →
+        # original) since that's what deanonymize needs.
         reverse_mapping = {v: k for k, v in original_to_surrogate.items()}
 
         replace = _build_replacer(original_to_surrogate)
         modified = [replace(t) for t in texts]
 
         if reverse_mapping and call_id:
-            await self._vault.put(call_id, reverse_mapping)
+            # Build the structured vault entry: per-surrogate
+            # (original, type, sources) + call-level (detector_mode,
+            # frozen kwargs). The deanonymize-side prewarm hook reads
+            # all three to reconstruct the pipeline-cache key AND the
+            # per-detector cache keys without re-running detection.
+            vault_surrogates = {
+                surrogate: VaultSurrogate(
+                    original=original,
+                    entity_type=per_original_etype[original],
+                    source_detectors=tuple(per_original_sources[original]),
+                )
+                for surrogate, original in reverse_mapping.items()
+            }
+            await self._vault.put(
+                call_id,
+                VaultEntry(
+                    surrogates=vault_surrogates,
+                    detector_mode=detector_mode,
+                    kwargs=call_kwargs,
+                ),
+            )
         elif reverse_mapping and not call_id:
             log.warning(
                 "Anonymized %d entities but no call_id was provided — "
@@ -812,143 +1009,195 @@ class Pipeline:
         )
         return modified, reverse_mapping
 
-    async def deanonymize(self, texts: list[str], call_id: str | None) -> list[str]:
-        """Reverse the substitution using the stored mapping for this call_id."""
+    async def deanonymize(
+        self, texts: list[str], call_id: str | None,
+    ) -> list[str]:
+        """Reverse the substitution using the stored vault entry for
+        this call_id. Optionally pre-warms both cache layers from the
+        typed entry — see `_prewarm_caches` for the dual-write
+        semantics."""
         if not texts:
             return []
-        mapping = await self._vault.pop(call_id) if call_id else {}
-        if not mapping:
+        entry = await self._vault.pop(call_id) if call_id else VaultEntry()
+        if entry.is_empty:
             log.debug("deanonymize call_id=%s — nothing to restore", call_id)
             return texts
-        replace = _build_replacer(mapping)
+        flat_mapping = {
+            surrogate: vs.original
+            for surrogate, vs in entry.surrogates.items()
+        }
+        replace = _build_replacer(flat_mapping)
         restored = [replace(t) for t in texts]
         log.info(
             "deanonymize call_id=%s entities=%d texts=%d",
-            call_id, len(mapping), len(texts),
+            call_id, len(flat_mapping), len(texts),
         )
 
-        # Detector cache pre-warm. Synthesises Match objects from the
-        # vault entries (recovering entity_type from the opaque
-        # surrogate prefix — see surrogate.opaque_token_entity_type)
-        # and writes them into each active cache-using detector's
-        # default-override cache slot. The next request that contains
-        # the same restored text gets cache hits instead of running
-        # detection again — primarily targets replayed-history multi-
-        # turn workloads, where turn N's response shows up as part of
-        # turn N+1's prompt.
-        #
-        # Gated by `config.detector_cache_prewarm`. The boot validator
-        # ensures `USE_FAKER=false` when this flag is on, so every
-        # surrogate in the vault is opaque-format and the entity-type
-        # extractor recovers a canonical type for every entry.
-        if config.detector_cache_prewarm:
-            await self._prewarm_detector_caches(restored, mapping)
+        # Dual-write prewarm: if the pipeline cache is enabled OR any
+        # active cache-using detector has caching live, seed both
+        # layers from the typed vault entry. The pipeline cache write
+        # uses `(restored_text, detector_mode, kwargs)` reconstructed
+        # from the entry; per-detector cache writes filter the
+        # synthesised match list by `source_detectors` per surrogate
+        # so each detector's cache slot only holds what THAT detector
+        # actually produced (Option-3-style fidelity — see
+        # docs/design-decisions.md). Best-effort: prewarm failures are
+        # logged and swallowed.
+        await self._prewarm_caches(restored, entry)
 
         return restored
 
-    async def _prewarm_detector_caches(
-        self, restored: list[str], mapping: dict[str, str],
+    async def _prewarm_caches(
+        self, restored: list[str], entry: VaultEntry,
     ) -> None:
-        """Build synthesised Match objects from the vault `mapping`
-        (surrogate → original) and write them into each active
-        cache-using detector's default-override cache slot for each
-        restored text.
+        """Dual-write prewarm hook called from `deanonymize`. Writes
+        synthesised matches to:
 
-        Per the design rationale (see docs/design-decisions.md →
-        "Pre-warm detector cache from deanonymize-derived matches"):
-        the same deduped match list lands in every cache-using
-        detector's slot — Option 2 of the three architectural shapes
-        considered. Per-detector hit/miss stats become misleading as
-        a documented trade-off.
+          1. The pipeline-level cache, keyed by `(text, detector_mode,
+             kwargs)` reconstructed from the vault entry — every text
+             gets the deduped Match list with `source_detectors`
+             attribution. Future identical-overrides requests for the
+             same restored text hit in one shot.
+          2. Each active cache-using detector's per-detector cache,
+             filtered by `source_detectors` per surrogate. Only entities
+             that THAT detector independently found land in its slot —
+             so per-detector cache hit/miss stats stay meaningful, and
+             override-fragmented requests where some detectors' kwargs
+             match this call's hit per-detector caches even when the
+             pipeline cache misses.
 
-        Surrogates that don't match the opaque-token format are
-        skipped — produce nothing, leak nothing. With the
-        USE_FAKER=false boot invariant this branch shouldn't fire,
-        but the defensive skip keeps a misconfigured deployment
-        from polluting caches with OTHER-typed entries that would
-        break surrogate consistency.
-
-        Race semantics: prewarm and a concurrent real `detect()`
-        on the same key both call `get_or_compute`. Under Redis
-        the SET uses `nx=True` (first writer wins). The in-memory
-        backend is last-writer-wins by design (see
-        `cache_memory.py` — holding the lock across an LLM call
-        would defeat the per-detector concurrency cap). Both are
-        correctness-safe under the USE_FAKER=false boot invariant
-        because real-detection and synthesised matches are
-        deterministically equal on the same input (same model +
-        prompt + text → same matches), so whichever writer lands
-        last contributes the same value the other would have.
-
-        Best-effort: per-call failures are logged and skipped so
-        prewarm can never break the deanonymize round-trip the
-        caller already received its restored text for.
+        Both writes use the cache layer's "compute on miss, return
+        cached on hit" semantics: real-detection results aren't
+        overwritten by synthesised ones if both paths fire on the
+        same key. Per-call failures are logged and swallowed so
+        prewarm can never break the deanonymize round-trip.
         """
-        # Build a single synthesised Match list from the vault
-        # entries — same list pre-warms every detector's cache slot
-        # (Option 2's deliberate fan-out).
-        synth: list[Match] = []
-        for surrogate, original in mapping.items():
-            etype = opaque_token_entity_type(surrogate)
-            if etype is None:
-                # Either Faker output (validator should have prevented
-                # this) or a malformed surrogate — skip so we don't
-                # silently store an OTHER-typed entry that would
-                # later break the surrogate generator's `(text, type)`
-                # cache key on a cache hit.
-                continue
-            synth.append(Match(text=original, entity_type=etype))
-
-        if not synth:
+        if not entry.surrogates:
             return
 
-        # Walk active cache-using detectors; warm each one's default
-        # cache slot for each restored text. `_detectors` mirrors the
-        # active detector list at __init__ time; restricting to
-        # `SPECS_WITH_CACHE` filters out regex/denylist (no cache).
-        cache_using = {
-            spec.name for spec in SPECS_WITH_CACHE
-        }
+        # Build the synthesised (Match, sources) list once. Used by
+        # both writes — pipeline cache stores the full list verbatim;
+        # per-detector caches use a filtered view per detector.
+        synth: list[MatchWithSources] = []
+        for vs in entry.surrogates.values():
+            synth.append((
+                Match(text=vs.original, entity_type=vs.entity_type),
+                vs.source_detectors,
+            ))
+
         tasks: list[asyncio.Task] = []
+
+        # 1. Pipeline cache writes — one per restored text, keyed by
+        #    the same shape detect-side computes.
+        if self._pipeline_cache.enabled:
+            for text in restored:
+                key: PipelineCacheKey = (text, entry.detector_mode, entry.kwargs)
+                tasks.append(
+                    asyncio.create_task(
+                        self._safe_pipeline_put(key, list(synth)),
+                    )
+                )
+
+        # 2. Per-detector cache writes — for each active cache-using
+        #    detector, build the filtered match list and the
+        #    detector-specific cache key. Skip detectors not in the
+        #    vault entry's kwargs (DETECTOR_MODE override changed
+        #    between anonymize and deanonymize, no kwargs to use).
+        kwargs_by_detector: dict[str, dict[str, Any]] = {
+            name: {key: value for key, value in frozen}
+            for name, frozen in entry.kwargs
+        }
+        cache_using = {spec.name for spec in SPECS_WITH_CACHE}
         for det in self._detectors:
             if det.name not in cache_using:
                 continue
-            warm = getattr(det, "warm_cache", None)
-            if warm is None:
-                # Test stubs that bypass BaseRemoteDetector.__init__
-                # may not have warm_cache. Skip rather than crash.
+            cache = getattr(det, "_cache", None)
+            if cache is None or not cache.enabled:
+                # Detector's own cache is off (or it's a stub without
+                # one). No point warming a no-op slot.
                 continue
+            kwargs = kwargs_by_detector.get(det.name)
+            if kwargs is None:
+                # This detector wasn't part of the original anonymize
+                # call (DETECTOR_MODE differed). Without kwargs we
+                # can't construct a correct cache key — skip rather
+                # than risk writing to the wrong slot.
+                continue
+            cache_key_for = getattr(det, "cache_key_for", None)
+            if cache_key_for is None:
+                continue
+            # Filter: only matches this detector independently found.
+            filtered = [
+                Match(text=vs.original, entity_type=vs.entity_type)
+                for vs in entry.surrogates.values()
+                if det.name in vs.source_detectors
+            ]
+            if not filtered:
+                # This detector found nothing — still warm the slot
+                # with an empty result so a future identical request
+                # gets a hit-with-empty-list rather than running
+                # detection again. Same shape `_detect_via_cache`
+                # would write on a cold call that returned no matches.
+                pass
             for text in restored:
                 tasks.append(
-                    asyncio.create_task(self._safe_warm(warm, det.name, text, synth))
+                    asyncio.create_task(
+                        self._safe_detector_warm(
+                            det.name, cache, cache_key_for,
+                            text, kwargs, filtered,
+                        ),
+                    )
                 )
 
         if tasks:
-            # Gather rather than serialise: under a Redis-backed cache
-            # the sequential await would pay one RTT per (detector,
-            # text) pair on the deanonymize hot path. Independent
-            # writes have no ordering dependency, so let the event
-            # loop interleave them.
+            # Gather rather than serialise: under Redis, the sequential
+            # await would pay one RTT per (detector × text) pair on the
+            # deanonymize hot path. Independent writes have no ordering
+            # dependency, so let the event loop interleave them.
             await asyncio.gather(*tasks)
 
-    async def _safe_warm(
-        self,
-        warm: Callable[[str, list[Match]], Awaitable[Any]],
-        det_name: str,
-        text: str,
-        synth: list[Match],
+    async def _safe_pipeline_put(
+        self, key: PipelineCacheKey, synth: list[MatchWithSources],
     ) -> None:
-        """Best-effort wrapper around a single detector's warm_cache
-        call. Prewarm is purely a latency optimisation for the next
-        request — a failure here must not break the current
-        deanonymize round-trip (the caller already received its
-        restored text). Log the failure with enough detail to
-        diagnose, then continue."""
+        """Best-effort wrapper for one pipeline-cache prewarm write.
+        Logs and swallows any exception so a single bad slot can't
+        break the deanonymize round-trip."""
         try:
-            await warm(text, synth)
+            await self._pipeline_cache.put(key, synth)
         except Exception:
             log.exception(
-                "prewarm failed detector=%s text_len=%d — continuing",
+                "pipeline cache prewarm put failed key=(text_len=%d, "
+                "detector_mode=%r) — continuing",
+                len(key[0]), key[1],
+            )
+
+    async def _safe_detector_warm(
+        self,
+        det_name: str,
+        cache,
+        cache_key_for: Callable[..., Any],
+        text: str,
+        kwargs: dict[str, Any],
+        matches: list[Match],
+    ) -> None:
+        """Best-effort wrapper for one per-detector prewarm write.
+        Builds the cache key via the detector's `cache_key_for`
+        method (unpacking kwargs as keyword args) and writes the
+        filtered match list into the detector's cache slot.
+
+        Empty `text` is a no-op (matches the detect-side
+        `_detect_via_cache` empty-text short-circuit so we don't
+        store an entry keyed on empty input)."""
+        if not text or not text.strip():
+            return
+        try:
+            cache_key = cache_key_for(text, **kwargs)
+            async def _synth() -> list[Match]:
+                return list(matches)
+            await cache.get_or_compute(cache_key, _synth)
+        except Exception:
+            log.exception(
+                "detector cache prewarm failed detector=%s text_len=%d — continuing",
                 det_name, len(text),
             )
 

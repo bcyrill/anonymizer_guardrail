@@ -259,13 +259,30 @@ class RemoteGlinerPIIDetector(BaseRemoteDetector):
             self.threshold if self.threshold is not None else "<server default>",
         )
 
-    def _default_cache_key(self, text: str) -> tuple:
-        """Default-overrides cache key — must match what `detect()`
-        produces when called with `labels=None, threshold=None`."""
+    def cache_key_for(
+        self,
+        text: str,
+        *,
+        labels: list[str] | tuple[str, ...] | None = None,
+        threshold: float | None = None,
+    ) -> tuple:
+        """Build the per-detector cache key for `text` given the
+        cache-affecting overrides. Used by both `detect()` and the
+        pipeline's deanonymize-side prewarm hook (which reconstructs
+        the same key from the vault entry's frozen kwargs).
+
+        Per-call overrides win; otherwise fall back to
+        `self.labels`/`self.threshold`. labels is normalised to a
+        tuple — order is preserved (it flows through to the wire
+        body, so different orderings make materially different calls)."""
+        effective_labels = labels if labels is not None else self.labels
+        effective_threshold = (
+            threshold if threshold is not None else self.threshold
+        )
         return (
             text,
-            tuple(self.labels) if self.labels is not None else None,
-            self.threshold,
+            tuple(effective_labels) if effective_labels is not None else None,
+            effective_threshold,
         )
 
     async def detect(
@@ -281,29 +298,15 @@ class RemoteGlinerPIIDetector(BaseRemoteDetector):
         per-request override path (`additional_provider_specific_params`)
         pin a different label vocabulary per route without redeploying.
         """
-        # Per-call overrides win; otherwise use what was configured at
-        # construction time (which itself fell back to the env defaults).
-        # Local variables — never mutate self.labels / self.threshold,
-        # the detector instance is shared across requests.
-        effective_labels = labels if labels is not None else self.labels
-        effective_threshold = (
-            threshold if threshold is not None else self.threshold
+        cache_key = self.cache_key_for(
+            text, labels=labels, threshold=threshold,
         )
-
-        # Cache key: text + the resolved overrides that actually change
-        # gliner's output. labels is a list (mutable, unhashable);
-        # convert to a tuple for the key. Don't sort — order is
-        # preserved through to the wire body, so a caller passing
-        # labels in different orders is making materially different
-        # calls as far as the cache contract is concerned. None means
-        # "use server defaults" and gets its own slot, distinct from
-        # "explicit empty list" (which the validator above reduces to
-        # None anyway, but the cache layer doesn't have to know that).
-        cache_key = (
-            text,
-            tuple(effective_labels) if effective_labels is not None else None,
-            effective_threshold,
-        )
+        # Recover the resolved values for the HTTP layer.
+        _, key_labels, effective_threshold = cache_key
+        # cache_key_for returned the labels as a tuple; the HTTP
+        # layer expects a list. Convert back here so `_do_detect`'s
+        # body shape is unchanged.
+        effective_labels = list(key_labels) if key_labels is not None else None
         return await self._detect_via_cache(
             text, cache_key,
             lambda: self._do_detect(

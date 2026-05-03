@@ -364,9 +364,10 @@ class RemotePrivacyFilterDetector(BaseRemoteDetector):
             "(timeout=%ds).", self.url, self.timeout_s,
         )
 
-    def _default_cache_key(self, text: str) -> tuple:
-        """PF has no per-call overrides today, so the default-overrides
-        key is identical to the always-used key — `(text,)`."""
+    def cache_key_for(self, text: str) -> tuple:
+        """Cache key for this detector. PF has no per-call overrides
+        today, so the key is just `(text,)`. Used by `detect()` and
+        the pipeline's deanonymize-side prewarm hook."""
         return (text,)
 
     async def detect(self, text: str) -> list[Match]:
@@ -374,7 +375,7 @@ class RemotePrivacyFilterDetector(BaseRemoteDetector):
         overrides today, so the cache key is just `(text,)`. Single-
         element tuple keeps the shape consistent with the other
         cache-using detectors and makes future overrides easy to add."""
-        cache_key = (text,)
+        cache_key = self.cache_key_for(text)
         return await self._detect_via_cache(
             text, cache_key, lambda: self._do_detect(text),
         )

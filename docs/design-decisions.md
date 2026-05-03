@@ -272,180 +272,158 @@ are anonymized" sounds like more coverage, not less?
 
 ---
 
-## Detector cache pre-warm from deanonymize-derived matches
+## Bidirectional pipeline-level result cache (with source-tracked prewarm)
 
-**Implemented behind the `DETECTOR_CACHE_PREWARM` env var
-(default off).** When enabled, `pipeline.deanonymize` synthesises
-`Match` objects from the vault entries that contributed substring
-replacements and seeds each active cache-using detector
-(`SPECS_WITH_CACHE`) with the deduped match list keyed at the
-detector's default-overrides cache slot. The next request that
-contains the same restored text — typical for multi-turn
-conversations where turn N's assistant reply lands inside turn
-N+1's prompt — gets a per-detector cache hit instead of running
-detection again.
+**Implemented behind the `PIPELINE_CACHE_BACKEND` env var
+(default `none`, off).** When enabled, the pipeline cache stores
+deduped match lists keyed by `(text, detector_mode,
+frozen_per_call_kwargs)`. Two write paths populate it:
 
-The implementation matches "Option 2" of the three architectural
-shapes considered (pre-warm each per-detector cache with the
-deduped match set). Variations 1 (new bidirectional pipeline
-cache) and 3 (per-detector pre-warm with detector-source
-tracking) were considered and dismissed for now — see below.
+- **Detection-side write**: after `_run_detection` runs the active
+  detectors, the deduped result lands in the pipeline cache. The
+  next request for the same text + same kwargs hits in one shot —
+  no detector dispatch.
+- **Deanonymize-side prewarm**: `pipeline.deanonymize` synthesises
+  matches from the typed `VaultEntry` and writes them into BOTH the
+  pipeline cache (deduped synth list keyed by full request shape)
+  AND each per-detector cache (filtered by `source_detectors` per
+  surrogate, keyed with that detector's own kwargs).
 
-### Why this is gated behind a flag
+The implementation bundles Option 1 (bidirectional pipeline cache)
+and Option 3 (per-detector source tracking) — both pieces sharing
+the same vault schema migration so the migration cost is paid once.
 
-`DETECTOR_CACHE_PREWARM=false` (the default) keeps today's
-deanonymize behaviour exactly as before — pure substring-replace,
-no cache writes, no surprise cross-call interactions. Operators
-opting in are accepting two documented caveats:
+### Vault schema
 
-1. **Per-detector hit/miss stats become misleading.** The same
-   deduped match list lands in every active cache-using
-   detector's slot. When LLM/PF/gliner are all active, every
-   detector's cache reports "found" entities the others actually
-   found.
-2. **Override-staleness for non-default per-call overrides.**
-   The pre-warm writes to each detector's *default-overrides*
-   cache slot. Non-default-overrides requests land in different
-   slots and run detection normally; a textually-identical
-   default-overrides request that follows a non-default-overrides
-   anonymize call gets the non-default-derived matches in its
-   default slot. Stable-overrides workloads aren't affected.
+The vault stores a structured `VaultEntry` per call_id (not a flat
+surrogate→original dict):
 
-### Why USE_FAKER must be false when pre-warm is on
+```python
+@dataclass(frozen=True)
+class VaultEntry:
+    surrogates: dict[str, VaultSurrogate]    # surrogate → typed entry
+    detector_mode: tuple[str, ...]           # active detectors at anonymize time
+    kwargs: FrozenCallKwargs                 # frozen per-detector cache-affecting kwargs
 
-The boot validator
-(`Config._detector_cache_prewarm_requires_opaque_tokens`) rejects
-`DETECTOR_CACHE_PREWARM=true` paired with `USE_FAKER=true`.
-
-The reason: pre-warm needs to know each entity's `entity_type`
-when synthesising `Match` objects. Without storing the type on
-the vault (a deliberate non-goal — see "Variations considered"),
-we recover it at deanonymize time by parsing the surrogate's
-prefix:
-
-```
-[<TYPE>_<8 uppercase hex>]   →   TYPE
+@dataclass(frozen=True)
+class VaultSurrogate:
+    original: str
+    entity_type: str                         # canonical type from the producing Match
+    source_detectors: tuple[str, ...]        # detectors that independently found this entity
 ```
 
-Faker output (`Robert Jones`, `192.0.2.5`, `bob@corp.example`)
-carries no such signal. Allowing both knobs simultaneously would
-either silently fall back to `OTHER` for every Faker entity —
-breaking the surrogate generator's `(text, entity_type)` cache
-key invariant and producing different surrogates on cache hits
-than on cold detection — or require the vault schema change we
-explicitly opted out of.
+All three additions are load-bearing:
 
-The same constraint extends to per-call `use_faker=true`
-overrides: `pipeline.anonymize` rejects them with a WARNING
-when `DETECTOR_CACHE_PREWARM=true`, falling back to
-`config.use_faker=false` for that request. Without this, an
-operator with prewarm enabled who lets a single per-call Faker
-override slip through would punch a hole in the
-opaque-tokens-only invariant for that call_id, and the matching
-deanonymize-side prewarm would either silently drop those
-entities (treating them as malformed) or — worse, with a future
-permissive parser — attribute them to `OTHER` and break
-surrogate consistency on the next turn.
+- `entity_type` per surrogate — synthesised matches need a typed
+  Match to land in the right surrogate-cache slot. Faker output
+  (`Robert Jones`, `192.0.2.5`) carries no type signal, so we can't
+  recover it from the surrogate prefix.
+- `source_detectors` per surrogate — captured BEFORE `_dedup`
+  collapses per-detector lists. Lets the deanonymize hook filter
+  the synthesised match list per detector so per-detector cache
+  slots only get *that* detector's matches (not the deduped union).
+  Per-detector hit/miss stats stay meaningful.
+- Call-level `detector_mode` + `kwargs` — required to reconstruct
+  the pipeline-cache key AND each per-detector cache key at
+  deanonymize time. Without these, prewarm would have to fall back
+  to default-overrides slots, which silently re-introduces
+  override-staleness.
 
-### Variations considered
+### Cache architecture
 
-**1. New bidirectional pipeline-level cache.** A separate cache
-keyed `(text, detector_mode, frozen_per_call_kwargs) → tuple[Match, ...]`
-that holds the deduped match set, populated by both real
-detection runs and the deanonymize hook. `_detect_one` consults
-it first; on hit, skips ALL detectors. Theoretically the
-cleanest abstraction (symmetric coverage of user-typed text
-*and* deanonymize-derived text). Dismissed for now because:
+Two cache layers participate when both are configured live:
 
-- Adds a new cache type with its own backend / failure-mode
-  surface (memory + redis), doubling the cache complexity for
-  a feature whose primary win (catching the assistant-message
-  miss) the chosen Option 2 already delivers.
-- The pipeline cache key is union-sensitive: any change to any
-  detector's per-call kwargs invalidates the slot for all of
-  them. Operators with override-fragmented workloads (multi-tenant
-  prompt rotation, per-call gliner labels) get fewer hits than
-  they would on per-detector caches alone. The combined Option-1-
-  plus-per-detector design that addresses this is more code than
-  Option 2 by a margin that wasn't justified by the available
-  trigger.
+1. **Pipeline cache** (this layer, opt-in via `PIPELINE_CACHE_BACKEND`):
+   one lookup, returns the deduped match list directly. Fast path
+   when no overrides changed since the last call for the same text.
+2. **Per-detector caches** (existing per-detector `<DETECTOR>_CACHE_*`
+   knobs): structural backup tier. The pipeline cache key is
+   union-sensitive (any kwarg change anywhere → miss); the
+   per-detector key only fragments by *that* detector's kwargs.
+   When the pipeline cache misses on partial-override-mismatch,
+   detectors whose kwargs are unchanged still hit their own slots.
 
-**2. (the chosen option — implemented above)**.
+The deanonymize-side prewarm writes to BOTH layers in one pass.
+Per-detector writes are filtered by `source_detectors` so
+detectors that didn't independently find an entity don't get it
+written to their slot — preserves honest per-detector stats and
+keeps the per-detector tier from carrying the deduped-union lie.
 
-**3. Per-detector pre-warm with detector-source tracking.** Like
-Option 2, but each vault entry stores `source_detectors` (which
-detectors found each entity) plus the resolved per-call overrides
-each active detector used at anonymize time. On deanonymize,
-rebuild *each detector's* match list filtered by source and
-keyed by that detector's actual overrides — per-detector cache
-hit/miss stats stay honest, and pre-warmed entries land in the
-exact slot future identical-overrides requests would query.
+### Why prewarm matters under multi-turn workloads
 
-Dismissed because:
+The cache without prewarm hits on every replayed prior user
+message but always misses on the most recent assistant reply
+(which was never put through detection — only deanonymize).
+Prewarm closes that half:
 
-- The vault schema grows substantially (3-10× bytes per entry on
-  a typical 5-detector deployment with 5-20 entities) and
-  requires JSON-wire-format changes on both `MemoryVault` and
-  `RedisVault`.
-- Per-detector hit/miss-fidelity is a real operational property
-  but isn't load-bearing for any current deployment shape.
-  Operators reading per-detector cache stats today aren't doing
-  capacity planning that pivots on the source attribution.
+- Steady-state cost without prewarm: 2 detection passes per
+  round-trip (the new user message + the new assistant reply that
+  echoes back at turn N+1 without ever being seen by detection).
+- With prewarm: 1 detection pass per round-trip (the new user
+  message). The assistant reply was prewarmed into both caches at
+  the previous deanonymize, so turn N+1's anonymize hits.
 
-If a future operator's workload makes the per-detector stats
-honesty load-bearing (e.g. detector-mix optimisation based on
-per-detector hit rates), Option 3 is the upgrade path. The
-vault entity-type addition that's a non-goal today becomes
-load-bearing then.
+### Faker support
 
-### What enabling it actually does
+Compatible with `USE_FAKER=true`. The structured vault entry
+carries `entity_type` per surrogate, so prewarm doesn't need to
+recover types from surrogate prefixes — that surrogate-prefix
+extractor (the previous Option-2 implementation's
+load-bearing helper) is no longer needed.
+
+### What enabling it looks like
 
 ```bash
-export DETECTOR_CACHE_PREWARM=true
-export USE_FAKER=false   # required by the boot validator
+# Memory backend (single-replica or restart-tolerant):
+export PIPELINE_CACHE_BACKEND=memory
+export PIPELINE_CACHE_MAX_SIZE=2000
 
-# Detector caches must be enabled for prewarm to populate them.
-# Memory backend (default for single-replica) or redis backend
-# (for cross-replica share):
-export LLM_CACHE_MAX_SIZE=200
-# OR: LLM_CACHE_BACKEND=redis  + CACHE_REDIS_URL=...
+# OR redis backend (multi-replica + restart-persistent):
+export PIPELINE_CACHE_BACKEND=redis
+export PIPELINE_CACHE_TTL_S=600
+export CACHE_REDIS_URL=redis://localhost:6379/2
+export CACHE_SALT=<deployment-secret>   # shared with per-detector cache
+
+# Per-detector caches stay opt-in via the existing
+# <DETECTOR>_CACHE_MAX_SIZE / <DETECTOR>_CACHE_BACKEND knobs —
+# enabling them gives the structural backup tier on override
+# fragmentation. Disable them and only the pipeline cache is live.
 ```
 
 Wire-up summary:
 
-- `Pipeline.deanonymize` → after substring replacement →
-  `_prewarm_detector_caches(restored, mapping)`.
-- `_prewarm_detector_caches` walks `mapping` (surrogate →
-  original), recovers `entity_type` via
-  `surrogate.opaque_token_entity_type`, builds one
-  `tuple[Match, ...]` and writes it into each active
-  cache-using detector's `_cache` via `det.warm_cache(text, matches)`.
-- `BaseRemoteDetector.warm_cache` calls
-  `self._cache.get_or_compute(self._default_cache_key(text), …)` —
-  which writes on miss but preserves any pre-existing entry
-  (so real-detection results aren't overwritten by synthesised
-  ones if both paths fire on the same text).
+- `Pipeline.__init__` → constructs `self._pipeline_cache` via
+  `build_pipeline_cache(backend=...)`. Backend `none` returns a
+  no-op sentinel so the wrap-around-detect path is branch-free.
+- `Pipeline._detect_one` → wraps the per-text fan-out in
+  `self._pipeline_cache.get_or_compute(key, _compute)`. Cache
+  key = `(text, detector_mode, frozen_call_kwargs)`. Compute
+  callable runs the detectors, dedupes via `_dedup_with_sources`,
+  returns `list[(Match, source_detectors)]`.
+- `Pipeline.anonymize` → after detection, builds the structured
+  `VaultEntry` (typed surrogates + source attribution + frozen
+  kwargs) and `vault.put`s it.
+- `Pipeline.deanonymize` → reads the entry, substring-replaces,
+  calls `_prewarm_caches(restored, entry)` — which in parallel
+  writes to the pipeline cache (per restored text) AND each active
+  cache-using detector's per-detector cache (filtered by
+  `source_detectors`, keyed with the detector's kwargs from the
+  vault entry).
 
-### When to re-evaluate
+### Trade-offs accepted
 
-- A workload's `<prefix>_cache_misses` counter on `/health`
-  shows the assistant-message miss is a measurable share of
-  detection cost AND the override-staleness caveat is biting
-  (heavy override fragmentation in mixed traffic).
-- A deployment wants prewarm + Faker simultaneously (today's
-  Option 2 forbids the combination via the boot validator).
-- A deployment wants a single cache layer for both user and
-  response text (text-level repeats independent of provenance).
-- An operator reading per-detector cache hit/miss stats needs
-  them to actually mean something for capacity planning —
-  Option 2's "every detector found everything" inflation
-  breaks that signal.
-
-Any of those triggers points at the same task expansion:
-[TASKS.md → Bidirectional pipeline-level result cache](../TASKS.md#bidirectional-pipeline-level-result-cache).
-That task bundles Option 1's bidirectional pipeline cache AND
-Option 3's per-detector source tracking together — the vault
-schema migration covers both, and the dual-write prewarm hook
-populates the pipeline cache (text-level repeats) AND each
-per-detector cache honestly (filtered by source_detectors per
-surrogate). One migration, full fidelity.
+- **No backwards compatibility on the vault wire format.** This
+  was a clean break from the prior `dict[str, str]` shape. In-flight
+  vault entries from a prior version are decoded as malformed and
+  treated as missing — the deanonymize path returns the response
+  with surrogates still in it (logged ERROR, same severity as a
+  TTL miss). Operators on Redis backends should drain in-flight
+  entries before deploying, or accept the one-window grace miss.
+- **Pipeline cache key is union-sensitive.** Any change to any
+  detector's kwargs invalidates the slot for all of them. The
+  per-detector tier is the structural backup; both layers
+  together give graceful degradation.
+- **`source_detectors` adds vault size**, ~3-10x bytes per
+  surrogate on a typical 5-detector deployment. Acceptable: the
+  vault entries are short-lived (`VAULT_TTL_S` seconds, default
+  600) and the size is dominated by the per-text mapping anyway.

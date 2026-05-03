@@ -13,11 +13,28 @@ boot with a clear message.
     operators can safely share the Redis instance with other
     consumers (operator's choice — we recommend a dedicated logical
     DB regardless).
-  * **Value:** JSON-encoded `dict[str, str]` (the surrogate→original
-    mapping). JSON over msgpack because the entries are short, the
+  * **Value:** JSON-encoded `VaultEntry`. The top-level shape is a
+    three-key object:
+
+    ```json
+    {
+      "surrogates": {
+        "[PERSON_DEADBEEF]": ["Alice Smith", "PERSON", ["regex", "llm"]],
+        "[EMAIL_ADDRESS_AABBCCDD]": ["a@example.com", "EMAIL_ADDRESS", ["regex"]]
+      },
+      "detector_mode": ["regex", "llm"],
+      "kwargs": [
+        ["llm",  [["model", "anonymize"], ["prompt_name", "default"]]],
+        ["regex", [["overlap_strategy", null], ["patterns_name", null]]]
+      ]
+    }
+    ```
+
+    Each surrogate value is `[original, entity_type, source_detectors]`.
+    JSON over msgpack because the entries are short, the
     debuggability via `redis-cli GET vault:<id>` matters more than
     bytes-on-the-wire, and pulling in another serialization
-    dependency isn't justified for a string→string dict.
+    dependency isn't justified.
   * **TTL:** per-key `EXPIRE` set on `put`. Redis evicts expired
     entries server-side, so the lazy-eviction loop the in-memory
     backend has is unnecessary here.
@@ -38,7 +55,7 @@ Operators who need the in-flight count read it from Redis directly:
   * **Redis unreachable on `put`:** the put raises `RedisVaultError`,
     `Pipeline.anonymize` propagates, `main.py` returns BLOCKED with
     the standard guardrail-failure path. The pre_call DOESN'T return
-    a "GUARDRAIL_INTERVENED" with anonymized text whose mapping
+    a "GUARDRAIL_INTERVENED" with anonymized text whose entry
     we couldn't store — that would ship surrogates that we can't
     later restore.
   * **Redis unreachable on `pop`:** also raises. The post_call sees
@@ -57,8 +74,15 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
-from .vault import VaultBackend  # type-only reference is fine, no cycle
+from .vault import (  # type-only references are fine, no cycle
+    FrozenCallKwargs,
+    FrozenKwargs,
+    VaultBackend,
+    VaultEntry,
+    VaultSurrogate,
+)
 
 log = logging.getLogger("anonymizer.vault.redis")
 
@@ -72,9 +96,9 @@ class RedisVaultError(RuntimeError):
 
 
 class RedisVault:
-    """Shared mapping store backed by Redis. Suitable for
-    multi-replica deployments where the pre_call and post_call may
-    land on different replicas behind a load balancer.
+    """Shared vault backed by Redis. Suitable for multi-replica
+    deployments where the pre_call and post_call may land on
+    different replicas behind a load balancer.
 
     Connection pooling, retries, and reconnect-on-disconnect are
     all delegated to `redis.asyncio.Redis` — the client's own
@@ -146,13 +170,13 @@ class RedisVault:
         dedicated logical DB index (`/<n>` in the URL)."""
         return f"{cls._KEY_PREFIX}{call_id}"
 
-    async def put(self, call_id: str, mapping: dict[str, str]) -> None:
+    async def put(self, call_id: str, entry: VaultEntry) -> None:
         """SET <key> <json> EX <ttl>. Single round-trip; Redis evicts
         on expiry server-side, no client-side scheduling needed."""
-        if not call_id or not mapping:
+        if not call_id or entry.is_empty:
             return
         try:
-            payload = json.dumps(mapping)
+            payload = json.dumps(_encode_entry(entry))
             await self._client.set(self._key(call_id), payload, ex=self._ttl_s)
         except Exception as exc:
             # Wrap in a typed error so the pipeline's BLOCKED path
@@ -164,17 +188,18 @@ class RedisVault:
                 f"Failed to store vault entry for call_id={call_id!r}: {exc}"
             ) from exc
 
-    async def pop(self, call_id: str) -> dict[str, str]:
-        """Atomic GETDEL. Returns `{}` if absent or already-popped /
-        TTL-expired (Redis returns nil and the key is gone server-side).
+    async def pop(self, call_id: str) -> VaultEntry:
+        """Atomic GETDEL. Returns an empty `VaultEntry()` if absent or
+        already-popped / TTL-expired (Redis returns nil and the key
+        is gone server-side).
 
         GETDEL is a single round-trip and atomic; using GET + DEL would
         race with concurrent pops from another replica, where two
         post_calls for the same call_id could both see the entry. With
-        GETDEL only one wins; the other gets {}.
+        GETDEL only one wins; the other gets an empty entry.
         """
         if not call_id:
-            return {}
+            return VaultEntry()
         try:
             payload = await self._client.getdel(self._key(call_id))
         except Exception as exc:
@@ -183,9 +208,9 @@ class RedisVault:
             ) from exc
 
         if payload is None:
-            return {}
+            return VaultEntry()
         try:
-            return json.loads(payload)
+            data = json.loads(payload)
         except json.JSONDecodeError as exc:
             # Corrupted entry — log ERROR, return empty so the
             # post_call doesn't crash but the operator sees the
@@ -197,7 +222,17 @@ class RedisVault:
                 "Inspect Redis manually or rotate the call_id namespace.",
                 call_id,
             )
-            return {}
+            return VaultEntry()
+        try:
+            return _decode_entry(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            log.error(
+                "Vault entry for call_id=%s decoded to unexpected JSON "
+                "shape (%s) — deanonymise dropped, surrogates still in "
+                "response. Inspect Redis manually.",
+                call_id, exc,
+            )
+            return VaultEntry()
 
     def size(self) -> int:
         """Returns 0. See module docstring — `/health` exposes this
@@ -213,6 +248,115 @@ class RedisVault:
             await self._client.aclose()
         except Exception as exc:  # noqa: BLE001 — never fail shutdown
             log.warning("RedisVault aclose failed: %s", exc)
+
+
+# ── JSON encoding / decoding ──────────────────────────────────────────
+
+
+def _encode_entry(entry: VaultEntry) -> dict[str, Any]:
+    """Convert a `VaultEntry` into a JSON-serialisable dict. Each
+    surrogate value is encoded as the 3-tuple `[original,
+    entity_type, source_detectors]` to keep the wire format compact
+    while still operator-readable from `redis-cli GET vault:<id>`.
+    """
+    return {
+        "surrogates": {
+            sur: [s.original, s.entity_type, list(s.source_detectors)]
+            for sur, s in entry.surrogates.items()
+        },
+        "detector_mode": list(entry.detector_mode),
+        "kwargs": [
+            [name, [list(pair) for pair in frozen]]
+            for name, frozen in entry.kwargs
+        ],
+    }
+
+
+def _decode_entry(data: Any) -> VaultEntry:
+    """Inverse of `_encode_entry`. Raises `KeyError`/`TypeError`/
+    `ValueError` for shape mismatches; the caller (RedisVault.pop)
+    catches these and treats them as corrupted-entry cases.
+    """
+    if not isinstance(data, dict):
+        raise TypeError(f"top-level value is not an object: {type(data).__name__}")
+
+    raw_surrogates = data.get("surrogates")
+    if not isinstance(raw_surrogates, dict):
+        raise TypeError(
+            f"surrogates is not an object: {type(raw_surrogates).__name__}"
+        )
+    surrogates: dict[str, VaultSurrogate] = {}
+    for sur, value in raw_surrogates.items():
+        if not isinstance(sur, str):
+            raise TypeError(f"surrogate key is not a string: {sur!r}")
+        if not isinstance(value, list) or len(value) != 3:
+            raise ValueError(f"surrogate value not a 3-element list: {value!r}")
+        original, entity_type, sources = value
+        if not isinstance(original, str) or not isinstance(entity_type, str):
+            raise TypeError(
+                f"surrogate {sur!r}: original/entity_type must be strings"
+            )
+        if not isinstance(sources, list) or not all(
+            isinstance(s, str) for s in sources
+        ):
+            raise TypeError(
+                f"surrogate {sur!r}: source_detectors must be list of strings"
+            )
+        surrogates[sur] = VaultSurrogate(
+            original=original,
+            entity_type=entity_type,
+            source_detectors=tuple(sources),
+        )
+
+    raw_mode = data.get("detector_mode", [])
+    if not isinstance(raw_mode, list) or not all(
+        isinstance(m, str) for m in raw_mode
+    ):
+        raise TypeError("detector_mode must be a list of strings")
+    detector_mode = tuple(raw_mode)
+
+    raw_kwargs = data.get("kwargs", [])
+    if not isinstance(raw_kwargs, list):
+        raise TypeError("kwargs must be a list")
+    kwargs: list[tuple[str, FrozenKwargs]] = []
+    for entry in raw_kwargs:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ValueError(f"kwargs entry must be a 2-element list: {entry!r}")
+        name, pairs = entry
+        if not isinstance(name, str):
+            raise TypeError(f"kwargs detector name must be a string: {name!r}")
+        if not isinstance(pairs, list):
+            raise TypeError(
+                f"kwargs[{name!r}] pairs must be a list, got {type(pairs).__name__}"
+            )
+        frozen: list[tuple[str, Any]] = []
+        for pair in pairs:
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ValueError(
+                    f"kwargs[{name!r}] pair must be a 2-element list: {pair!r}"
+                )
+            key, val = pair
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"kwargs[{name!r}] pair key must be a string: {key!r}"
+                )
+            frozen.append((key, _coerce_value(val)))
+        kwargs.append((name, tuple(frozen)))
+
+    return VaultEntry(
+        surrogates=surrogates,
+        detector_mode=detector_mode,
+        kwargs=tuple(kwargs),
+    )
+
+
+def _coerce_value(value: Any) -> Any:
+    """Lists round-trip back to tuples (mirroring `freeze_kwargs`'s
+    list→tuple normalisation so the deserialised kwargs hash to the
+    same value as a freshly-frozen one)."""
+    if isinstance(value, list):
+        return tuple(_coerce_value(v) for v in value)
+    return value
 
 
 __all__ = ["RedisVault", "RedisVaultError"]

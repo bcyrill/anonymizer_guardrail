@@ -291,19 +291,25 @@ class LLMDetector(BaseRemoteDetector):
         self.api_key = api_key if api_key is not None else CONFIG.api_key
         self.model = model or CONFIG.model
 
-    def _default_cache_key(self, text: str) -> tuple:
-        """Default-overrides cache key shape — must match what
-        `detect()` produces when called with `model=None,
-        prompt_name=None`. Used by the deanonymize-side cache
-        prewarm path.
+    def cache_key_for(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        prompt_name: str | None = None,
+    ) -> tuple:
+        """Build the per-detector cache key for `text` given the
+        cache-affecting overrides. Used by both `detect()` (for the
+        normal cache-wrap path) AND the pipeline's deanonymize-side
+        prewarm hook (which reconstructs the same key from the vault
+        entry's frozen kwargs).
 
-        `self.model` is stripped to mirror `detect()`'s
-        `(model or self.model).strip() or self.model` resolution —
-        otherwise an operator who configured `LLM_MODEL=" name "`
-        would prewarm one slot and read another.
-        """
-        effective_model = self.model.strip() or self.model
-        return (text, effective_model, "default")
+        `model` is stripped to canonicalise the key: a None-override
+        and a no-override carrying the matching default share one
+        cache slot. Same pattern as SurrogateGenerator.for_match."""
+        effective_model = (model or self.model).strip() or self.model
+        effective_prompt_name = prompt_name if prompt_name else "default"
+        return (text, effective_model, effective_prompt_name)
 
     async def detect(
         self,
@@ -322,14 +328,12 @@ class LLMDetector(BaseRemoteDetector):
         authenticated the call. Including it would fragment the cache
         across users (e.g. forwarded keys) for no correctness benefit.
         """
-        # Resolve overrides to their effective concrete values so the
-        # cache key is canonical: a None-override and a no-override
-        # carrying the matching default share one cache slot. Same
-        # pattern as SurrogateGenerator.for_match.
-        effective_model = (model or self.model).strip() or self.model
-        effective_prompt_name = prompt_name if prompt_name else "default"
-
-        cache_key = (text, effective_model, effective_prompt_name)
+        cache_key = self.cache_key_for(
+            text, model=model, prompt_name=prompt_name,
+        )
+        # Recover the resolved values for the HTTP layer — same shape
+        # `cache_key_for` computed, just unpacked back into named args.
+        _, effective_model, effective_prompt_name = cache_key
         return await self._detect_via_cache(
             text, cache_key,
             lambda: self._do_detect(
@@ -465,11 +469,24 @@ def _llm_call_kwargs(overrides: Any, api_key: str | None) -> dict[str, Any]:
     }
 
 
+def _llm_cache_kwargs(overrides: Any, _api_key: str | None) -> dict[str, Any]:
+    """Cache-affecting subset of `_llm_call_kwargs`. Same model +
+    prompt + text → same matches regardless of which key authenticated
+    the call (api_key is excluded). The pipeline cache key + vault
+    kwargs use this; `prepare_call_kwargs` (above) still carries
+    api_key for the actual HTTP path."""
+    return {
+        "model": overrides.llm_model,
+        "prompt_name": overrides.llm_prompt,
+    }
+
+
 SPEC = DetectorSpec(
     name="llm",
     factory=LLMDetector,
     module=sys.modules[__name__],
     prepare_call_kwargs=_llm_call_kwargs,
+    cache_kwargs=_llm_cache_kwargs,
     has_semaphore=True,
     stats_prefix="llm",
     unavailable_error=LLMUnavailableError,

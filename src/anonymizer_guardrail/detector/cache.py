@@ -217,4 +217,19 @@ def build_detector_cache(
 __all__ = [
     "DetectorResultCache",
     "build_detector_cache",
+    "resolve_cache_salt",
 ]
+
+
+# Public alias for cross-module reuse — the pipeline-level cache
+# (in `anonymizer_guardrail/pipeline_cache_redis.py`) needs the same
+# operator-resolved salt so an operator's CACHE_SALT applies to both
+# detector and pipeline caches uniformly. Kept as a thin wrapper rather
+# than renaming `_resolve_cache_salt` so the existing `_reset_…_for_tests`
+# hook stays internal.
+def resolve_cache_salt(raw: str) -> bytes:
+    """Public wrapper around `_resolve_cache_salt`. Same semantics
+    (cached, random fallback, BLAKE2b-truncation) — exposed so the
+    pipeline-cache redis backend can reuse the operator's CACHE_SALT
+    without re-implementing the resolution logic."""
+    return _resolve_cache_salt(raw)

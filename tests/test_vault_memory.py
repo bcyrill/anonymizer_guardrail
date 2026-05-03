@@ -25,7 +25,18 @@ import os
 # Match other test modules: keep transitive config harmless.
 os.environ.setdefault("DETECTOR_MODE", "regex")
 
+from anonymizer_guardrail.vault import VaultEntry, VaultSurrogate
 from anonymizer_guardrail.vault_memory import MemoryVault
+
+
+def _entry(surrogate: str, original: str, etype: str = "OTHER") -> VaultEntry:
+    """Tiny test helper — single-surrogate entries are what the
+    LRU/TTL tests need; the structured fields don't matter here."""
+    return VaultEntry(
+        surrogates={
+            surrogate: VaultSurrogate(original=original, entity_type=etype),
+        },
+    )
 
 
 # ── LRU cap ─────────────────────────────────────────────────────────────
@@ -34,48 +45,48 @@ from anonymizer_guardrail.vault_memory import MemoryVault
 async def test_lru_evicts_oldest_when_over_cap() -> None:
     """Filling past max_entries drops the least-recently-inserted entry."""
     v = MemoryVault(ttl_s=600, max_entries=2)
-    await v.put("a", {"sa": "oa"})
-    await v.put("b", {"sb": "ob"})
-    await v.put("c", {"sc": "oc"})  # evicts "a"
+    await v.put("a", _entry("sa", "oa"))
+    await v.put("b", _entry("sb", "ob"))
+    await v.put("c", _entry("sc", "oc"))  # evicts "a"
 
     assert v.size() == 2
-    assert await v.pop("a") == {}            # evicted, gone
-    assert await v.pop("b") == {"sb": "ob"}  # still there
-    assert await v.pop("c") == {"sc": "oc"}  # still there
+    assert await v.pop("a") == VaultEntry()       # evicted, gone
+    assert await v.pop("b") == _entry("sb", "ob")  # still there
+    assert await v.pop("c") == _entry("sc", "oc")  # still there
 
 
 async def test_lru_eviction_handles_burst() -> None:
     """Inserting many more than the cap leaves only the most recent N."""
     v = MemoryVault(ttl_s=600, max_entries=3)
     for i in range(10):
-        await v.put(f"call-{i}", {"s": f"o-{i}"})
+        await v.put(f"call-{i}", _entry("s", f"o-{i}"))
 
     assert v.size() == 3
     # Only the last three inserts survive.
     for i in range(7):
-        assert await v.pop(f"call-{i}") == {}
+        assert await v.pop(f"call-{i}") == VaultEntry()
     for i in range(7, 10):
-        assert await v.pop(f"call-{i}") == {"s": f"o-{i}"}
+        assert await v.pop(f"call-{i}") == _entry("s", f"o-{i}")
 
 
 async def test_re_putting_same_id_refreshes_recency() -> None:
     """A repeat put() on an existing call_id moves it to the end, so it
     isn't the next victim of LRU eviction."""
     v = MemoryVault(ttl_s=600, max_entries=2)
-    await v.put("a", {"sa": "oa"})
-    await v.put("b", {"sb": "ob"})
-    await v.put("a", {"sa": "oa2"})  # refresh "a" to most-recent
-    await v.put("c", {"sc": "oc"})   # should evict "b", not "a"
+    await v.put("a", _entry("sa", "oa"))
+    await v.put("b", _entry("sb", "ob"))
+    await v.put("a", _entry("sa", "oa2"))  # refresh "a" to most-recent
+    await v.put("c", _entry("sc", "oc"))   # should evict "b", not "a"
 
-    assert await v.pop("a") == {"sa": "oa2"}
-    assert await v.pop("b") == {}
-    assert await v.pop("c") == {"sc": "oc"}
+    assert await v.pop("a") == _entry("sa", "oa2")
+    assert await v.pop("b") == VaultEntry()
+    assert await v.pop("c") == _entry("sc", "oc")
 
 
 async def test_max_entries_floor_at_one() -> None:
     """A typoed 0/negative max_entries can't disable writes — floor is 1."""
     v = MemoryVault(ttl_s=600, max_entries=0)
-    await v.put("a", {"sa": "oa"})
+    await v.put("a", _entry("sa", "oa"))
     assert v.size() == 1
 
 
@@ -83,13 +94,13 @@ async def test_max_entries_floor_at_one() -> None:
 
 
 async def test_ttl_expiry() -> None:
-    """An entry whose monotonic timestamp is past the TTL returns {}.
+    """An entry whose monotonic timestamp is past the TTL returns empty.
     MemoryVault-specific: the TTL is checked lazily on every `pop`,
     not via a background sweeper. RedisVault's TTL is server-side
     via `EXPIRE` — covered separately in `test_vault_redis.py`."""
     v = MemoryVault(ttl_s=0, max_entries=10)  # TTL 0 → everything is "expired"
-    await v.put("a", {"sa": "oa"})
+    await v.put("a", _entry("sa", "oa"))
     # A 0-second TTL means the `now - ts > ttl` check trips on any
     # positive elapsed time. The tiny sleep is enough.
     await asyncio.sleep(0.01)
-    assert await v.pop("a") == {}
+    assert await v.pop("a") == VaultEntry()

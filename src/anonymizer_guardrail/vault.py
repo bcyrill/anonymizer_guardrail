@@ -6,8 +6,32 @@ post_call reads and evicts it. Entries are TTL'd in case the
 post_call never arrives (request errored out, client disconnected,
 etc.) so memory doesn't grow unbounded.
 
-This module owns the *interface* (`VaultBackend` Protocol) and the
-*selection* (`build_vault()` factory). Concrete implementations
+# Vault entry shape
+
+The vault stores a structured `VaultEntry` per call_id (not just a
+flat surrogate→original dict). The extras are needed by the
+deanonymize-side pipeline-cache pre-warm:
+
+  * Per-surrogate `entity_type` — synthesised matches need a typed
+    entity_type to land in the right surrogate-cache slot. Recovering
+    type from the surrogate prefix only works for opaque tokens; with
+    Faker output (`Robert Jones`, `192.0.2.5`) we'd lose the signal.
+  * Per-surrogate `source_detectors` — which detector(s) actually
+    produced this match before `_dedup` collapsed the per-detector
+    lists. Lets the prewarm path filter the synthesised match list
+    per detector so per-detector cache slots get *that* detector's
+    matches (not the deduped union — see the bidirectional pipeline
+    cache rationale in docs/design-decisions.md).
+  * Call-level `detector_mode` + per-detector `kwargs` — required to
+    reconstruct the pipeline-cache key (`(text, detector_mode,
+    frozen_kwargs)`) and per-detector cache keys at deanonymize time.
+    Without these, prewarm would have to fall back to default-overrides
+    slots, which silently re-introduces the override-staleness the
+    prior Option-2 prewarm had.
+
+This module owns the *interface* (`VaultBackend` Protocol), the
+*shape* (`VaultEntry`, `VaultSurrogate`, the kwargs-freezing helper),
+and the *selection* (`build_vault()` factory). Concrete implementations
 each live in their own module:
 
   * `vault_memory.py` → `MemoryVault` (default; process-local,
@@ -16,11 +40,6 @@ each live in their own module:
     shared store for multi-replica deployments). Imports `redis-py`
     only when the backend is actually selected.
 
-Selection happens in `build_vault()` based on `VAULT_BACKEND`. The
-factory is the only place that imports a concrete backend; the
-pipeline references the Protocol type so swapping doesn't ripple
-across the codebase.
-
 Test layout mirrors this split: `tests/test_vault.py` holds the
 parametrized contract tests that run against every backend; each
 `test_vault_<backend>.py` file owns the backend-specific tests.
@@ -28,14 +47,108 @@ parametrized contract tests that run against every backend; each
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .config import config
 
 
+# ── Per-entry shape ────────────────────────────────────────────────────
+
+
+# Hashable kwargs shape stored per-detector. Each entry is
+# `(detector_name, frozen_kwargs)` where `frozen_kwargs` is a
+# tuple of `(key, value)` pairs sorted by key. Lists/tuples in the
+# value position become tuples; scalars pass through. Constrained
+# enough to round-trip through JSON for the Redis backend, hashable
+# enough to be a piece of the pipeline-cache key.
+FrozenKwargs = tuple[tuple[str, Any], ...]
+FrozenCallKwargs = tuple[tuple[str, FrozenKwargs], ...]
+
+
+def freeze_kwargs(kwargs: Mapping[str, Any]) -> FrozenKwargs:
+    """Sort + tupleify a per-detector kwargs dict so it can serve as
+    a hashable cache-key component AND round-trip through JSON.
+
+    Values are normalised:
+      * `list` / `tuple` → `tuple` (recursive on contents).
+      * Scalars (`str`, `int`, `float`, `bool`, `None`) pass through.
+      * `dict` is rejected — there's no detector today that returns
+        nested dict kwargs and freezing them would require a stable
+        recursion contract we don't need.
+
+    Sorting by key gives a canonical order: kwargs={"a": 1, "b": 2}
+    and {"b": 2, "a": 1} freeze to the same tuple. Without that, the
+    pipeline cache would scatter hits across distinct frozen tuples
+    for the same logical input.
+    """
+    out: list[tuple[str, Any]] = []
+    for key in sorted(kwargs):
+        value = kwargs[key]
+        out.append((key, _freeze_value(value)))
+    return tuple(out)
+
+
+def _freeze_value(value: Any) -> Any:
+    """Recursive value normalisation for `freeze_kwargs`. Lists and
+    tuples become tuples; scalars pass through; dicts are rejected.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(v) for v in value)
+    if isinstance(value, dict):
+        raise TypeError(
+            "freeze_kwargs: nested dict values aren't supported. "
+            f"Got {value!r}."
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class VaultSurrogate:
+    """One surrogate's metadata stored in the vault.
+
+    `original` is the substring the surrogate replaces (the value the
+    deanonymize-side substring-replacer puts back). `entity_type` is
+    the canonical type from the producing Match — needed at
+    deanonymize-side prewarm time so synthesised matches carry the
+    same type the original detector did. `source_detectors` is the
+    list of detectors that independently found this entity *before*
+    `_dedup` collapsed per-detector lists; used to filter the
+    synthesised match list per detector when the prewarm hook seeds
+    each per-detector cache.
+    """
+
+    original: str
+    entity_type: str
+    source_detectors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VaultEntry:
+    """One full vault entry per call_id.
+
+    Equivalent to the legacy `dict[str, str]` shape but with three
+    structured additions (per-surrogate type, per-surrogate source
+    detectors, call-level detector_mode + frozen kwargs) — see the
+    module docstring for why each is needed by the pipeline-cache
+    prewarm.
+    """
+
+    surrogates: dict[str, VaultSurrogate] = field(default_factory=dict)
+    detector_mode: tuple[str, ...] = ()
+    kwargs: FrozenCallKwargs = ()
+
+    @property
+    def is_empty(self) -> bool:
+        """True iff this entry carries no surrogates — used by both
+        backends to short-circuit `put` (an empty mapping shouldn't
+        store a placeholder)."""
+        return not self.surrogates
+
+
 @runtime_checkable
 class VaultBackend(Protocol):
-    """Round-trip mapping store contract.
+    """Round-trip vault contract.
 
     Implementations: `MemoryVault` (in `vault_memory.py`, default)
     and `RedisVault` (in `vault_redis.py`, opt-in via
@@ -58,15 +171,15 @@ class VaultBackend(Protocol):
     backend if needed; costs nothing at runtime.
     """
 
-    async def put(self, call_id: str, mapping: dict[str, str]) -> None:
-        """Store the surrogate→original mapping for one call. Empty
-        mapping or empty call_id is a no-op."""
+    async def put(self, call_id: str, entry: VaultEntry) -> None:
+        """Store the structured entry for one call. Empty entry or
+        empty call_id is a no-op."""
         ...
 
-    async def pop(self, call_id: str) -> dict[str, str]:
-        """Retrieve and remove the mapping. Returns `{}` if absent or
-        expired. Idempotent — second pop with the same call_id
-        returns `{}`."""
+    async def pop(self, call_id: str) -> VaultEntry:
+        """Retrieve and remove the entry. Returns an empty
+        `VaultEntry()` if absent or expired. Idempotent — second
+        pop with the same call_id returns empty."""
         ...
 
     def size(self) -> int:
@@ -116,4 +229,12 @@ def build_vault() -> VaultBackend:
     )
 
 
-__all__ = ["VaultBackend", "build_vault"]
+__all__ = [
+    "FrozenCallKwargs",
+    "FrozenKwargs",
+    "VaultBackend",
+    "VaultEntry",
+    "VaultSurrogate",
+    "build_vault",
+    "freeze_kwargs",
+]

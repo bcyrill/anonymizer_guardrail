@@ -185,18 +185,39 @@ of which user authenticated. For gliner, label *order* IS part of
 the key — different orderings are treated as different calls
 because the wire request preserves order.
 
-### Pre-warming from deanonymize
+### Pipeline-level result cache (with deanonymize-side prewarm)
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DETECTOR_CACHE_PREWARM` | `false` | When true, `pipeline.deanonymize` synthesises Match objects from the vault entries it just substituted back, then writes them into each active cache-using detector's default-overrides cache slot. The next request that contains the same restored text hits the cache instead of running detection. **Requires `USE_FAKER=false`** — see [design-decisions → Detector cache pre-warm from deanonymize-derived matches](design-decisions.md#detector-cache-pre-warm-from-deanonymize-derived-matches) for the rationale and the documented caveats (misleading per-detector stats, override-staleness for non-default-overrides workloads). The boot validator enforces the mutual exclusion. |
+| `PIPELINE_CACHE_BACKEND` | `none` | One of `none`, `memory`, `redis`. `none` (the default) is off — every anonymize runs detection. `memory` caches deduped match lists in-process; `redis` routes to a shared `RedisPipelineCache` for multi-replica deployments and restart-persistence (uses `CACHE_REDIS_URL` + `CACHE_SALT`, same as the per-detector caches). |
+| `PIPELINE_CACHE_MAX_SIZE` | `0` | LRU cap, memory backend only. 0 with `backend=memory` disables caching at runtime. |
+| `PIPELINE_CACHE_TTL_S` | `600` | Per-key TTL, redis backend only. Reset on every cache write — frequently-hit keys stay warm. |
 
-The primary win is the assistant-message-on-turn-N+1 case: today
-the cache hits on every replayed prior user message but always
-misses on the most recent assistant reply (which was never put
-through detection — only deanonymize). Pre-warm closes that
-half, dropping steady-state cost from "two detection calls per
-round-trip" to "one new call per round-trip".
+When enabled, the pipeline cache sits ABOVE the per-detector caches
+and stores the *deduped* match list keyed by `(text, detector_mode,
+frozen_per_call_kwargs)`. Two write paths populate it:
+
+- **Detection-side write**: after detection runs, the deduped result
+  lands in the pipeline cache. The next request for the same text +
+  same kwargs hits in one shot — no detector dispatch.
+- **Deanonymize-side prewarm**: `pipeline.deanonymize` synthesises
+  matches from the typed vault entry and writes them into both the
+  pipeline cache (for the deanonymized text) AND each per-detector
+  cache (filtered by the entry's `source_detectors` per surrogate).
+
+Closes the assistant-message-on-turn-N+1 case: today the cache
+hits on every replayed prior user message but always misses on
+the most recent assistant reply (which was never put through
+detection — only deanonymize). Prewarm closes that half, dropping
+steady-state cost from "two detection calls per round-trip" to
+"one new call per round-trip".
+
+Compatible with `USE_FAKER=true` — the structured vault entry
+carries `entity_type` per surrogate, so prewarm doesn't need to
+recover types from surrogate prefixes. Per-detector cache stats
+stay meaningful: `source_detectors` filters per-detector writes so
+each slot only holds what THAT detector actually produced (not the
+deduped union).
 
 ### When to enable
 

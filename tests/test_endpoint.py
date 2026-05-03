@@ -161,10 +161,11 @@ def test_round_trip_request_then_response(client: TestClient) -> None:
     assert "bob@acmecorp.com" in post["texts"][0]
     # Vault entry must have been popped — otherwise mappings linger past
     # their useful lifetime. A second pop for the same call_id should
-    # return `{}` regardless of backend (Protocol-level contract from
-    # `tests/test_vault.py::test_pop_after_pop_is_idempotent`).
+    # return an empty entry regardless of backend (Protocol-level
+    # contract from `tests/test_vault.py::test_pop_after_pop_is_idempotent`).
     import asyncio
-    assert asyncio.run(main_mod._pipeline.vault.pop(call_id)) == {}
+    from anonymizer_guardrail.vault import VaultEntry
+    assert asyncio.run(main_mod._pipeline.vault.pop(call_id)) == VaultEntry()
 
 
 def test_response_with_unknown_call_id_returns_none(client: TestClient) -> None:

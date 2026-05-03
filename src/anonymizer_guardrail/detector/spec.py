@@ -94,6 +94,29 @@ class DetectorSpec:
     (only LLM uses the latter today). Default is the no-op
     `_no_call_kwargs` so the pipeline can call it unconditionally."""
 
+    cache_kwargs: Callable[["Overrides", str | None], dict[str, Any]] | None = None
+    """Builds the subset of per-call kwargs that affect detection
+    OUTPUT — used by the pipeline-level cache key and by the vault
+    entry's frozen kwargs. None (the default) means
+    "use `prepare_call_kwargs` as-is" — appropriate for detectors
+    whose every kwarg affects output (regex, gliner, denylist).
+    LLM overrides this to strip `api_key`: same model + prompt + text
+    → same matches regardless of which key authenticated the call,
+    so including api_key would fragment the cache per-user for no
+    correctness benefit."""
+
+    def resolve_cache_kwargs(
+        self, overrides: "Overrides", api_key: str | None,
+    ) -> dict[str, Any]:
+        """Return the cache-relevant kwargs for this spec given the
+        request's overrides + forwarded api_key. Pipeline freezes the
+        result into the cache-key tuple AND stores it on the vault
+        entry; both paths must produce byte-identical tuples for the
+        same logical inputs, so this method is the single source of
+        truth."""
+        fn = self.cache_kwargs or self.prepare_call_kwargs
+        return fn(overrides, api_key)
+
     # ── Concurrency cap (optional) ─────────────────────────────────────
     has_semaphore: bool = False
     """When True, the pipeline allocates a semaphore + in-flight

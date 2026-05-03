@@ -105,13 +105,15 @@ async def test_no_entities_produces_empty_mapping(pipeline: Pipeline) -> None:
 async def test_vault_evicts_after_pop(pipeline: Pipeline) -> None:
     """Pipeline.deanonymize must call vault.pop, leaving no residue
     behind. Probed via a manual pop after deanonymize: a clean eviction
-    means the second pop returns `{}`. Backend-agnostic — RedisVault's
-    `size()` returns 0 unconditionally so we can't use that probe."""
+    means the second pop returns an empty entry. Backend-agnostic —
+    RedisVault's `size()` returns 0 unconditionally so we can't use
+    that probe."""
+    from anonymizer_guardrail.vault import VaultEntry
     await pipeline.anonymize(["email me at bob@example.com"], call_id="evict-test")
     await pipeline.deanonymize(["…"], call_id="evict-test")
-    # Manual pop — anything still in the vault under this call_id
-    # would surface here. `{}` confirms deanonymize evicted it.
-    assert await pipeline.vault.pop("evict-test") == {}
+    # Manual pop — anything still in the vault under this call_id would
+    # surface here. An empty VaultEntry confirms deanonymize evicted it.
+    assert await pipeline.vault.pop("evict-test") == VaultEntry()
 
 
 async def test_memory_vault_size_reflects_in_flight_entries() -> None:
