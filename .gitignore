@@ -40,3 +40,9 @@ Thumbs.db
 
 # Coding Agent
 .junie/
+
+# Benchmark output (default `-o cache-bench-results/` lands here;
+# the canonical results live at `docs/benchmark/cache-bench/` and
+# ARE committed)
+cache-bench-results/
+cache-bench-results-*/

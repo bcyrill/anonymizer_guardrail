@@ -41,6 +41,7 @@ from anonymizer_guardrail.detector import (
     remote_gliner_pii as gliner_mod,
     remote_privacy_filter as pf_mod,
 )
+from anonymizer_guardrail.detector.cache import _reset_resolved_salt_for_tests
 from anonymizer_guardrail.pipeline import Pipeline
 
 from .payloads import Conversation
@@ -242,10 +243,45 @@ def _build_detector_configs(cell: BenchCell, urls: ServiceUrls) -> dict:
     return out
 
 
+async def _flush_redis(url: str) -> None:
+    """FLUSHDB on the Redis URL's logical DB so a prior cell's cache
+    entries don't leak into this cell. Required because the cache-salt
+    resolver memoizes its first value process-wide; even with a fresh
+    salt per cell, Redis writes from earlier cells could (in theory)
+    collide if the harness ever re-uses a salt. FLUSHDB makes
+    cell-isolation a runtime invariant rather than a salt-uniqueness
+    promise. Best-effort: failures here are logged and swallowed since
+    the cell's own assertions catch any unexpected leakage."""
+    if not url:
+        return
+    try:
+        import redis.asyncio as redis_asyncio
+        client = redis_asyncio.from_url(url, decode_responses=True)
+        try:
+            await client.flushdb()
+        finally:
+            await client.aclose()
+    except Exception as exc:  # noqa: BLE001 — bench-side, never fatal
+        log.warning("FLUSHDB on %s failed: %s", url, exc)
+
+
 @asynccontextmanager
 async def _configured_pipeline(cell: BenchCell, urls: ServiceUrls):
     """Build a fresh Pipeline with the cell's cache config patched in.
-    Yields the Pipeline; restores the original config on exit."""
+    Yields the Pipeline; restores the original config on exit.
+
+    Cell-isolation invariants:
+      * The central `_resolved_salt` cache in `detector/cache.py` is
+        reset BEFORE the new salt is resolved, so each cell uses its
+        own salt rather than the first one ever seen.
+      * The Redis logical DB (when redis cells run) is FLUSHDB'd
+        before the cell starts, so no entries from a prior cell remain.
+
+    Without these two, Redis cells' results would silently leak across
+    cells — entries written by an earlier cell would be hashed under the
+    same first-seen salt and the next cell would hit them on a cold run,
+    producing impossibly fast numbers.
+    """
     # Snapshot originals.
     orig_central = {
         "config_mod": config_mod.config,
@@ -255,6 +291,9 @@ async def _configured_pipeline(cell: BenchCell, urls: ServiceUrls):
     orig_detectors = {mod: mod.CONFIG for mod in _DETECTOR_CONFIG_MODULES.values()}
 
     try:
+        # Reset the process-wide salt cache so this cell's `cache_salt`
+        # actually takes effect on the resolver.
+        _reset_resolved_salt_for_tests()
         # Apply patches.
         new_central = _build_pipeline_config(cell, urls)
         config_mod.config = new_central
@@ -263,6 +302,11 @@ async def _configured_pipeline(cell: BenchCell, urls: ServiceUrls):
 
         for mod, new_config in _build_detector_configs(cell, urls).items():
             setattr(mod, "CONFIG", new_config)
+
+        # FLUSHDB so this redis cell starts cold even if a prior cell
+        # used the same logical DB (it does — bench shares one DB).
+        if cell.backend == "redis" and cell.cache_mode != "none" and urls.cache_redis_url:
+            await _flush_redis(urls.cache_redis_url)
 
         pipeline = Pipeline()
         try:

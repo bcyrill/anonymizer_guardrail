@@ -103,6 +103,8 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 | Container images, build, run | [docs/deployment.md](docs/deployment.md) |
 | Curl recipes | [docs/examples.md](docs/examples.md) |
 | Detector quality benchmark | [docs/benchmark.md](docs/benchmark.md) |
+| Cache effectiveness benchmark — script | [docs/cache-bench.md](docs/cache-bench.md) |
+| Cache effectiveness benchmark — committed results | [docs/benchmark/cache-bench/](docs/benchmark/cache-bench/report.md) |
 | Limitations — single replica, no streaming | [docs/limitations.md](docs/limitations.md) |
 | Contributor guide | [docs/development.md](docs/development.md) |
 | Design decisions — paths considered and declined | [docs/design-decisions.md](docs/design-decisions.md) |

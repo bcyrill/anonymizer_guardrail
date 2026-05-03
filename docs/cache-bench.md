@@ -112,6 +112,13 @@ Output lands in `cache-bench-results/` by default:
 
 Override the path with `-o` / `--output-dir`.
 
+The default output dir is gitignored so ad-hoc bench runs don't
+clutter the working tree. The canonical, committed results live at
+[`docs/benchmark/cache-bench/`](benchmark/cache-bench/report.md) —
+operators reproducing the report can re-run the bench and overwrite
+that path explicitly via `-o docs/benchmark/cache-bench/` if they
+want the committed numbers refreshed.
+
 ## Reading the report
 
 The headline view is one markdown table per detector mix. Rows are
