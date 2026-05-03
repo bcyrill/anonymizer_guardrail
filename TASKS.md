@@ -322,11 +322,11 @@ only*).
 `surrogate → original` (strings only). Pre-warming with
 `tuple[Match, ...]` needs the entity type, which `Match`
 carries. Extend the vault entry shape to
-`surrogate → (original, entity_type)`; recover the type at
-deanonymize time. Small change, isolated to `vault.py` and the
-two pipeline call sites.
+`surrogate → (original, entity_type)` for Options 1 and 2; recover
+the type at deanonymize time. Small change, isolated to `vault.py`
+and the two pipeline call sites. Option 3 needs more (see below).
 
-**Architectural shape — two alternatives, decide at
+**Architectural shape — three alternatives, decide at
 implementation time:**
 
 1. **New pipeline-level cache.** A separate cache, distinct
@@ -347,9 +347,56 @@ implementation time:**
    combined* found on the original surrogate-anonymized text, not
    what each detector independently would find on the
    deanonymized form.
+3. **Per-detector pre-warm with detector-source tracking.** Like
+   Option 2, but each vault entry also records *which detector(s)*
+   found each entity AND the resolved per-call override values
+   each active detector used. On deanonymize, rebuild each
+   detector's match set faithfully (only entities that detector
+   found, keyed with the matching override values) and write it
+   into that detector's cache slot. **Most honest of the three:
+   a cache hit on detector X returns the same `Match` list X
+   actually produced on turn N's user message, not a deduped
+   union of all detectors' outputs. Per-detector hit/miss stats
+   stay meaningful; per-detector cache keys remain consistent
+   with how `_detect_via_cache` builds them today.**
 
-Option 1 is more honest about what the data actually is. Option
-2 is smaller. Pick at implementation time.
+   Vault change is bigger than Options 1 and 2:
+     * Per-surrogate: store `(original, entity_type, source_detectors)`
+       where `source_detectors` is the set of detectors that
+       independently found this entity. The pipeline already has
+       this info before `_dedup` runs — capture there, write
+       through to vault.
+     * Per call_id: also store the *resolved per-call overrides*
+       each active detector used (LLM's `(model, prompt_name)`,
+       gliner's `(labels_tuple, threshold)`, etc.). Without these
+       the pre-warm can't compute the correct cache-key tuple for
+       each detector — the per-detector cache keys include the
+       overrides by design (see `detector/cache.py` and each
+       detector's `detect()`).
+     * Footprint impact: roughly 3-10× the bytes per vault entry
+       on a typical 5-detector deployment with 5-20 entities.
+       Within reason for both memory and Redis backends, but
+       worth measuring before defaulting on. Operators with
+       redis-backed vaults may want to bump `VAULT_TTL_S` or
+       Redis-side `maxmemory` to absorb the increase.
+
+   Caveat shared with Options 1 and 2: even Option 3 doesn't
+   cover entities the *upstream model* generated newly in its
+   response. Pre-warming only ever populates cache entries for
+   what the deanonymize step put back. New PII the model
+   introduced (a name in a generated example, an address in a
+   summary) still incurs a real detection call. The win vs
+   Options 1 and 2 is **per-detector fidelity**, not breadth —
+   load-bearing only if operators read per-detector
+   `<prefix>_cache_hits/misses` for capacity planning or
+   detector-mix optimisation.
+
+Option 1 is the cleanest abstraction. Option 2 is the smallest
+diff. Option 3 is the only one whose per-detector cache hits
+match what re-running each detector would produce. Pick based on
+which property — clean separation, small change, or per-detector
+honesty — matters most for the deployment that triggered this
+work.
 
 **Concrete trigger:**
 
@@ -365,25 +412,45 @@ Option 1 is more honest about what the data actually is. Option
 
 1. Extend `Vault` entry shape to store entity_type alongside
    each original. `pipeline.anonymize` already has both; pass
-   them through.
+   them through. **For Option 3 only**: also store
+   `source_detectors: set[str]` per surrogate and the resolved
+   per-call overrides each active detector used (the kwargs
+   `prepare_call_kwargs` produced for that request) at the
+   call_id level. The `JSON` wire format both backends use
+   round-trips both additions; no msgpack needed.
 2. Add a hook on `pipeline.deanonymize` that, after the
    substring-replace pass, builds `tuple[Match, ...]` from the
    vault entries and records `(deanonymized_text, matches)`
-   pairs.
-3. Implement Option 1 OR Option 2 above. For Option 1: define
+   pairs. **For Option 3**: build *one match list per detector*
+   filtered by `source_detectors`, plus reconstruct each
+   detector's cache key using the saved per-call overrides.
+3. Implement Option 1, 2, OR 3 above. For Option 1: define
    a new `PipelineResultCache` (Protocol mirroring
    `DetectorResultCache`), instantiate one on `Pipeline`,
    consult it at the top of `_detect_one`, store entries from
    the deanonymize hook. For Option 2: write into each active
-   detector's `_cache` directly, building the per-detector key
-   from the configured-default override values (since the
-   response side doesn't carry per-call overrides).
+   detector's `_cache` directly with the deduped match set,
+   building the per-detector key from the configured-default
+   override values. For Option 3: write into each active
+   detector's `_cache` directly with that detector's filtered
+   match list, keyed by `(deanonymized_text, *saved_overrides)` —
+   the saved overrides are what makes Option 3's hit return the
+   correct value vs Option 2's lossy "what every detector
+   collectively found, keyed by defaults."
 4. Stats: surface hit/miss/size on `/health` under a new
    `pipeline_cache_*` prefix (Option 1) or fold into existing
-   `<prefix>_cache_*` keys (Option 2).
+   `<prefix>_cache_*` keys (Options 2 and 3 — Option 3's hits
+   stay attributed to the right detector since the cache writes
+   are per-detector with the correct value, so the existing
+   stats remain meaningful without renaming).
 5. Tests: turn-N response → turn-N+1 request hits cache;
-   pre-warming respects per-call override boundaries (Option 2);
-   evicted entries fall back to detection cleanly.
+   pre-warming respects per-call override boundaries (Options 2
+   and 3); evicted entries fall back to detection cleanly. For
+   Option 3 specifically: vault-stored source-detector tracking
+   round-trips correctly through the JSON wire format on both
+   memory and Redis backends; rebuilding a detector's match list
+   from `source_detectors` excludes entities other detectors
+   found that this detector didn't.
 
 **Non-goals:**
 
