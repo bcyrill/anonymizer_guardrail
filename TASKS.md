@@ -346,11 +346,27 @@ implementation time:**
    pre-warming the cache for text it knows would have produced
    those matches if detection had run. `_detect_one(text)` checks
    the pipeline cache first; on hit, skips ALL detectors and
-   returns the cached set directly. Per-detector caches still
-   exist as a fallback for the cold-pipeline-key case (operator
-   evicted, TTL fired) and for capacity tuning of individual
-   detectors, but their hit-rate share drops once the pipeline
-   cache is in play.
+   returns the cached set directly.
+
+   **Per-detector caches earn their keep alongside the pipeline
+   cache by catching the override-fragmentation gap.** When
+   *some* detectors' per-call kwargs change between requests but
+   not others (operators A/B-testing LLM prompts while regex
+   patterns stay stable; multi-tenant deployments where each
+   tenant has their own prompt but shares one regex set; per-call
+   gliner label rotation), the pipeline-cache key flips and the
+   slot misses — but the unchanged-detector per-detector slots
+   still hit on `_detect_one`'s fallback path. Concretely: a
+   request that changes only `llm_prompt` from the previous
+   request misses the pipeline cache (its key includes every
+   detector's kwargs), but the regex / denylist / PF / gliner
+   per-detector caches still hit because *their* keys didn't
+   change. Per-detector caches recover the unchanged-detector
+   work that the pipeline cache can't.
+
+   When to enable both vs Option-1-alone depends on the
+   workload's override-fragmentation profile. See "Trade-off:
+   pipeline cache vs per-detector caches" below.
 
    **Why bidirectional and not just deanonymize-fed**: a
    one-way pipeline cache is asymmetric. A user-typed message that
@@ -379,10 +395,33 @@ implementation time:**
    `(model, prompt_name)`, gliner's `(labels_tuple, threshold)`,
    etc.). Verbose, but correct — this is the same correctness
    concern flagged for Option 2's pre-warming, just lifted to the
-   pipeline-cache key. **Cleanest abstraction; adds a new cache
-   type but in exchange the pipeline cache becomes the dominant
-   caching layer and the per-detector caches stop being the
-   first-line lookup.**
+   pipeline-cache key.
+
+   **Drawback — union sensitivity.** Because the key includes
+   *every active detector's* kwargs as a union, a change to *any*
+   detector's overrides invalidates the slot for *all* of them.
+   The pipeline cache treats the request as a single atomic shape,
+   so it can't selectively re-use the parts that didn't change.
+   Per-detector caches don't have this problem — each detector's
+   key is scoped to its own kwargs only. This is the structural
+   reason a deployment with frequent override fragmentation wants
+   both caches: the pipeline cache catches the common
+   "all-defaults" path in one lookup, and per-detector caches
+   catch the fragmented case the pipeline cache structurally
+   can't reach.
+
+   **Trade-off: pipeline cache vs per-detector caches.**
+
+   | Workload shape | Recommendation |
+   |---|---|
+   | Stable overrides across requests (single-tenant, fixed pattern set, fixed prompt) | Pipeline cache only; disable per-detector caches (`<DETECTOR>_CACHE_MAX_SIZE=0`). Pipeline cache absorbs every text-level repeat in one shot; per-detector caches would be redundant. |
+   | Heavy override fragmentation (multi-tenant prompt rotation, dynamic gliner labels, per-request A/B testing) | Both caches. Pipeline cache catches the all-defaults requests; per-detector caches catch the override-fragmented requests' unchanged-detector work. |
+   | Mixed | Both caches. Hybrid wins. |
+
+   **Cleanest abstraction; adds a new cache type but in exchange
+   the pipeline cache becomes the dominant caching layer for
+   stable-override workloads, with per-detector caches as the
+   backup tier for override-fragmented workloads.**
 2. **Pre-warm each per-detector cache** with the deduped match
    set. Doesn't add a cache type; reuses the existing
    `DetectorResultCache`. Downside: per-detector hit/miss stats
@@ -494,9 +533,20 @@ pick one.
    detector's cache key using the saved per-call overrides.
 3. Implement Option 1, 2, OR 3 above. For Option 1: define
    a new `PipelineResultCache` (Protocol mirroring
-   `DetectorResultCache`), instantiate one on `Pipeline`,
-   consult it at the top of `_detect_one`, store entries from
-   the deanonymize hook. For Option 2: write into each active
+   `DetectorResultCache`), instantiate one on `Pipeline`. **Two
+   write paths feed it, both writing the same key/value shape:**
+   (a) at the top of `_detect_one`, check the pipeline cache; on
+   miss, run detectors, dedup, and *write the deduped result back
+   into the pipeline cache* before returning — this is what makes
+   user-typed-text repeats fast, regardless of whether they came
+   in as a fresh request or were echoed from history; (b) the
+   deanonymize hook synthesises matches from vault entries and
+   writes them into the same cache, pre-warming the slot so the
+   first time the deanonymized text appears as detection input,
+   it's a hit. Cache key is
+   `(text, detector_mode, frozen_per_call_kwargs)` — see the
+   architectural-shape discussion above for the kwargs flattening
+   shape. For Option 2: write into each active
    detector's `_cache` directly with the deduped match set,
    building the per-detector key from the configured-default
    override values. For Option 3: write into each active
