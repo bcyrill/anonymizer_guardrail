@@ -281,6 +281,218 @@ per-text cache when `input_mode="merged"`.
 
 ---
 
+## Bidirectional pipeline-level result cache
+
+**Related to:** the implemented design-decision
+[Detector cache pre-warm from deanonymize-derived matches](docs/design-decisions.md#detector-cache-pre-warm-from-deanonymize-derived-matches),
+which lists this work as the "Option 1" variation that was
+considered and dismissed. This entry is the formal task expansion
+of that variation for if/when the trigger fires.
+
+**Priority:** low.
+
+**What:** add a new `PipelineResultCache` layer that sits ABOVE the
+per-detector caches and caches the *deduped* match set keyed by
+`(text, detector_mode, frozen_per_call_kwargs)`. Two write paths
+populate it, both writing to the same key/value shape:
+
+  * **Detection-side write**: after `_detect_one(text)` runs the
+    active detectors and dedups, the result lands in the pipeline
+    cache so the next request for the same text hits in one shot.
+  * **Deanonymize-side pre-warm**: `pipeline.deanonymize` synthesises
+    matches from vault entries (same path as today's
+    `_prewarm_detector_caches`) and writes them into the pipeline
+    cache for the deanonymized output text.
+
+`_detect_one(text)` checks the pipeline cache first; on hit, skips
+ALL detectors and returns the cached set directly. The "input vs
+output" asymmetry the existing per-detector pre-warm has — fresh
+user text populates per-detector caches while deanonymize-derived
+text populates per-detector caches via a separate hook, both
+keyed at the default-overrides slot — collapses into a single
+unified caching layer that covers text-level repeats regardless
+of provenance.
+
+**Why:** completes the deanonymize-prewarm story by making
+pre-warm a special case of a general "we've seen this text
+before" cache. Today's Option 2 implementation pre-warms
+per-detector caches with deduped matches keyed at default
+overrides; that's correct for stable-overrides workloads but
+mis-attributes hit/miss across detectors. The pipeline cache
+attributes hits to "the deduped result for this exact request
+shape" — semantically clean and correct.
+
+**Why deferred (low priority):** Option 2 is already shipped and
+covers the common case (multi-turn conversations where turn N's
+assistant message lands in turn N+1's prompt). The pipeline cache
+is a layered upgrade: bigger surface area (new cache Protocol,
+factory, two backends, /health stats, merged-mode warning
+update), with the primary win the same one Option 2 already
+delivers. Premature until override fragmentation OR per-detector
+stats fidelity become load-bearing for an actual deployment.
+
+**Concrete trigger:** any of:
+
+- An operator's per-detector hit/miss stats become misleading
+  enough that capacity planning is hard. The pipeline cache's
+  per-shape stats (`pipeline_cache_hits/misses`) replace the
+  multi-detector confusion with one number.
+- A workload with stable per-call overrides where Option 2's
+  default-slot pre-warm misses the textually-identical-but-
+  override-different requests. The pipeline cache's
+  `(text, detector_mode, kwargs)` key handles this naturally.
+- Operators measuring text-level repeat rate find that a
+  unified cache layer would absorb traffic that today
+  fragments across N per-detector slots.
+
+**Architectural shape — single bidirectional cache, mirrors the
+existing detector cache structure:**
+
+The new module layout matches `detector/cache.py` / `cache_memory.py`
+/ `cache_redis.py`, just at the pipeline scope:
+
+```
+src/anonymizer_guardrail/
+  pipeline_cache.py          # PipelineResultCache Protocol + factory
+  pipeline_cache_memory.py   # InMemoryPipelineCache (default, zero deps)
+  pipeline_cache_redis.py    # RedisPipelineCache (opt-in via cache-redis)
+```
+
+`PipelineResultCache` Protocol mirrors `DetectorResultCache`:
+`enabled`, `get_or_compute(key, compute) → list[Match]`, `stats() →
+dict[str, int]`, `aclose()`. Same shape detectors already code
+against, just at a different layer.
+
+**Cache-key shape** (the load-bearing detail):
+
+```python
+PipelineCacheKey = tuple[str, tuple[str, ...], tuple[tuple[str, tuple], ...]]
+#                   text   detector_mode    frozen_per_call_kwargs
+```
+
+Where `frozen_per_call_kwargs` is a hashable tuple-of-tuples
+version of the per-detector kwargs each active detector's
+`prepare_call_kwargs` produced for the request — LLM's `(model,
+prompt_name)`, gliner's `(labels_tuple, threshold)`, regex's
+`(overlap_strategy, patterns_name)`, etc. Verbose, but correct:
+any change to any detector's overrides invalidates the slot
+(documented union sensitivity — see design-decisions entry).
+
+**Backends — same factory pattern as detector caches:**
+
+  * `InMemoryPipelineCache`: process-local LRU keyed by the
+    PipelineCacheKey tuple (Python's `dict` handles the tuple
+    natively). Sized via `PIPELINE_CACHE_MAX_SIZE` (memory backend
+    only). Same eviction + thread-safety pattern as
+    `InMemoryDetectionCache`.
+  * `RedisPipelineCache`: shared store. Key:
+    `pipeline:<blake2b-keyed-digest of repr(key))>` — same
+    salt + digest scheme `RedisDetectionCache` uses today,
+    reusing `CACHE_SALT` for the digest key. Value: JSON
+    `[{"text": str, "type": str}]`. TTL via `EXPIRE`
+    (`PIPELINE_CACHE_TTL_S`). Reuses the existing
+    `CACHE_REDIS_URL` from central config.
+
+**Sketch:**
+
+1. **Schema + Protocol.** New `pipeline_cache.py` defines
+   `PipelineResultCache` Protocol + `_resolve_cache_salt`
+   (importable from `detector/cache.py` to share the resolution
+   logic) + `build_pipeline_cache(backend, max_size, ttl_s)`
+   factory. Two backend modules. Same shape as detector cache.
+
+2. **Pipeline integration.**
+   * `Pipeline.__init__` constructs the pipeline cache via
+     factory, stores on `self._pipeline_cache`.
+   * `_detect_one(text, ...)` (the per-text dispatch) checks
+     `self._pipeline_cache.get_or_compute(key, compute)` first
+     where `compute` is the existing per-detector dispatch chain.
+     On hit, the pipeline cache absorbs it; on miss, detectors
+     run as today and the result lands in the pipeline cache.
+   * `_prewarm_detector_caches` (the existing deanonymize hook)
+     gets a sibling `_prewarm_pipeline_cache` that writes to the
+     pipeline cache instead of (or alongside, depending on flags)
+     the per-detector ones.
+
+3. **Config knobs (central Config):**
+   * `PIPELINE_CACHE_BACKEND: Literal["memory", "redis", "none"] = "none"`
+     — three-way: memory, redis, or off entirely. Off is the
+     default to keep behaviour unchanged for existing deployments.
+   * `PIPELINE_CACHE_MAX_SIZE: int = 0` — LRU cap, memory backend
+     only.
+   * `PIPELINE_CACHE_TTL_S: int = 600` — TTL, redis backend only.
+   * Reuse `CACHE_REDIS_URL` + `CACHE_SALT` (no new cross-cutting
+     vars).
+   * Cross-field validator: `PIPELINE_CACHE_BACKEND=redis`
+     requires `CACHE_REDIS_URL`. Same shape as the existing
+     `_cache_redis_url_required_when_any_detector_picks_redis`
+     validator — extend it or add a sibling.
+
+4. **/health stats.** Add `pipeline_cache_size`,
+   `pipeline_cache_max`, `pipeline_cache_hits`,
+   `pipeline_cache_misses`, `pipeline_cache_backend` to
+   `Pipeline.stats()`. Same pattern the per-detector caches
+   already use.
+
+5. **Merged-mode warning extension.** The existing pipeline-init
+   warning (`pipeline.py:_detector_cache_prewarm_requires_opaque_tokens`-
+   adjacent block) flags `input_mode=merged` + per-detector
+   cache-on as wasted work. With a pipeline cache, merged mode
+   ALSO produces unique-by-construction blobs → the pipeline
+   cache writes one-shot entries. Warn on
+   `input_mode=merged` + `PIPELINE_CACHE_BACKEND != "none"`,
+   same wording shape.
+
+6. **Interaction with existing `DETECTOR_CACHE_PREWARM`.**
+   When BOTH the new pipeline cache and the existing prewarm
+   are active, decide policy:
+     * Option A: prewarm writes to pipeline cache only when
+       enabled; per-detector prewarm becomes the fallback.
+     * Option B: prewarm writes to both (defensive — costs
+       extra writes but covers operators who toggle one off).
+     * Option C: deprecate the per-detector prewarm path when
+       the pipeline cache is on, with a one-release migration
+       window (warning at boot when both are set).
+   Pick at implementation time. Option B is safest; Option C
+   is cleanest long-term.
+
+7. **Tests:**
+   * Round-trip: detection populates pipeline cache; second
+     identical request hits the pipeline cache (no detector
+     dispatch, observable via mocked HTTP-call counters).
+   * Override sensitivity: change an LLM prompt override →
+     pipeline cache misses; identical request afterwards hits
+     the new slot.
+   * Backend parity: redis backend round-trips through fakeredis
+     with the same `(text, detector_mode, kwargs)` key shape.
+   * Stats: hits/misses/size/max/backend on `/health` for both
+     backends, including the redis `size=0, max=0` placeholder
+     pattern.
+   * Pre-warm interaction: the deanonymize hook populates the
+     pipeline cache with the synthesised match list under the
+     correct key (default detector_mode + default kwargs).
+
+**Non-goals:**
+
+- **Don't auto-disable per-detector caches** when the pipeline
+  cache is on. Operators with override-fragmented workloads
+  benefit from the per-detector caches absorbing the unchanged-
+  detector hits the pipeline cache structurally can't reach
+  (its key is union-sensitive — see design-decisions discussion).
+  Per-detector caches remain operator-controlled; the pipeline
+  cache is a separate opt-in layer.
+- **Don't conflate this with the per-detector cache redis backend.**
+  They're two independent caches that happen to share `CACHE_REDIS_URL`
+  + `CACHE_SALT`. Redis namespaces (`cache:<detector>:<digest>`
+  vs `pipeline:<digest>`) keep them separate so a `FLUSHDB` on
+  one doesn't wipe the other.
+- **Don't ship a "pipeline-only mode"** that disables per-detector
+  caches automatically when the pipeline cache is on. The
+  trade-off (override fragmentation) is workload-dependent;
+  operators pick.
+
+---
+
 ## Pin Viterbi calibration JSON for privacy-filter
 
 **What:** ship a default `services/privacy_filter/calibration.json`

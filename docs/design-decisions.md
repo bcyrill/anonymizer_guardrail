@@ -437,4 +437,6 @@ Wire-up summary:
   response text (text-level repeats independent of provenance).
   Time to consider Option 1's bidirectional pipeline cache,
   with the pipeline cache as primary tier and per-detector
-  caches as the override-fragmentation backup tier.
+  caches as the override-fragmentation backup tier. The task
+  expansion is tracked in
+  [TASKS.md → Bidirectional pipeline-level result cache](../TASKS.md#bidirectional-pipeline-level-result-cache).
