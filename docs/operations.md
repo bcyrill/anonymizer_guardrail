@@ -458,6 +458,79 @@ redis-cli -n 2 DBSIZE
 process-local on both backends — they reflect this replica's
 traffic, not cluster-wide totals.
 
+## Surrogates persist in responses (`DEANONYMIZE_SUBSTITUTE=false`)
+
+By default the guardrail's `deanonymize` step substitutes
+surrogates back to originals so the calling client receives the
+real values in the model's response. Set
+`DEANONYMIZE_SUBSTITUTE=false` to skip the substitution — the
+client receives surrogate-laden output instead.
+
+### What this is for
+
+Redaction-only pipelines where round-trip restoration is the wrong
+thing to do:
+
+- Telemetry / log scrubbing — anonymize before writing, never restore.
+- Training-data sanitization — feed the model surrogate-laden text;
+  the output should also be surrogate-laden so downstream training
+  doesn't memorise originals.
+- Compliance pipelines that strip PII for auditing — restoration
+  would defeat the audit trail.
+
+### What it changes
+
+- `pipeline.deanonymize` calls `vault.pop` and runs `_prewarm_caches`
+  exactly as before, then returns `texts` unchanged (skipping the
+  substring substitution).
+- The cache prewarm seeds the pipeline cache + per-detector caches
+  for the **surrogate-laden** response text. That's the right key
+  shape: the client receives the surrogate-laden form, includes it
+  in the next turn's chat history, and the future anonymize call
+  on that same text gets a cache hit (with empty matches — no
+  re-anonymization of already-anonymized text).
+- Log lines on deanonymize calls carry a `substitute=skip` marker
+  so log shippers can grep for substitute-off requests.
+
+### What it does NOT change
+
+- **Vault** still works as before. Operators who want to save
+  vault overhead choose `VAULT_BACKEND=memory` (default;
+  sub-microsecond) or accept the Redis cost. The vault is needed
+  to drive the prewarm; no separate flag disables it.
+- **Per-detector caches** still work as before — the prewarm
+  writes them, future anonymize lookups hit them.
+- **Pipeline cache** still works as before.
+- **Surrogate consistency across turns** is preserved — same
+  original PII produces the same surrogate regardless of the
+  flag. The surrogate cache (process-wide
+  `original → surrogate` map) is independent of the deanonymize
+  path.
+- **Detection on response-side text**: the deanonymize step does
+  NOT run detection (and never has, regardless of this flag). If
+  the upstream LLM emits NEW PII not present in the original
+  prompt — e.g. via retrieval-augmented generation surfacing
+  customer records — that PII passes through unchanged. The
+  guardrail does NOT redact model output. See
+  [design-decisions](design-decisions.md) for the rationale.
+
+### What clients receiving surrogate-laden responses must handle
+
+A chat UI rendering the model's response will show literal
+surrogate strings (e.g. `[PERSON_DEADBEEF]` or `Robert Jones` if
+`USE_FAKER=true`). For human-facing chat that's confusing; for
+machine consumers (downstream tools, training-data pipelines,
+log indexes) it's typically what's wanted. Operators choosing
+this knob are deciding the surrogate form is the canonical
+output — make sure your downstream consumer is built around that.
+
+### Performance
+
+No measurable change vs the default. The substring substitution
+that's skipped is a single regex pass per text and was already
+~microseconds. The win is operational (semantic match for the
+deployment shape), not latency.
+
 ## Merged-input mode
 
 Today, every text in `req.texts` triggers its own detector call —

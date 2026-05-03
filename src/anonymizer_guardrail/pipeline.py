@@ -1015,23 +1015,44 @@ class Pipeline:
         """Reverse the substitution using the stored vault entry for
         this call_id. Optionally pre-warms both cache layers from the
         typed entry — see `_prewarm_caches` for the dual-write
-        semantics."""
+        semantics.
+
+        When `config.deanonymize_substitute=false`, the surrogate→
+        original substitution is SKIPPED — texts are returned
+        unchanged (still surrogate-laden) and the prewarm seeds the
+        cache for the surrogate-laden form (which is what subsequent
+        anonymize calls will see in this mode). Use for
+        redaction-only deployments where restoring originals would
+        undermine the purpose."""
         if not texts:
             return []
         entry = await self._vault.pop(call_id) if call_id else VaultEntry()
         if entry.is_empty:
             log.debug("deanonymize call_id=%s — nothing to restore", call_id)
             return texts
-        flat_mapping = {
-            surrogate: vs.original
-            for surrogate, vs in entry.surrogates.items()
-        }
-        replace = _build_replacer(flat_mapping)
-        restored = [replace(t) for t in texts]
-        log.info(
-            "deanonymize call_id=%s entities=%d texts=%d",
-            call_id, len(flat_mapping), len(texts),
-        )
+        if config.deanonymize_substitute:
+            flat_mapping = {
+                surrogate: vs.original
+                for surrogate, vs in entry.surrogates.items()
+            }
+            replace = _build_replacer(flat_mapping)
+            restored = [replace(t) for t in texts]
+            log.info(
+                "deanonymize call_id=%s entities=%d texts=%d",
+                call_id, len(flat_mapping), len(texts),
+            )
+        else:
+            # Substitute-off mode: pass texts through verbatim. The
+            # client receives surrogate-laden output. Vault was popped
+            # above so the entry is still consumed — no leak. Log at
+            # the same level so operators see the call shape but with
+            # an explicit `substitute=skip` marker.
+            restored = list(texts)
+            log.info(
+                "deanonymize call_id=%s entities=%d texts=%d "
+                "substitute=skip",
+                call_id, len(entry.surrogates), len(texts),
+            )
 
         # Dual-write prewarm: if the pipeline cache is enabled OR any
         # active cache-using detector has caching live, seed both
@@ -1043,6 +1064,14 @@ class Pipeline:
         # actually produced (Option-3-style fidelity — see
         # docs/design-decisions.md). Best-effort: prewarm failures are
         # logged and swallowed.
+        #
+        # The prewarm seeds based on `restored`. When substitute is
+        # on, that's the original-laden form (matches what the
+        # client's next turn will send through anonymize). When
+        # substitute is off, that's the surrogate-laden form (matches
+        # what the client's next turn will send because the client
+        # received surrogates). Either way, the cache key matches the
+        # text future requests will look up.
         await self._prewarm_caches(restored, entry)
 
         return restored

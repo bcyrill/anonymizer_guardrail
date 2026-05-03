@@ -144,6 +144,28 @@ class Config(BaseSettings):
     # ignores this knob.
     pipeline_cache_ttl_s: int = 600
 
+    # ── Deanonymize behaviour ─────────────────────────────────────────────────
+    # When false, `pipeline.deanonymize` SKIPS the surrogate→original
+    # substring substitution but otherwise runs the full deanonymize
+    # path: vault.pop still happens (drives the prewarm hook), and the
+    # pipeline + per-detector caches still get warmed for the
+    # surrogate-laden response text. The texts are returned unchanged.
+    #
+    # End-user effect: responses go back to the calling client
+    # surrogate-laden — originals never re-enter the chat history. Use
+    # for redaction-only deployments (PII-stripped logs, training-data
+    # sanitization, downstream tools that just want the entities
+    # masked) where restoring originals would defeat the purpose.
+    #
+    # The cache prewarm continues to fire because the surrogate-laden
+    # response text IS what subsequent anonymize calls will see in
+    # this mode (the client receives the surrogate-laden form and
+    # includes it in the next turn's history). The cache keys match
+    # what future requests look up. See `pipeline.py:_prewarm_caches`.
+    #
+    # Default true preserves today's full round-trip behaviour.
+    deanonymize_substitute: bool = True
+
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     # Backend selection. "memory" (default) is process-local — fine
     # for single-replica deployments. "redis" routes the vault through

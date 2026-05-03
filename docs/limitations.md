@@ -119,3 +119,32 @@ Default backends keep single-replica deployments zero-dependency. The
 Redis-backed alternatives are bundled in the default container image
 (`pip install ".[vault-redis,cache-redis]"`) so flipping the env var
 doesn't require a rebuild.
+
+## Round-trip restoration is the default
+
+By default the guardrail completes a full round-trip: anonymize on
+the request side, deanonymize on the response side, and the
+calling client receives the original PII restored. For
+redaction-only deployments where the surrogate form should
+persist in responses (telemetry / log scrubbing, training-data
+sanitization, compliance pipelines), set
+`DEANONYMIZE_SUBSTITUTE=false` — see [operations →
+Surrogates persist in responses](operations.md#surrogates-persist-in-responses-deanonymize_substitutefalse).
+
+Two implications operators should know about regardless of the
+flag:
+
+- **PII the model itself emits (vs the surrogate it received) is
+  not redacted.** The deanonymize step only does substring
+  replacement of known surrogates → originals. A model that
+  retrieves customer records from a downstream tool and surfaces
+  them in its response surfaces real PII to the client. See
+  [design-decisions → Why we don't redact model output](design-decisions.md)
+  for the rationale.
+- **Clients receiving surrogate-laden responses
+  (`DEANONYMIZE_SUBSTITUTE=false`)** see literal surrogate strings
+  in the model's output. For human-facing chat UIs this is
+  confusing; for machine consumers it's typically what's wanted.
+  This is a deployment-shape choice, not a backwards-compatible
+  feature flag — switch only when the consumer is built around
+  the surrogate form.
