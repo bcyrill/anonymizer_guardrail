@@ -259,6 +259,64 @@ def test_show_presets_table_renders_service_variants() -> None:
     assert "privacy_filter=hf" in rendered
 
 
+def test_runner_injects_redis_urls_when_redis_was_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Redis is auto-started, the runner must inject
+    VAULT_REDIS_URL=redis://anonymizer-redis:6379/0 and
+    CACHE_REDIS_URL=…/1 into the guardrail container env. Distinct
+    DB indices keep the vault and cache namespaces separate.
+    Operator-supplied URLs (via env) get overridden — the auto-started
+    container is the canonical source. Pin so a refactor that drops
+    the URL-injection block doesn't silently route the guardrail at a
+    nonexistent URL."""
+    from tools.launcher import services as services_mod
+
+    # Simulate redis was started in this process.
+    monkeypatch.setattr(
+        services_mod, "_STARTED_SERVICES", {services_mod._REDIS_NAME},
+    )
+    # Operator also has VAULT_REDIS_URL set in their env — auto-start
+    # must override.
+    monkeypatch.setenv("VAULT_REDIS_URL", "redis://operator-supplied:9999/5")
+    monkeypatch.setenv("VAULT_BACKEND", "redis")
+
+    cfg = LaunchConfig(detector_mode="regex")
+    argv = build_run_argv(_FakeEngine(), cfg)
+    env = _argv_to_env_dict(argv)
+
+    assert env["VAULT_REDIS_URL"] == "redis://anonymizer-redis:6379/0"
+    assert env["CACHE_REDIS_URL"] == "redis://anonymizer-redis:6379/1"
+    # The operator's VAULT_BACKEND=redis still flows through (not an
+    # auto-injected URL — just an env passthrough).
+    assert env["VAULT_BACKEND"] == "redis"
+
+
+def test_runner_does_not_inject_redis_urls_when_redis_not_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Redis wasn't auto-started, the runner must NOT inject
+    URLs — the operator's external Redis (or no Redis at all) governs.
+    Operator-supplied URLs flow through normally via the cross-cutting
+    passthrough loop."""
+    from tools.launcher import services as services_mod
+
+    # Make sure nothing was "started" in this test.
+    monkeypatch.setattr(services_mod, "_STARTED_SERVICES", set())
+    monkeypatch.setenv("VAULT_REDIS_URL", "redis://operator-supplied:9999/5")
+
+    cfg = LaunchConfig(detector_mode="regex")
+    argv = build_run_argv(_FakeEngine(), cfg)
+    env = _argv_to_env_dict(argv)
+
+    # Operator value flows through (cross-cutting passthrough), not
+    # the auto-injected /0 URL.
+    assert env["VAULT_REDIS_URL"] == "redis://operator-supplied:9999/5"
+    # CACHE_REDIS_URL wasn't set in env, no auto-start — should be
+    # absent entirely.
+    assert "CACHE_REDIS_URL" not in env
+
+
 def test_show_presets_table_inlines_source_annotation() -> None:
     """The Source column was collapsed into the Preset cell as a
     `(bundled)` / `(operator)` annotation — narrower table without

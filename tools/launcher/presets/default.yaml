@@ -73,6 +73,23 @@ presets:
       REGEX_OVERLAP_STRATEGY: longest
       REGEX_PATTERNS_PATH: bundled:regex_default.yaml
 
+  # Pentest-flavoured stack — regex with the pentest pattern set AND
+  # the LLM detector with the pentest system prompt. Defaults to
+  # llm_backend=service (fake-llm) for self-contained operation; for
+  # real pentest engagements override with `--llm-backend external`
+  # and supply LLM_API_BASE / LLM_API_KEY / LLM_MODEL pointing at a
+  # production LLM. The pentest prompt is wasted on fake-llm (rule-
+  # driven, ignores the system prompt) but the preset still exercises
+  # the prompt-loading path for testing.
+  llm-pentest:
+    detector_mode: regex,llm
+    use_faker: false
+    llm_backend: service
+    env_overrides:
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_pentest.yaml
+      LLM_SYSTEM_PROMPT_PATH: bundled:llm_pentest.md
+
   # ── Single-detector service flavours ───────────────────────────────────
   # Auto-start the matching inference container and dial it. Use when
   # validating the service alone (regex layer not in play, no
@@ -120,6 +137,38 @@ presets:
     gliner_backend: service
     env_overrides:
       GLINER_PII_LABELS: person,date_of_birth,ssn,medical_record_number,address
+
+  # ── Redis-backed flavours ──────────────────────────────────────────────
+  # Auto-start a shared `anonymizer-redis` container and route the
+  # vault / detector-cache through it. `redis_backend=service` triggers
+  # the launcher to start the container AND inject VAULT_REDIS_URL +
+  # CACHE_REDIS_URL into the guardrail env. Operators wanting to dial
+  # an existing Redis use `redis_backend=external` (or override on the
+  # CLI) and supply the URLs themselves.
+
+  vault-redis:
+    detector_mode: regex
+    use_faker: false
+    redis_backend: service
+    env_overrides:
+      VAULT_BACKEND: redis
+      REGEX_OVERLAP_STRATEGY: longest
+      REGEX_PATTERNS_PATH: bundled:regex_default.yaml
+
+  # PF detector with the result cache backed by Redis. Useful for
+  # multi-replica deployments and for cache survival across guardrail
+  # restarts. Auto-starts both the privacy-filter HF service and the
+  # shared Redis container; the HF variant matches the existing
+  # `privacy-filter-service` preset's choice (HF-pipeline build).
+  pf-cache-redis:
+    detector_mode: privacy_filter
+    use_faker: false
+    pf_backend: service
+    redis_backend: service
+    service_variants:
+      privacy_filter: hf
+    env_overrides:
+      PRIVACY_FILTER_CACHE_BACKEND: redis
 
   # ── Combined flavours ──────────────────────────────────────────────────
   # Regex (deterministic shape-classifier; first in priority order so

@@ -72,12 +72,20 @@ class ServiceSpec:
 
     health_endpoint: str = "/health"
     """HTTP path the readiness probe hits. The probe expects a 200
-    response whose body contains `health_ok_substring`."""
+    response whose body contains `health_ok_substring`. Ignored when
+    `health_command` is set."""
 
     health_ok_substring: str = '"status":"ok"'
     """Substring the readiness probe looks for in the /health response.
     The default matches what the privacy_filter / gliner_pii services
-    return when the model has finished loading."""
+    return when the model has finished loading. Ignored when
+    `health_command` is set."""
+
+    health_command: tuple[str, ...] | None = None
+    """Optional shell-command-based readiness probe. When set, the
+    launcher runs `<engine> exec <container> <command>` and treats a
+    zero exit code as healthy — used for non-HTTP services like Redis
+    (`("redis-cli", "ping")`). Falls back to the HTTP probe when None."""
 
     readiness_timeout_s: int = 30
     """Upper bound (seconds) the launcher waits for the service to

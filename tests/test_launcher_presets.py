@@ -48,17 +48,20 @@ def test_bundled_presets_load() -> None:
     from tools.launcher.preset_loader import load_presets
 
     presets = load_presets()
-    # The 10 bundled presets shipped with the launcher today.
+    # The 13 bundled presets shipped with the launcher today.
     expected = {
         "regex-default",
         "regex-pentest",
         "regex-debug",
         "regex-llm-debug",
+        "llm-pentest",
         "privacy-filter-service",
         "gliner-pii-service",
         "gliner-pii-minimal",
         "gliner-pii-financial",
         "gliner-pii-healthcare",
+        "vault-redis",
+        "pf-cache-redis",
         "regex-pentest-gliner-pii-service",
     }
     assert expected.issubset(presets.keys())
@@ -376,6 +379,47 @@ def test_apply_preset_normalizes_backend_choices() -> None:
     assert cfg.use_faker is False
     # And no service variants on a pure-regex preset.
     assert cfg.service_variants == {}
+
+
+def test_bundled_vault_redis_preset_pins_backend_and_env() -> None:
+    """vault-redis must (a) auto-start the shared Redis container and
+    (b) set VAULT_BACKEND=redis. Pin both — operator picking the
+    preset expects the vault to actually use redis, not the memory
+    backend with redis side-running."""
+    from tools.launcher.preset_loader import load_presets
+
+    vr = load_presets()["vault-redis"].spec
+    assert vr.redis_backend == "service"
+    assert vr.env_overrides["VAULT_BACKEND"] == "redis"
+
+
+def test_bundled_pf_cache_redis_pins_backend_and_cache_env() -> None:
+    """pf-cache-redis must auto-start (PF service, redis container)
+    AND select PRIVACY_FILTER_CACHE_BACKEND=redis so the PF detector
+    actually routes its result cache through redis. Plus the HF
+    variant — matches `privacy-filter-service`'s choice for the same
+    rationale."""
+    from tools.launcher.preset_loader import load_presets
+
+    pf = load_presets()["pf-cache-redis"].spec
+    assert pf.pf_backend == "service"
+    assert pf.redis_backend == "service"
+    assert pf.service_variants == {"privacy_filter": "hf"}
+    assert pf.env_overrides["PRIVACY_FILTER_CACHE_BACKEND"] == "redis"
+
+
+def test_apply_preset_writes_redis_backend() -> None:
+    """`_apply_preset` must propagate `redis_backend` from the spec
+    into `cfg.redis_backend` so `auto_start_services` knows to fire
+    `start_redis`. Pin so a refactor that drops the apply step
+    silently regresses every redis-using preset to memory backends."""
+    from tools.launcher.main import _apply_preset
+    from tools.launcher.runner import LaunchConfig
+
+    cfg = LaunchConfig()
+    _apply_preset(cfg, "vault-redis")
+    assert cfg.redis_backend == "service"
+    assert cfg.env_overrides["VAULT_BACKEND"] == "redis"
 
 
 def test_apply_preset_writes_service_variants() -> None:

@@ -53,6 +53,42 @@ from .spec_extras import (
 )
 
 
+# ── Redis infrastructure service ──────────────────────────────────────
+# Single shared Redis container the operator opts into via
+# `redis_backend=service`. Used as the backing store for VAULT (when
+# `VAULT_BACKEND=redis`) and for the per-detector result caches (when
+# any `<DETECTOR>_CACHE_BACKEND=redis`). Distinct logical DB indices
+# (vault → /0, cache → /1) keep the two namespaces from colliding so
+# operators can `FLUSHDB` one without wiping the other.
+#
+# Defined here (not in `LAUNCHER_METADATA` which is keyed by detector
+# name) because Redis isn't a detector — it's a peer infrastructure
+# dependency. The lifecycle is identical to a detector service though,
+# so it reuses `ServiceSpec` and feeds through the same start/stop
+# machinery.
+_REDIS_SERVICE = ServiceSpec(
+    container_name="anonymizer-redis",
+    image_tag_envs=("TAG_REDIS",),
+    image_tag_defaults=("redis:7-alpine",),
+    port=6379,
+    # `redis-cli ping` returns "PONG" + exit 0 once the server is up.
+    # No HTTP, so we use the command-based probe path.
+    health_command=("redis-cli", "ping"),
+    readiness_timeout_s=15,
+    # No HF cache; redis state lives in memory by default. Operators
+    # wanting persistence mount their own volume (`-v <name>:/data`)
+    # via `--` extras to launcher.sh.
+    hf_cache_volume=None,
+)
+
+
+# Sentinel name for the redis container in `_STARTED_SERVICES` and
+# the auto-start loop. Distinct from any detector name so the runner
+# loop can iterate `cfg.backends` for detectors and check redis
+# separately without false collisions.
+_REDIS_NAME = "_redis_infra"
+
+
 # stderr console — same rationale as runner._console: keep our status
 # output off the guardrail container's stdout stream.
 _console = Console(stderr=True)
@@ -284,12 +320,23 @@ def _wait_for_health(engine: Engine, service: ServiceSpec) -> None:
             _print_dead_container_diagnostics(engine, service)
             raise SystemExit(1)
 
-        ok, body = engine.exec_health_probe(
-            service.container_name,
-            service.port,
-            service.health_endpoint,
-        )
-        if ok and service.health_ok_substring in body:
+        if service.health_command is not None:
+            # Command-based probe (e.g. Redis: `redis-cli ping` →
+            # exit 0 + "PONG"). Used for non-HTTP services where
+            # the standard /health probe can't reach.
+            ok, body = engine.exec_command(
+                service.container_name, service.health_command,
+            )
+        else:
+            ok, body = engine.exec_health_probe(
+                service.container_name,
+                service.port,
+                service.health_endpoint,
+            )
+        if ok and (
+            service.health_command is not None
+            or service.health_ok_substring in body
+        ):
             _console.print(f"[green]{service.container_name} is ready.[/green]")
             return
         # Periodic progress: reassures the operator the launcher is
@@ -334,6 +381,74 @@ def _print_dead_container_diagnostics(engine: Engine, service: ServiceSpec) -> N
     )
 
 
+def start_redis(engine: Engine) -> None:
+    """Auto-start the shared Redis infrastructure container. Behaves
+    like `start_service` but for a non-detector peer service. Tracked
+    in `_STARTED_SERVICES` under the `_REDIS_NAME` sentinel so the
+    atexit cleanup path tears it down.
+
+    The container joins `SHARED_NETWORK` so the guardrail can dial it
+    at `redis://anonymizer-redis:6379/<db>`. Idempotent: a running
+    redis with the same name is reused (and NOT torn down on exit —
+    we don't stop containers we didn't start)."""
+    service = _REDIS_SERVICE
+
+    engine.ensure_network(SHARED_NETWORK)
+
+    if engine.container_exists(service.container_name):
+        if engine.container_running(service.container_name):
+            _console.print(
+                f"[green]{service.container_name} already running — "
+                f"reusing it (will NOT stop on exit).[/green]",
+            )
+            return
+        _console.print(
+            f"[yellow]{service.container_name} exists but isn't running — "
+            f"removing.[/yellow]",
+        )
+        engine.remove_container(service.container_name)
+
+    image, _kind = _resolve_image(engine, service)
+    _console.print(
+        f"Starting {service.container_name} on network "
+        f"\"{SHARED_NETWORK}\" (port {service.port})…",
+    )
+
+    cmd = [
+        engine.name, "run", "-d",
+        "--name", service.container_name,
+        "--network", SHARED_NETWORK,
+        "-p", f"{service.port}:{service.port}",
+        image,
+    ]
+    import subprocess
+    subprocess.run(cmd, check=True, capture_output=True)
+    _STARTED_SERVICES.add(_REDIS_NAME)
+
+    _wait_for_health(engine, service)
+
+
+def cleanup_redis(engine: Engine) -> None:
+    """Stop and remove the redis container if WE started it. Mirrors
+    `cleanup_service` for the detector side — distinct because the
+    redis container isn't keyed by a detector name in
+    `LAUNCHER_METADATA`."""
+    if _REDIS_NAME not in _STARTED_SERVICES:
+        return
+    _console.print(
+        f"\nStopping auto-started {_REDIS_SERVICE.container_name}…",
+    )
+    engine.stop_container(_REDIS_SERVICE.container_name)
+    engine.remove_container(_REDIS_SERVICE.container_name)
+
+
+def redis_was_started() -> bool:
+    """Read-only check used by the run-argv composer to decide whether
+    to inject `VAULT_REDIS_URL` / `CACHE_REDIS_URL` into the guardrail
+    env. Mirrors `started_services()` for the detector side."""
+    return _REDIS_NAME in _STARTED_SERVICES
+
+
 def auto_start_services(
     engine: Engine,
     cfg: "LaunchConfig",
@@ -344,19 +459,16 @@ def auto_start_services(
     `backend="service"`. Returns the list of started detector names so
     the caller can pass it to `register_atexit_cleanup`.
 
+    Also auto-starts the shared Redis container when
+    `cfg.redis_backend == "service"` — done in this same helper so
+    the CLI / TUI don't have to remember a separate Redis-start step.
+
     Honours `cfg.service_variants` for variant resolution (e.g.
     `privacy_filter` → `hf` picks `privacy-filter-hf-service`). Forwards
     `cfg.log_level`. Optional `extra_volumes` lets the caller mount
     additional bind volumes per detector — used by the CLI for
     `--rules` on the auto-started fake-llm; the TUI doesn't expose
     that knob today and passes None.
-
-    Replaces the pre-existing duplicated loop in `main.py` (CLI) and
-    `menu.py` (TUI). The two had drifted — the TUI was silently
-    dropping `cfg.service_variants` so the menu's variant picker
-    became a no-op. Centralising the loop here makes that class of
-    drift impossible: any future per-detector start-time concern
-    (e.g. extra env, GPU policy) lives in one place.
 
     `SystemExit` from a failed health-check inside `start_service`
     propagates. The CLI lets Click handle it; the TUI catches it
@@ -365,6 +477,14 @@ def auto_start_services(
     """
     extra_volumes = extra_volumes or {}
     started: list[str] = []
+    # Start Redis FIRST so by the time detector services / the
+    # guardrail come up they can dial it. (Order matters less than
+    # network reachability — Redis is fast-ready (~1s) so any
+    # detector race is benign — but starting it first keeps the
+    # operator-facing log lines in a sensible order.)
+    if getattr(cfg, "redis_backend", "") == "service":
+        start_redis(engine)
+        started.append(_REDIS_NAME)
     for det_name, backend in cfg.backends.items():
         if backend != "service":
             continue
@@ -402,12 +522,22 @@ def cleanup_service(engine: Engine, name: str) -> None:
 def register_atexit_cleanup(engine: Engine, names: Iterable[str]) -> None:
     """Install an atexit handler that tears down every service we
     auto-started. Single registration call covers all relevant
-    services so the teardown ordering is deterministic."""
+    services so the teardown ordering is deterministic.
+
+    `names` may include the `_REDIS_NAME` sentinel (when the launcher
+    auto-started Redis); the handler routes that one through
+    `cleanup_redis` instead of `cleanup_service` because the redis
+    container isn't keyed by a detector name in `LAUNCHER_METADATA`.
+    Detectors stop first so any in-flight cache writes complete
+    before Redis goes away."""
     names = list(names)
 
     def _cleanup() -> None:
         for n in names:
-            cleanup_service(engine, n)
+            if n == _REDIS_NAME:
+                cleanup_redis(engine)
+            else:
+                cleanup_service(engine, n)
 
     atexit.register(_cleanup)
 
@@ -422,7 +552,10 @@ def started_services() -> set[str]:
 __all__ = [
     "auto_start_services",
     "start_service",
+    "start_redis",
     "cleanup_service",
+    "cleanup_redis",
     "register_atexit_cleanup",
     "started_services",
+    "redis_was_started",
 ]

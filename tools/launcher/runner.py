@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .engine import Engine
-from .services import started_services
+from .services import redis_was_started, started_services
 from .spec_extras import (
     CONTAINER_NAME_DEFAULT,
     CROSS_CUTTING_GUARDRAIL_ENV_PASSTHROUGHS,
@@ -92,6 +92,15 @@ class LaunchConfig:
     # so the runner can decide which auto-start dispatches to fire.
     # Keys are detector names; values are "service" / "external" / "" (skip).
     backends: dict[str, str] = field(default_factory=dict)
+
+    # Redis infrastructure backend. "service" → auto-start the shared
+    # `anonymizer-redis` container and inject VAULT_REDIS_URL +
+    # CACHE_REDIS_URL into the guardrail env. "external" → operator
+    # supplies the URLs themselves (via env or `-e` extras). Empty
+    # → no Redis machinery; the guardrail uses memory backends. Same
+    # vocabulary as the per-detector backends so the CLI / preset
+    # surface stays uniform.
+    redis_backend: str = ""
 
     # Per-detector service-variant selection. Empty / missing = use
     # the LauncherSpec's default `service`; a string keys into
@@ -191,6 +200,33 @@ def build_run_argv(engine: Engine, cfg: LaunchConfig) -> list[str]:
         val = cfg.env_overrides.get(var) or os.environ.get(var, "")
         if val:
             env_args.extend(["-e", f"{var}={val}"])
+
+    # Auto-started Redis: inject VAULT_REDIS_URL + CACHE_REDIS_URL so
+    # presets / configs that select redis backends Just Work without
+    # the operator having to wire URLs themselves. Distinct logical
+    # DB indices (vault → /0, cache → /1) keep the two namespaces
+    # from colliding so operators can `FLUSHDB` one without wiping
+    # the other. Override any operator-supplied values from the
+    # cross-cutting loop above — the auto-started container is the
+    # canonical source for those URLs (same pattern as detector
+    # services overriding `*_URL` from `guardrail_env_when_started`).
+    if redis_was_started():
+        redis_host = "anonymizer-redis"  # SHARED_NETWORK hostname
+        injected = {
+            "VAULT_REDIS_URL": f"redis://{redis_host}:6379/0",
+            "CACHE_REDIS_URL": f"redis://{redis_host}:6379/1",
+        }
+        # Replace any earlier `-e VAR=…` for these keys (mirrors the
+        # detector-side override loop's already_set_keys reconciler).
+        for k, v in injected.items():
+            replaced = False
+            for i in range(0, len(env_args) - 1, 2):
+                if env_args[i] == "-e" and env_args[i + 1].startswith(f"{k}="):
+                    env_args[i + 1] = f"{k}={v}"
+                    replaced = True
+                    break
+            if not replaced:
+                env_args.extend(["-e", f"{k}={v}"])
 
     # Faker / locale knobs live on the central Config, not per-detector.
     if not cfg.use_faker:

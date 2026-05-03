@@ -105,6 +105,26 @@ class Engine:
             check=False, capture_output=True,
         )
 
+    def exec_command(
+        self, container: str, command: tuple[str, ...], timeout: int = 5,
+    ) -> tuple[bool, str]:
+        """Run `<engine> exec <container> <command…>` and return
+        (success, combined_output). Used as the command-based readiness
+        probe for non-HTTP services like Redis (`redis-cli ping`).
+
+        `success` is True iff exit code 0; output combines stdout +
+        stderr so the caller can inspect the response body either way.
+        Timeouts and missing-engine errors return (False, "")."""
+        try:
+            r = subprocess.run(
+                [self.name, "exec", container, *command],
+                capture_output=True, text=True, check=False,
+                timeout=timeout + 2,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False, ""
+        return r.returncode == 0, r.stdout + r.stderr
+
     def exec_health_probe(self, container: str, port: int, endpoint: str, timeout: int = 2) -> tuple[bool, str]:
         """Probe `http://127.0.0.1:<port><endpoint>` from INSIDE the
         container. Avoids host-vs-network routing edge cases that bit

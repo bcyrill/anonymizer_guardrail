@@ -167,6 +167,11 @@ def _apply_preset(cfg: LaunchConfig, preset: str) -> dict[str, str | None]:
     # path picks the variant container. Same shape the menu's
     # variant-edit modal writes; no other plumbing needed.
     cfg.service_variants.update(spec.service_variants)
+    # Redis infrastructure backend — only set if the preset declares
+    # one. An empty preset value preserves any explicit `--redis-backend`
+    # the operator passed before `--preset` on the CLI.
+    if spec.redis_backend:
+        cfg.redis_backend = spec.redis_backend
     return {
         "llm": spec.llm_backend or None,
         "privacy_filter": spec.pf_backend or None,
@@ -211,6 +216,7 @@ def _render_presets_table() -> "Table":
     table.add_column("LLM", style="green", no_wrap=True)
     table.add_column("PF", style="green", no_wrap=True)
     table.add_column("GLiNER", style="green", no_wrap=True)
+    table.add_column("Redis", style="green", no_wrap=True)
     table.add_column("Service variants", style="green", overflow="fold")
     table.add_column("Env overrides", style="green", overflow="fold")
 
@@ -259,6 +265,7 @@ def _render_presets_table() -> "Table":
             _backend_cell(spec, "llm_backend"),
             _backend_cell(spec, "pf_backend"),
             _backend_cell(spec, "gliner_backend"),
+            _backend_cell(spec, "redis_backend"),
             _service_variants_cell(spec),
             _env_overrides_cell(spec),
         )
@@ -343,6 +350,7 @@ _S_DENYLIST = "Denylist detector"
 _S_PF = "Privacy-filter detector"
 _S_GLINER = "GLiNER-PII detector"
 _S_LLM = "LLM detector"
+_S_REDIS = "Redis (vault + cache)"
 _S_OTHER = "Other"
 
 
@@ -592,6 +600,18 @@ def _open_menu(ctx: click.Context, _param: click.Parameter, value: bool) -> None
     is_flag=True, default=False, group=_S_LLM,
     help="LLM_FAIL_CLOSED=false (LLM errors degrade vs block).",
 )
+# ── Redis (vault + cache) ────────────────────────────────────────────────
+@grouped_option(
+    "--redis-backend",
+    type=str, default=None, group=_S_REDIS,
+    help=(
+        "service (auto-start the shared anonymizer-redis container "
+        "and inject VAULT_REDIS_URL / CACHE_REDIS_URL) | external "
+        "(operator supplies URLs via env). When unset, no Redis is "
+        "wired and VAULT_BACKEND=redis / *_CACHE_BACKEND=redis "
+        "would fail at boot for missing URLs."
+    ),
+)
 # ── Other ─────────────────────────────────────────────────────────────────
 @grouped_option(
     "--rules",
@@ -630,6 +650,7 @@ def cli(
     llm_prompt: str | None,
     forward_llm_key: bool,
     llm_fail_open: bool,
+    redis_backend: str | None,
     rules: str | None,
     extra: tuple[str, ...],
 ) -> None:
@@ -733,6 +754,14 @@ def cli(
         cfg.backends["privacy_filter"] = "service"
     if gliner_backend:
         cfg.backends["gliner_pii"] = gliner_backend
+
+    # Redis infrastructure backend. Explicit CLI flag wins over the
+    # preset's value (the preset's redis_backend was already applied
+    # by `_apply_preset` above; the explicit flag overrides only when
+    # set). Same precedence pattern as `llm_backend or preset_backends.get(…)`
+    # immediately above.
+    if redis_backend:
+        cfg.redis_backend = redis_backend
 
     # ── Validation ───────────────────────────────────────────────────────
     detectors = cfg.detector_names
