@@ -91,6 +91,7 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 
 | Topic | Where |
 |---|---|
+| **Architecture overview** — components, request lifecycle, layout | [docs/architecture.md](docs/architecture.md) |
 | **Detector overview + comparison** | [docs/detectors/](docs/detectors/index.md) |
 | Per-detector deep dives | [regex](docs/detectors/regex.md), [denylist](docs/detectors/denylist.md), [privacy-filter](docs/detectors/privacy-filter.md), [gliner-pii](docs/detectors/gliner-pii.md), [llm](docs/detectors/llm.md) |
 | Cross-cutting env vars (HTTP, surrogate, vault) | [docs/configuration.md](docs/configuration.md) |
