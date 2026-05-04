@@ -59,11 +59,13 @@ class MemoryVault:
         self, ttl_s: int | None = None, max_entries: int | None = None
     ) -> None:
         self._ttl_s = ttl_s if ttl_s is not None else config.vault_ttl_s
-        # Hard cap as a backstop against unbounded growth when callers
-        # never issue the matching post_call (TTL eventually clears them,
-        # but a burst of unique call_ids can still blow the heap before
-        # then). max(1, …) so a typoed 0/negative value can't disable
-        # writes entirely.
+        # Hard cap as a backstop against unbounded growth. Under the
+        # peek-based deanonymize path every entry — successful round-
+        # trip or orphaned — sits in the store until TTL fires, so the
+        # cap matters even with a healthy success rate. TTL eventually
+        # clears entries, but a burst of unique call_ids can still
+        # blow the heap before then. max(1, …) so a typoed 0/negative
+        # value can't disable writes entirely.
         self._max_entries = max(
             1,
             max_entries if max_entries is not None else config.vault_max_entries,
@@ -93,9 +95,9 @@ class MemoryVault:
             self._store[call_id] = (time.monotonic(), entry)
             # LRU backstop in case TTL eviction hasn't reclaimed enough
             # space (e.g. flood of unique call_ids well within TTL).
-            # Evicted entries lose their data — the matching post_call
-            # will deanonymize nothing, surfacing as the same warning the
-            # TTL path emits. Preferable to OOM.
+            # Evicted entries lose their data — any subsequent
+            # deanonymize for that call_id sees an empty vault, so its
+            # response goes back surrogate-laden. Preferable to OOM.
             evicted = 0
             while len(self._store) > self._max_entries:
                 self._store.popitem(last=False)

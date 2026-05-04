@@ -125,10 +125,12 @@ endpoint is unreachable."
   faster cleanup.
 - **Size cap (memory backend):** `VAULT_MAX_ENTRIES` (default
   10000) bounds the store with LRU eviction as a second backstop.
-  A burst of unique `call_id`s without matching `response` calls
-  (client crashes, malicious flood) would otherwise sit in memory
-  until TTL fires. Eviction emits a warning so a sustained overrun
-  is visible in logs.
+  Every entry — successful round-trips and orphaned ones alike —
+  sits in memory until TTL fires under the peek-based deanonymize
+  path, so a burst of unique `call_id`s (high traffic, client
+  crashes, malicious flood) can grow the store faster than TTL
+  reclaims it. Eviction emits a warning so a sustained overrun is
+  visible in logs.
 - **Skipped when `call_id` is missing.** A request without
   `litellm_call_id` is still anonymized, but no mapping is stored —
   the response side has nothing to restore against. Surfaces in the

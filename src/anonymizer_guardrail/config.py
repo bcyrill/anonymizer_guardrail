@@ -192,16 +192,18 @@ class Config(BaseSettings):
     # if requests legitimately take this long" line and bump it.
     vault_ttl_s: int = 120
     # Hard cap on vault entries. Memory backend only — TTL-only
-    # eviction fires lazily on put(), so a burst of unique call_ids
-    # without matching post_calls (client crashes, timeouts, malicious
+    # eviction fires lazily on put(), and under the peek-based
+    # deanonymize path every entry (successful round-trip or
+    # orphaned) sits in memory until TTL fires. A burst of unique
+    # call_ids (high traffic, client crashes, timeouts, malicious
     # flood) can grow the vault to millions of entries before TTL
-    # clears them. The cap forces LRU eviction on overflow as a
+    # clears them, so the cap forces LRU eviction on overflow as a
     # backstop. Each entry is a small dict of surrogate→original
     # strings (~hundreds of bytes typical), so 10k entries ≈ a few MB
-    # worst case. Raise if your traffic legitimately holds many
-    # in-flight call_ids simultaneously (very chatty conversations,
-    # long-running streams). Redis backend has no equivalent — operators
-    # bound Redis memory via `maxmemory` policy on the Redis side.
+    # worst case. Raise if your steady-state traffic
+    # (`request_rate × VAULT_TTL_S`) legitimately exceeds the cap;
+    # Redis backend has no equivalent — operators bound Redis memory
+    # via `maxmemory` policy on the Redis side.
     vault_max_entries: int = 10_000
 
     @field_validator("detector_mode", mode="after")
