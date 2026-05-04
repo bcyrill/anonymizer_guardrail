@@ -442,5 +442,6 @@ tools/
 | Per-call override surface | [per-request-overrides.md](per-request-overrides.md) |
 | Adding a new detector | [development.md → Adding a new detector](development.md#adding-a-new-detector) |
 | LiteLLM wiring (the "how do I plug this in" question) | [litellm-integration.md](litellm-integration.md) |
-| Detection-quality benchmark | [benchmark.md](benchmark.md) |
+| Detection-quality benchmark | [detector-bench.md](detector-bench.md) |
 | Cache effectiveness benchmark | [benchmark/cache-bench/report.md](benchmark/cache-bench/report.md) |
+| Detector-service latency benchmark (CPU + GPU) | [service-bench.md](service-bench.md) |

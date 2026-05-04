@@ -131,7 +131,8 @@ docs/                            # operator-facing documentation
   development.md                 # this file
   tools.md                       # implementation map for tools/launcher,
                                  # tools/image_builder, tools/detector_bench
-  benchmark.md                   # operator guide for detector_bench.sh
+  detector-bench.md              # operator guide for detector_bench.sh
+  service-bench.md               # CPU/GPU latency comparison across detector services
   detectors/                     # one file per detector
     index.md                     # overview + comparison
     regex.md

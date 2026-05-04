@@ -11,7 +11,7 @@ For operator-facing docs (how to *use* these tools), see:
 
 - [deployment.md](deployment.md) — running the launcher and the
   images it builds.
-- [benchmark.md](benchmark.md) — running the detector benchmark.
+- [detector-bench.md](detector-bench.md) — running the detector benchmark.
 
 This page is the engineering view: how each tool is wired, where
 to look when extending it.
@@ -167,7 +167,7 @@ per-request `detector_mode` override to filter the active set
 down) plus once with the full mix, then prints a side-by-side
 metric table. Always exits 0 — exploratory, not a CI gate.
 
-Operator-facing docs live in [benchmark.md](benchmark.md); this
+Operator-facing docs live in [detector-bench.md](detector-bench.md); this
 page is the implementation map.
 
 ## See also
