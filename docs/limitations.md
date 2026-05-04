@@ -31,6 +31,54 @@ survives provided Redis stayed up. Install with
 `VAULT_REDIS_URL`; see [vault → Backends](vault.md#backends) for
 the wire format and failure modes.
 
+## Streaming responses are not deanonymized
+
+When a client requests `stream: true`, the assistant's response
+chunks reach the client with surrogates intact (`[PERSON_…]`,
+`[EMAIL_ADDRESS_…]`, etc.). The pre-call (anonymize) side still
+works — the upstream LLM only ever sees anonymized text — but the
+client sees surrogates in the streamed reply.
+
+**Root cause is in LiteLLM, not this service.** LiteLLM's
+`UnifiedLLMGuardrails` integration calls our
+`apply_guardrail` endpoint repeatedly during streaming (every Nth
+chunk plus a final assembled-response call), but its iterator-hook
+implementation is **moderation-only**: it computes the guardrail
+output for compliance scanning and `BLOCKED` decisions, then yields
+the *original* upstream chunk to the client regardless of any
+modified text the guardrail returned. See
+[`unified_guardrail.py` line 417 `original_item = copy.deepcopy(item)`
+and line 465 `yield original_item`](https://github.com/BerriAI/litellm/blob/main/litellm/proxy/guardrails/guardrail_hooks/unified_guardrail/unified_guardrail.py).
+
+Service-side, the deanonymize path is already correct under this
+load — `pipeline.deanonymize` uses `vault.peek` so every sampled
+streaming call sees the same surrogate map and produces the right
+deanonymized output. That output just doesn't make it to the
+client because LiteLLM yields the original chunk.
+
+**Workarounds:**
+
+- **Disable streaming** on anonymizer-protected models. The
+  anonymizer protects the upstream LLM unconditionally; the only
+  thing streaming breaks is the client-side restoration. For chat
+  UIs that rely on token-by-token rendering this is a UX downgrade
+  but not a correctness regression — the client gets the same
+  final text in one response, just without the typing animation.
+- **Track upstream.** Comment / +1 on a feature request to make
+  `UnifiedLLMGuardrails` apply guardrail-modified texts to yielded
+  chunks (gated by a config flag so existing moderation-only
+  consumers aren't surprised).
+
+**Long-term fix tracked here.** A LiteLLM-side `CustomGuardrail`
+Python plugin that implements `async_post_call_streaming_iterator_hook`
+as a true generator transformer (yielding modified chunks rather
+than originals) would close the loop end-to-end. Tracked in
+[`TASKS.md` → Streaming response support](../TASKS.md#streaming-response-support);
+deferred because (a) the plugin requires a thin derived LiteLLM
+image rather than the official one, which is a meaningful
+deployment-shape change, and (b) the upstream fix may land first
+and obviate the plugin entirely.
+
 ## Hard cap on POST body size
 
 Request bodies above

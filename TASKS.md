@@ -61,6 +61,185 @@ instrumentation.
 
 ---
 
+## Streaming response support
+
+**What:** make streaming chat completions deanonymize end-to-end.
+Today, the upstream LLM only ever sees anonymized text (pre_call works
+unchanged), but the streamed chunks reach the client with surrogates
+intact — see [docs/limitations.md → Streaming responses are not
+deanonymized](docs/limitations.md#streaming-responses-are-not-deanonymized)
+for the user-visible effect and the LiteLLM-side root cause.
+
+**Why deferred:** the existing `generic_guardrail_api` HTTP integration
+covers non-streaming traffic correctly, and the streaming fix requires
+a meaningful deployment-shape change (Python plugin co-located with
+LiteLLM rather than the official image consumed unmodified). Many
+operators can simply disable `stream: true` on anonymizer-protected
+models and live without the typing animation. The fix matters for
+chat UIs (Open WebUI, in-house frontends) where streaming UX is
+load-bearing.
+
+**Wire-protocol facts (from reading LiteLLM source — both
+load-bearing for the plan below):**
+
+1. `UnifiedLLMGuardrails.async_post_call_streaming_iterator_hook`
+   ([`unified_guardrail.py`](https://github.com/BerriAI/litellm/blob/main/litellm/proxy/guardrails/guardrail_hooks/unified_guardrail/unified_guardrail.py),
+   line 287+) is **moderation-only**: it samples accumulated text
+   every Nth chunk, calls `apply_guardrail`, then yields the
+   *original* (deep-copied) chunk regardless of what the guardrail
+   returned. Lines 417 (`copy.deepcopy(item)`) and 465
+   (`yield original_item`) pin this. The final-assembled-response
+   path (line 469+) likewise calls `apply_guardrail` for compliance
+   but doesn't yield modified content downstream. Conclusion: we
+   cannot fix this from the existing HTTP integration alone.
+2. `CustomLogger.async_post_call_streaming_iterator_hook` (the base
+   class — `litellm/integrations/custom_logger.py`) IS a generator
+   transformer. A subclass that overrides this method can intercept
+   each `ModelResponseStream` chunk and yield rewritten chunks to
+   the client. This is the right seam for streaming deanonymization.
+
+**Design — `CustomGuardrail` plugin co-located with LiteLLM:**
+
+Ship a sibling Python module `anonymizer_guardrail.litellm_plugin`
+exposing `StreamingAnonymizerGuardrail(CustomGuardrail)`. The class:
+
+1. **Implements `async_post_call_streaming_iterator_hook`** as a
+   real generator transformer. For each upstream chunk:
+   - Append `chunk.choices[0].delta.content` (when present) to a
+     per-call_id rolling buffer.
+   - Walk the buffer left-to-right. For text outside any potential
+     surrogate-token region, emit it. When the regex shape of an
+     opaque token starts matching (`[`), enter a buffered region.
+   - When a buffered region either resolves to a complete
+     `[<TYPE>_<HEXSUFFIX>]` token (call `vault.peek` via our HTTP
+     service, substitute the original, emit) or becomes invalid
+     (e.g. `[INFO]`, `[link](url)`, JSON arrays — flush as-is and
+     resume), exit the buffered region.
+   - Hold a sliding window equal to the maximum possible surrogate
+     length (derive from `surrogate.py`, not a magic constant) so
+     a token that straddles a chunk boundary doesn't get half-emitted.
+2. **Falls back for non-streaming pre/post via the existing HTTP
+   path** (delegates to the `apply_guardrail` endpoint we already
+   serve so we don't fork detection logic). The plugin's
+   `async_pre_call_hook` and non-streaming `async_post_call_success_hook`
+   call `generic_guardrail_api` internally.
+3. **Reads `litellm_call_id` out of `request_data`** to correlate
+   streaming chunks with the vault entry written by pre_call. Vault
+   peek-based deanonymize (already shipped) ensures every chunk's
+   peek call sees the same map.
+
+**Faker-mode caveat:** opaque-token mode (`USE_FAKER=false`) is the
+only mode where chunk-buffer detection works cleanly — surrogates
+have a regex-recognizable shape. Faker surrogates look like real
+names (`Robert Jones`, `192.0.2.5`) and have no detectable boundary;
+the plugin should refuse / passthrough in that mode and log a
+warning. Document the trade-off: Faker users either disable
+streaming or accept that surrogates persist in the streamed reply.
+
+**Packaging:**
+
+- Publish as a separate PyPI package
+  (`anonymizer-guardrail-litellm-plugin`) with the import path
+  documented for LiteLLM's `litellm_settings.guardrails:
+  - guardrail: <module>.<Class>` config.
+- Document the install path as a thin derived LiteLLM image:
+  `FROM ghcr.io/berriai/litellm:<tag>` + `RUN pip install
+  anonymizer-guardrail-litellm-plugin`. Operators stay on the
+  upstream image, just one Dockerfile line away.
+- Hybrid deployment shape: keep `generic_guardrail_api`
+  integration (official image, no plugin) as the default. Plugin
+  is opt-in for operators who need streaming end-to-end.
+
+**HTTP API: no service-side wire changes needed.** The plugin uses
+the existing `apply_guardrail` endpoint with `input_type=response`
+to resolve surrogates — the same wire shape we already serve. Each
+plugin chunk-resolution point posts a small text snippet (one or a
+few buffered surrogate substrings) and gets back the deanonymized
+form. Per-chunk HTTP overhead is real but bounded: only fires when
+a surrogate actually resolves (most chunks pass through without
+calling our service).
+
+**Service-side prerequisite (already shipped):** the `pop → peek`
+switch on `pipeline.deanonymize` already landed. Each plugin
+invocation hits our service with the same `litellm_call_id` and
+needs to see the same vault entry — peek semantics make that work.
+Without the prerequisite the plugin's first chunk-resolution would
+evict the entry and subsequent ones would fail.
+
+**Sketch:**
+
+1. **New module** `src/anonymizer_guardrail/litellm_plugin/__init__.py`
+   exposing `StreamingAnonymizerGuardrail`. Subclass of
+   `litellm.integrations.custom_guardrail.CustomGuardrail`. Reuse
+   our existing config / vault / HTTP-client wiring as much as
+   possible — the plugin is mostly chunk-buffering glue around
+   calls back to our HTTP service.
+2. **Chunk-buffer state** keyed by `litellm_call_id`. Per-call
+   state holds: buffered tail (≤ max surrogate length), state
+   machine cursor (outside-token / in-token-prefix / in-token-body),
+   in-flight HTTP futures (so multiple resolutions in one chunk can
+   batch). Drop state on generator close.
+3. **Refuse Faker** at first invocation: detect via a config probe
+   on our service or a startup-time setting on the plugin; log
+   warning + passthrough chunks unchanged.
+4. **Tests:**
+   - Token split mid-prefix (`[PERS` | `ON_9278DAC7]`).
+   - Token split at the `[` (chunk ends with `[`, next chunk has
+     `PERSON_…]`).
+   - Same surrogate referenced multiple times in one response
+     (peek must keep working — service-side test already covers this).
+   - `[INFO]`, markdown `[link](url)`, JSON `[1, 2]` flush
+     correctly without consulting the vault.
+   - Stream that drops without end-of-stream — buffer state
+     released, vault TTL evicts.
+   - Faker mode + streaming → passthrough, warning logged.
+5. **Documentation:**
+   - `docs/limitations.md` streaming-not-deanonymized section gets
+     a "fixed by the plugin" note.
+   - New section in `docs/litellm-integration.md` covering the
+     plugin install path alongside the existing
+     `generic_guardrail_api` path. When to pick which.
+   - `README.md` link-table entry "Streaming support — opt-in
+     plugin" pointing at the new section.
+
+**Concrete trigger:** ✅ tripped — Open WebUI → LiteLLM streamed
+chat shows surrogates in the rendered reply. Issue captured in
+the conversation that produced the limitations.md entry.
+
+**Non-goals:**
+
+- **Don't try to extend the `generic_guardrail_api` HTTP wire to
+  carry chunks.** That endpoint's contract is `texts: list[str]`
+  in, `texts: list[str]` out — fundamentally a non-streaming shape,
+  and LiteLLM upstream owns it. The right seam is the in-process
+  `CustomGuardrail` iterator hook.
+- **Don't fork or vendor LiteLLM.** The plugin is a single class
+  that subclasses LiteLLM's public `CustomGuardrail` base. If the
+  upstream surface changes, we adapt the plugin — same blast
+  radius as any LiteLLM consumer.
+- **Don't try to support Faker-mode streaming.** Realistic
+  surrogates have no detectable shape; chunk-buffer machinery
+  needs that shape to work. Document it; don't paper over it.
+- **Don't anonymize partial chunks on the request side.** The
+  request body is delivered whole to pre_call; only post_call
+  needs the chunk-aware path.
+- **Don't require the plugin for non-streaming users.** The
+  existing HTTP integration via `generic_guardrail_api` continues
+  to work with the official LiteLLM image. The plugin is opt-in
+  for streaming-only.
+
+**Alternative path: upstream PR to LiteLLM.** If
+`UnifiedLLMGuardrails` could optionally apply guardrail-modified
+texts back to the yielded chunks (gated by a config flag for
+backwards compatibility), the plugin would be unnecessary —
+operators could stay on the official image. Worth filing once
+we have the plugin design validated as a reproducer; the upstream
+PR may take time and the plugin path lets us ship in the meantime.
+A merged upstream fix would let us deprecate the plugin without
+breaking deployments that opted in (the HTTP API stays unchanged).
+
+---
+
 ## Optional structured (JSON) logging
 
 **What:** add a `LOG_FORMAT=text|json` env var (default `text`). When
