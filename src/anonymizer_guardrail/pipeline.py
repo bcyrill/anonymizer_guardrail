@@ -709,7 +709,7 @@ class Pipeline:
 
         Order: detectors first, pipeline cache, vault last. The
         pipeline's own request path is `detect → vault.put`
-        (`anonymize`) and `vault.pop` (`deanonymize`). If a request is
+        (`anonymize`) and `vault.peek` (`deanonymize`). If a request is
         mid-anonymize when shutdown fires, the detector path needs the
         vault to still be live for the put; closing the vault first
         would leave that put hitting a closed Redis client. Uvicorn
@@ -1023,10 +1023,19 @@ class Pipeline:
         cache for the surrogate-laden form (which is what subsequent
         anonymize calls will see in this mode). Use for
         redaction-only deployments where restoring originals would
-        undermine the purpose."""
+        undermine the purpose.
+
+        Read-only on the vault (`peek`, not `pop`). LiteLLM's
+        `UnifiedLLMGuardrails` invokes us multiple times for a single
+        streaming response — every Nth chunk it forwards the
+        accumulated assistant text so far, plus a final
+        full-assembled-response call after the stream ends. All
+        invocations share the same `litellm_call_id` and need to see
+        the same surrogate map. Vault entries are evicted by
+        `VAULT_TTL_S` rather than by destructive read."""
         if not texts:
             return []
-        entry = await self._vault.pop(call_id) if call_id else VaultEntry()
+        entry = await self._vault.peek(call_id) if call_id else VaultEntry()
         if entry.is_empty:
             log.debug("deanonymize call_id=%s — nothing to restore", call_id)
             return texts
@@ -1043,10 +1052,11 @@ class Pipeline:
             )
         else:
             # Substitute-off mode: pass texts through verbatim. The
-            # client receives surrogate-laden output. Vault was popped
-            # above so the entry is still consumed — no leak. Log at
-            # the same level so operators see the call shape but with
-            # an explicit `substitute=skip` marker.
+            # client receives surrogate-laden output. Vault entry stays
+            # in place (TTL-evicted later) so streaming repeated
+            # invocations under the same call_id continue to see it.
+            # Log at the same level so operators see the call shape
+            # but with an explicit `substitute=skip` marker.
             restored = list(texts)
             log.info(
                 "deanonymize call_id=%s entities=%d texts=%d "

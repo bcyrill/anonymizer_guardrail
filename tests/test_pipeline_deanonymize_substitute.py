@@ -76,11 +76,10 @@ async def test_substitute_false_returns_texts_unchanged(
 ) -> None:
     """Core contract: deanonymize is a passthrough when the flag is
     off. The response keeps the surrogates the upstream LLM emitted.
-    Vault entry is still consumed (popped) — pin via a second
-    deanonymize on the same call_id which must return the input
-    unchanged (no entry to pull from)."""
-    from anonymizer_guardrail.vault import VaultEntry
-
+    Vault entry is *not* consumed by deanonymize (peek-based) — TTL
+    handles cleanup. Pin via a second deanonymize on the same
+    call_id which must still observe the entry and produce the same
+    surrogate-laden output."""
     p = _setup(monkeypatch, deanonymize_substitute=False, pipeline_cache=False)
 
     modified, mapping = await p.anonymize(
@@ -95,8 +94,11 @@ async def test_substitute_false_returns_texts_unchanged(
     assert "carol@example.org" not in restored[0]
     assert surrogate in restored[0]
 
-    # Vault entry consumed — second pop returns empty.
-    assert await p.vault.pop("skip-1") == VaultEntry()
+    # Vault entry persists across deanonymize — second call sees the
+    # same entry and produces the same surrogate-laden output, matching
+    # the streaming-repeated-invocation pattern.
+    restored2 = await p.deanonymize([response_with_surrogate], call_id="skip-1")
+    assert restored2 == [response_with_surrogate]
     await p.aclose()
 
 

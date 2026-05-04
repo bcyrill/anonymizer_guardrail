@@ -159,13 +159,32 @@ def test_round_trip_request_then_response(client: TestClient) -> None:
     ).json()
     assert post["action"] == "GUARDRAIL_INTERVENED"
     assert "bob@acmecorp.com" in post["texts"][0]
-    # Vault entry must have been popped — otherwise mappings linger past
-    # their useful lifetime. A second pop for the same call_id should
-    # return an empty entry regardless of backend (Protocol-level
-    # contract from `tests/test_vault.py::test_pop_after_pop_is_idempotent`).
+
+    # Vault entry persists across deanonymize — streaming responses
+    # call us repeatedly with the same call_id, all needing to see
+    # the same surrogate map. Confirm it survived AND that a second
+    # response-side call still restores correctly. Cleanup happens
+    # via the explicit pop below (utility path); production
+    # deployments rely on VAULT_TTL_S.
     import asyncio
     from anonymizer_guardrail.vault import VaultEntry
-    assert asyncio.run(main_mod._pipeline.vault.pop(call_id)) == VaultEntry()
+    entry_after = asyncio.run(main_mod._pipeline.vault.peek(call_id))
+    assert entry_after != VaultEntry(), (
+        "deanonymize is read-only; entry should still be in the vault "
+        "for the next streaming-chunk invocation"
+    )
+    second_post = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": [f"Sure, I'll contact {surrogate_text} shortly."],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+        },
+    ).json()
+    assert second_post["action"] == "GUARDRAIL_INTERVENED"
+    assert "bob@acmecorp.com" in second_post["texts"][0]
+    # Drain so the vault is clean for the next test.
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
 
 
 def test_response_with_unknown_call_id_returns_none(client: TestClient) -> None:

@@ -112,6 +112,83 @@ async def test_pop_missing_returns_empty(vault: VaultBackend) -> None:
     assert await vault.pop("never-stored") == VaultEntry()
 
 
+# ── Contract: peek (read-only) ─────────────────────────────────────────
+
+
+async def test_peek_returns_entry_without_removing(vault: VaultBackend) -> None:
+    """`peek` is the read-only sibling of `pop`. Pins the "peek does
+    not remove" contract — required for streaming deanonymize, where
+    LiteLLM invokes our post_call repeatedly under the same call_id
+    (every Nth chunk + final assembled response). Each invocation
+    must see the same surrogate map."""
+    entry = _entry(s=("v", "PERSON"))
+    await vault.put("call-peek", entry)
+    assert await vault.peek("call-peek") == entry
+    # Second peek returns the same entry — eviction is TTL-driven, not
+    # call-driven.
+    assert await vault.peek("call-peek") == entry
+    # Third peek too — `pop` is the only way to remove it explicitly.
+    assert await vault.peek("call-peek") == entry
+
+
+async def test_peek_then_pop_drains(vault: VaultBackend) -> None:
+    """After arbitrary peeks, an explicit `pop` still drains the
+    entry. Pins the utility-callers contract — tests cleaning up
+    between cases, manual force-eviction — for both backends."""
+    entry = _entry(s=("v", "PERSON"))
+    await vault.put("call-peek-pop", entry)
+    await vault.peek("call-peek-pop")
+    await vault.peek("call-peek-pop")
+    assert await vault.pop("call-peek-pop") == entry
+    # And after pop, peek sees nothing.
+    assert await vault.peek("call-peek-pop") == VaultEntry()
+
+
+async def test_peek_missing_returns_empty(vault: VaultBackend) -> None:
+    """A call_id that was never `put` peeks to empty — same shape as
+    pop's missing case. Important for the deanonymize-without-anonymize
+    edge case (e.g. response-side call landing on a replica that
+    didn't see the request side; or a call_id that bypassed the
+    vault entirely)."""
+    assert await vault.peek("never-stored") == VaultEntry()
+
+
+async def test_peek_does_not_revive_after_pop(vault: VaultBackend) -> None:
+    """A `pop` followed by `peek` for the same call_id sees nothing.
+    Sanity check: the eviction wrought by pop is observable through
+    peek too, not just through subsequent pops."""
+    entry = _entry(s=("v", "PERSON"))
+    await vault.put("call-pop-then-peek", entry)
+    assert await vault.pop("call-pop-then-peek") == entry
+    assert await vault.peek("call-pop-then-peek") == VaultEntry()
+
+
+async def test_peek_full_entry_roundtrip(vault: VaultBackend) -> None:
+    """Same shape-fidelity check as `test_full_entry_roundtrip` but
+    via peek. All structured additions (entity_type, source_detectors,
+    detector_mode + kwargs) survive a peek round-trip on every
+    backend — important because the deanonymize-side prewarm hook
+    reads these fields from the peeked entry."""
+    entry = VaultEntry(
+        surrogates={
+            "[PERSON_ABCD1234]": VaultSurrogate(
+                original="Alice Smith",
+                entity_type="PERSON",
+                source_detectors=("regex", "llm"),
+            ),
+        },
+        detector_mode=("regex", "llm"),
+        kwargs=(
+            ("llm", (("model", "anonymize"),)),
+            ("regex", (("overlap_strategy", None),)),
+        ),
+    )
+    await vault.put("call-peek-full", entry)
+    assert await vault.peek("call-peek-full") == entry
+    # Still there for the next streaming-chunk call.
+    assert await vault.peek("call-peek-full") == entry
+
+
 # ── Contract: defensive no-ops on degenerate input ──────────────────────
 
 

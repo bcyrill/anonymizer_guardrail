@@ -427,4 +427,70 @@ Wire-up summary:
 - **`source_detectors` adds vault size**, ~3-10x bytes per
   surrogate on a typical 5-detector deployment. Acceptable: the
   vault entries are short-lived (`VAULT_TTL_S` seconds, default
-  600) and the size is dominated by the per-text mapping anyway.
+  120) and the size is dominated by the per-text mapping anyway.
+
+## Prewarm fires on every deanonymize call (no chunk-tracking)
+
+When LiteLLM streams a chat completion, its `UnifiedLLMGuardrails`
+layer invokes our `apply_guardrail` HTTP endpoint multiple times
+under the same `litellm_call_id` — every Nth chunk it forwards the
+*full accumulated assistant text so far*, plus a final
+assembled-response call after the stream ends. With the peek-based
+deanonymize path (see [vault.md](vault.md) for why peek), each of
+those calls runs `_prewarm_caches` against whatever text it was
+given.
+
+That means a 37-chunk response can write 7–8 cache entries — one
+per accumulated-text key — instead of the one entry a non-streaming
+response writes. Two paths considered:
+
+**Adopted: fire prewarm on every call, let LRU + TTL handle the
+rest.** No bookkeeping, no protocol changes. Each prewarm output
+is *correct* for its text — `_prewarm_caches` per-text-filters by
+`m.text in text`, so a slot for the partial text "I do not have"
+stores `[]` (no PII original substring-present); a slot for
+"…identified as \"Christoph Blocher\"…" stores the matching
+`Match`. Both match what real detection on those exact texts would
+return; nothing poisons future hits. The cost is bounded LRU slots
+(≈ N detectors × M restored texts × ~7 intermediate chunks per
+streaming response — typically 7–28 entries per stream) which the
+LRU evicts naturally as fresh requests come in.
+
+**Rejected: track `last_prewarm_text` per call_id, supersede on
+each call.** The cleaner end state — only the final-call prewarm
+survives — but at substantial code cost: a new field on
+`VaultEntry`, a vault-update path (current `put` + `peek` aren't
+enough — we'd need a "rewrite the entry" operation that doesn't
+race with concurrent reads), and `evict(key)` plumbing on both the
+`PipelineResultCache` Protocol and `DetectorResultCache` Protocol
+plus their three implementations each (memory, redis, disabled
+stub). The correctness story (each prewarm is exact for its text)
+made the bookkeeping unjustified at the time of the decision; the
+trade-off is real cache-displacement cost when both
+`PIPELINE_CACHE_BACKEND` is enabled and traffic is streaming-heavy.
+
+If telemetry shows streaming-driven cache displacement hurting
+hit rate at production volumes with `PIPELINE_CACHE_BACKEND`
+enabled, the supersede design is the obvious upgrade path — and
+because the wire format and `VaultEntry` shape both already
+tolerate additive change, it can land without breaking
+backwards compatibility on either.
+
+### Trade-offs accepted
+
+- **Cache slot displacement scales with streaming sample
+  frequency.** A long streaming response writes one
+  pipeline-cache slot per sampled chunk × per restored text, plus
+  one per-detector cache slot per active cache-using detector
+  × text × chunk. With `PIPELINE_CACHE_BACKEND=memory` this
+  competes with same-cap fresh entries from concurrent
+  non-streaming requests; on busy gateways with the cache
+  enabled, raising `PIPELINE_CACHE_MAX_SIZE` (and the per-detector
+  caps) ahead of streaming traffic is operationally cheaper than
+  the supersede machinery would be. Same-cap reasoning applies
+  to Redis backends — `maxmemory` policy on Redis evicts LRU at
+  the server side.
+- **Streaming workloads benefit from a larger cache cap than
+  non-streaming workloads of the same request rate.** ~7×
+  multiplier per streaming response is the rule-of-thumb when
+  sizing.

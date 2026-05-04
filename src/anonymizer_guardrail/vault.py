@@ -154,12 +154,29 @@ class VaultBackend(Protocol):
     and `RedisVault` (in `vault_redis.py`, opt-in via
     `VAULT_BACKEND=redis`).
 
-    `put` and `pop` are async because Redis I/O is fundamentally
-    async; bouncing through a thread pool would defeat the
-    event-loop architecture for what's a hot-path operation
-    (called twice per request: pre_call + post_call). MemoryVault
-    implements them as thin async wrappers around its sync body
-    so the contract is uniform.
+    `put`, `peek`, and `pop` are async because Redis I/O is
+    fundamentally async; bouncing through a thread pool would
+    defeat the event-loop architecture for what's a hot-path
+    operation (called multiple times per request:
+    pre_call + post_call, plus repeated post_call invocations on
+    streaming responses). MemoryVault implements them as thin
+    async wrappers around its sync body so the contract is uniform.
+
+    `peek` is the read-only sibling of `pop` and is what
+    `pipeline.deanonymize` uses on the hot path. Streaming responses
+    cause LiteLLM's `UnifiedLLMGuardrails` to invoke our post_call
+    repeatedly with growing accumulated text under the same
+    `litellm_call_id` (every Nth chunk + a final assembled-response
+    call). Each invocation needs to see the same surrogate map, so
+    it has to be peek (read-only). The vault entry is then evicted
+    by `VAULT_TTL_S` rather than by a destructive read — the TTL was
+    already the cleanup mechanism for the failure cases (request
+    errored out, replica restart mid-roundtrip), so this just
+    extends that to the success case too.
+
+    `pop` stays on the surface for utility callers (tests draining
+    entries between cases, future "force eviction now" callers) but
+    is no longer on the production deanonymize path.
 
     `size` stays sync — it's a `/health` accessor, not on the
     request hot path; for MemoryVault it's a `len()` call, for
@@ -176,10 +193,21 @@ class VaultBackend(Protocol):
         empty call_id is a no-op."""
         ...
 
+    async def peek(self, call_id: str) -> VaultEntry:
+        """Retrieve the entry without removing it. Returns an empty
+        `VaultEntry()` if absent or expired. Used by
+        `pipeline.deanonymize` so streaming post_call invocations
+        (multiple calls per `litellm_call_id`) all see the same
+        surrogate map. Eviction happens via `VAULT_TTL_S`."""
+        ...
+
     async def pop(self, call_id: str) -> VaultEntry:
         """Retrieve and remove the entry. Returns an empty
         `VaultEntry()` if absent or expired. Idempotent — second
-        pop with the same call_id returns empty."""
+        pop with the same call_id returns empty.
+
+        Not on the production deanonymize hot path anymore — kept
+        for utility callers (test cleanup, manual eviction)."""
         ...
 
     def size(self) -> int:

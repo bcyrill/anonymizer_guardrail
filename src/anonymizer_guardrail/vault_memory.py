@@ -108,19 +108,51 @@ class MemoryVault:
                     self._max_entries, evicted,
                 )
 
+    async def peek(self, call_id: str) -> VaultEntry:
+        """Retrieve the entry without removing it. Returns an empty
+        `VaultEntry()` if absent/expired.
+
+        Used by `pipeline.deanonymize` on the hot path. Streaming
+        post_call invocations call this multiple times for the same
+        `call_id` with growing accumulated text; each call sees the
+        same surrogate map. Eviction is TTL-driven, not call-driven.
+
+        Expiry path emits the same ERROR log as `pop` for the same
+        reason: the post_call arrived after the entry expired, so
+        the deanonymisation silently failed and the response
+        shipped with surrogates still in it.
+        """
+        if not call_id:
+            return VaultEntry()
+        with self._lock:
+            entry = self._store.get(call_id)
+        if entry is None:
+            return VaultEntry()
+        ts, vault_entry = entry
+        if time.monotonic() - ts > self._ttl_s:
+            # Don't bother removing here; the next `_evict_expired_locked`
+            # call (on the next put) will sweep this entry away. Returning
+            # empty preserves the "expired = invisible" contract.
+            log.error(
+                "Vault entry for call_id=%s expired before post_call — "
+                "deanonymise dropped, surrogates still in response. "
+                "Raise VAULT_TTL_S if requests legitimately take this long.",
+                call_id,
+            )
+            return VaultEntry()
+        return vault_entry
+
     async def pop(self, call_id: str) -> VaultEntry:
         """Retrieve and remove the entry for a call. Returns an empty
         `VaultEntry()` if absent/expired.
 
-        Expiry is logged at ERROR (not WARNING) because it means the
-        post_call arrived AFTER the vault TTL fired, so the
-        deanonymisation that the operator presumably wanted has
-        silently failed: the response shipped with `[PERSON_…]`
-        surrogates still in it. That's data-loss-ish — the original
-        request's mapping is gone for good. WARNING reads as benign;
-        ERROR puts it on the same severity as other detector
-        unavailability so an operator monitoring `error` lines sees
-        it.
+        Not used by the production deanonymize path (which uses
+        `peek` so streaming repeated invocations all see the same
+        entry). Kept on the surface for utility callers — test
+        cleanup between cases, manual force-eviction.
+
+        Expiry path emits ERROR for the same reason as `peek`: see
+        that method's docstring for the rationale.
 
         Absent / no call_id returns silently — that's the no-op
         path (`input_type=request` without a matching `response`,

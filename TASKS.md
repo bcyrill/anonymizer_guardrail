@@ -61,56 +61,6 @@ instrumentation.
 
 ---
 
-## Streaming response support
-
-**What:** make `deanonymize` correct for token-by-token streaming responses
-from the upstream model, where surrogates may straddle chunk boundaries.
-
-**Why:** LiteLLM's pre/post-call hook contract today gives us the full
-response body, and our regex-based substitution assumes the surrogate
-appears whole somewhere in the text. With streaming (`stream: true` on
-chat completions), the upstream model emits one or many tokens per chunk;
-a surrogate like `Robert Jones` might arrive as `"Robert"` in chunk N and
-`" Jones"` in chunk N+1. Our current code, applied chunk-by-chunk, would
-miss the deanonymization (no whole match in either chunk); applied to the
-assembled response it works but defeats the streaming use case (client
-sees surrogate text until the stream ends and post-call fires).
-
-README calls this out as a limitation: "LiteLLM's guardrail calls are
-pre/post; streaming responses are deanonymized after assembly."
-
-**Why deferred:** non-streaming completions are still the default for many
-clients; the people who care about streaming are a known subset. The fix
-is non-trivial (state across chunks, edge cases with partial matches), and
-LiteLLM's guardrail-API contract for streaming may evolve.
-
-**Sketch:**
-
-1. Confirm what LiteLLM actually sends for streaming responses through the
-   guardrail hook — is each chunk a separate POST, or does LiteLLM
-   re-assemble? The fix shape depends entirely on this.
-2. If per-chunk: maintain a per-call_id streaming-state buffer. For each
-   chunk:
-   - Emit everything UP TO the last `len(longest_surrogate)` chars
-     immediately (those can't possibly be a partial-match prefix of any
-     surrogate longer than that).
-   - Hold the trailing tail and prepend it to the next chunk before
-     scanning. On stream-end, flush the tail.
-   - Apply the existing alternation regex to the buffered region.
-3. If LiteLLM re-assembles before calling us: nothing to do — the README
-   limitation is wrong, and we should fix the docs instead.
-4. Tests with simulated chunk boundaries falling INSIDE a surrogate, AT a
-   surrogate boundary, and across multiple surrogates.
-
-**Concrete trigger:** a streaming use case shows up.
-
-**Non-goals:**
-
-- Don't try to anonymize partial chunks on the request side — the
-  request body is delivered whole to the pre-call hook.
-
----
-
 ## Optional structured (JSON) logging
 
 **What:** add a `LOG_FORMAT=text|json` env var (default `text`). When

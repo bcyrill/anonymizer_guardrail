@@ -5,7 +5,7 @@ opt-in stores it manages internally:
 
 | Store | Where | When does it fire | Default |
 |---|---|---|---|
-| **Vault** | per-call mapping (surrogate → original + type + sources + kwargs) | Written on `request`; popped on the matching `response` | always on (memory backend; flip to redis for multi-replica) |
+| **Vault** | per-call mapping (surrogate → original + type + sources + kwargs) | Written on `request`; peeked (read-only) on every matching `response` (streaming sends multiple); evicted by `VAULT_TTL_S` | always on (memory backend; flip to redis for multi-replica) |
 | **Surrogate cache** | process-wide `original → surrogate` map | Hit on every entity the surrogate generator touches; backs cross-request consistency | always on (LRU cap of 100k) |
 | **Pipeline-level result cache** | deduped match list keyed by `(text, detector_mode, kwargs)` | Wraps detector dispatch; hit skips ALL detectors. Also dual-written by deanonymize-side prewarm | OFF (`PIPELINE_CACHE_BACKEND=none`) |
 | **Per-detector result cache** | one cache per cache-using detector keyed by `(text, that-detector's kwargs)` | Hit inside `det.detect(text)`; backup tier when the pipeline cache misses on partial-kwargs change | OFF (`<DETECTOR>_CACHE_MAX_SIZE=0`) |
@@ -480,9 +480,10 @@ thing to do:
 
 ### What it changes
 
-- `pipeline.deanonymize` calls `vault.pop` and runs `_prewarm_caches`
+- `pipeline.deanonymize` calls `vault.peek` and runs `_prewarm_caches`
   exactly as before, then returns `texts` unchanged (skipping the
-  substring substitution).
+  substring substitution). The vault entry is left in place; eviction
+  is driven by `VAULT_TTL_S`, same as the streaming path.
 - The cache prewarm seeds the pipeline cache + per-detector caches
   for the **surrogate-laden** response text. That's the right key
   shape: the client receives the surrogate-laden form, includes it

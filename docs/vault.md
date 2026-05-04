@@ -3,9 +3,13 @@
 The vault is what makes round-trip deanonymization work. When a
 `request` call comes in with a `litellm_call_id`, the
 surrogate→original mapping for that request is stored under that ID.
-When the matching `response` call arrives, the mapping is *popped*
-(read + deleted in one step) so the upstream model's reply can be
-restored verbatim.
+When the matching `response` call arrives, the mapping is *peeked*
+(read without removal) so the upstream model's reply can be restored
+verbatim. Eviction happens via [`VAULT_TTL_S`](#configuration) rather
+than on the read — required for streaming responses, where LiteLLM
+forwards multiple sampled `response` calls under the same
+`litellm_call_id` (every Nth chunk + a final assembled-response
+call), each needing to see the same mapping.
 
 ## Configuration
 
@@ -13,7 +17,7 @@ restored verbatim.
 |---|---|---|
 | `VAULT_BACKEND` | `memory` | `memory` (default) or `redis`. The memory backend is process-local — fine for single-replica deployments. The Redis backend shares state across replicas. See [Backends](#backends) below. |
 | `VAULT_REDIS_URL` | *(empty)* | Required when `VAULT_BACKEND=redis`. Format: `redis://[user:pass@]host:port/db`. Use a dedicated logical DB index per deployment so `DBSIZE` and key scans don't collide with other consumers. |
-| `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. Applies to both backends — MemoryVault checks lazily on read; RedisVault sets `EXPIRE` so Redis evicts server-side. |
+| `VAULT_TTL_S` | `120` | The vault's only eviction signal. `pipeline.deanonymize` is read-only (peek), so entries persist until TTL — both for entries whose `post_call` never came AND for entries whose `post_call` ran successfully. The default comfortably covers typical chat completions (including streaming sampled-chunk peeks, which all happen within the response lifetime). Raise for workloads where individual requests can legitimately exceed 2 minutes (long generation, approval queues, batch). Applies to both backends: MemoryVault checks lazily on read; RedisVault sets `EXPIRE` so Redis evicts server-side. |
 | `VAULT_MAX_ENTRIES` | `10000` | Memory backend only. Hard cap on vault entries; LRU-evicted on overflow as a backstop against a flood of unique `call_id`s before TTL clears them. Raise for sustained high in-flight traffic; floor of 1 protects against typos. The Redis backend has no equivalent — operators bound Redis memory via `maxmemory` policy on the Redis side. |
 
 ## Backends
@@ -79,9 +83,11 @@ Wire format on Redis:
     for the rationale on each field.
   * **TTL:** per-key `EXPIRE` set on `put`. Redis evicts expired
     entries server-side — no client-side scheduling.
-  * **Atomic pop:** `GETDEL` (Redis ≥ 6.2). Single round-trip
-    read-and-delete with no race; two concurrent `pop`s for the
-    same call_id can't both observe the entry.
+  * **Read paths:** `peek` is `GET` (read-only, preserves TTL —
+    used by `pipeline.deanonymize` so streaming repeated invocations
+    all observe the same entry). `pop` is `GETDEL` (Redis ≥ 6.2;
+    single round-trip read-and-delete, no race) and is reserved for
+    utility callers — test cleanup, manual force-eviction.
 
 Failure modes:
 
@@ -90,9 +96,11 @@ Failure modes:
     BLOCKED. The pre_call DOESN'T return anonymized text whose
     mapping we couldn't store — that would ship surrogates we
     can't restore.
-  * **Redis unreachable on `pop`:** raises `RedisVaultError` and
-    the response goes back with surrogates still in it. Logged at
-    ERROR (same severity as a TTL miss in the memory backend).
+  * **Redis unreachable on `peek` (production deanonymize path):**
+    raises `RedisVaultError` and the response goes back with
+    surrogates still in it. Logged at ERROR (same severity as a TTL
+    miss in the memory backend). Same shape applies to the rare
+    `pop` caller path (test cleanup, manual force-eviction).
 
 LiteLLM's `unreachable_fallback` setting does NOT apply to vault
 errors — those are internal-state errors, distinct from "guardrail
@@ -100,13 +108,21 @@ endpoint is unreachable."
 
 ## Lifecycle
 
-- **Written** on `input_type=request`, **popped** on
-  `input_type=response`. One-shot per `litellm_call_id`.
-- **Expiry:** entries older than `VAULT_TTL_S` (default 600s) are
-  evicted. MemoryVault checks lazily on read; RedisVault relies on
-  Redis-side TTL eviction. The TTL is a backstop for the case
-  where LiteLLM crashes or aborts before issuing the matching
-  `response` call (without it the store would grow without bound).
+- **Written** on `input_type=request`, **peeked** (read-only) on
+  `input_type=response`. Entries are NOT evicted on the response
+  call — required for streaming responses, where LiteLLM's
+  `UnifiedLLMGuardrails` invokes our post_call repeatedly under the
+  same `litellm_call_id` (every Nth chunk + a final assembled-
+  response call), each needing the same mapping.
+- **Expiry:** entries older than `VAULT_TTL_S` (default 120s) are
+  evicted. MemoryVault checks lazily on read (next `peek` for an
+  expired call_id returns empty); RedisVault relies on Redis-side
+  TTL eviction. With the peek-based deanonymize path, TTL is the
+  *primary* eviction signal — both for the request-errored-out
+  failure case (no response ever arrives) and for the success case
+  (response arrived but the entry stays around until TTL). Set
+  `VAULT_TTL_S` aggressively if your workload would benefit from
+  faster cleanup.
 - **Size cap (memory backend):** `VAULT_MAX_ENTRIES` (default
   10000) bounds the store with LRU eviction as a second backstop.
   A burst of unique `call_id`s without matching `response` calls
@@ -121,11 +137,14 @@ endpoint is unreachable."
 
 ## Observability
 
-`/health` exposes `vault_size`: the number of *open* round-trips —
-requests that came in but whose responses haven't arrived yet. A
-steady-state value near zero is healthy. A monotonically growing
-value points at LiteLLM losing the response side, which the TTL
-eventually catches up with.
+`/health` exposes `vault_size`: the count of vault entries currently
+in the store. It's a **capacity gauge** — compare against
+`VAULT_MAX_ENTRIES` and raise the cap if the value sits close to the
+limit. Steady-state is bounded by
+`(request rate) × VAULT_TTL_S` (entries persist until TTL evicts
+them, regardless of whether the matching response was seen), so a
+healthy deployment lands somewhere proportional to traffic; the
+exact value is a sizing input, not a per-request alert signal.
 
 **Backend-specific behaviour:**
 

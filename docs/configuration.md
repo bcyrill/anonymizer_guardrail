@@ -41,14 +41,14 @@ docs:
 |---|---|---|
 | `VAULT_BACKEND` | `memory` | `memory` (default) or `redis`. Memory is process-local; Redis shares state across replicas. See [vault → Backends](vault.md#backends). |
 | `VAULT_REDIS_URL` | *(empty)* | Required when `VAULT_BACKEND=redis`. Format: `redis://[user:pass@]host:port/db`. Setting `redis` without this fails at boot. Install `pip install "anonymizer-guardrail[vault-redis]"` to get the redis dep. |
-| `VAULT_TTL_S` | `600` | Drops mappings whose `post_call` never came. Applies to both backends. See [vault](vault.md). |
+| `VAULT_TTL_S` | `120` | Per-entry TTL — the vault's only eviction signal under the peek-based deanonymize path. Applies to both backends. See [vault](vault.md). Raise for workloads where individual requests can legitimately exceed 2 minutes (long generation, approval queues, batch). |
 | `VAULT_MAX_ENTRIES` | `10000` | Memory backend only. Hard cap; LRU-evicted on overflow. Redis bounds via its own `maxmemory` policy. Floor of 1 protects against typos. |
 
 ## Deanonymize behaviour
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DEANONYMIZE_SUBSTITUTE` | `true` | When `false`, `pipeline.deanonymize` SKIPS the surrogate→original substring substitution but otherwise runs the full deanonymize path: vault.pop still happens (drives the prewarm hook), and the pipeline + per-detector caches still get warmed for the surrogate-laden response text. Texts return to the calling client unchanged — surrogates persist in responses. Use for redaction-only deployments (PII-stripped logs, training-data sanitization, downstream tools that just want entities masked) where restoring originals would defeat the purpose. The cache prewarm continues to fire because the surrogate-laden response text IS what subsequent anonymize calls will see in this mode (the client receives surrogates and includes them in the next turn's history). See [operations → Surrogates persist in responses](operations.md#surrogates-persist-in-responses-deanonymize_substitutefalse) for the deployment-shape implications. |
+| `DEANONYMIZE_SUBSTITUTE` | `true` | When `false`, `pipeline.deanonymize` SKIPS the surrogate→original substring substitution but otherwise runs the full deanonymize path: vault.peek still happens (drives the prewarm hook), and the pipeline + per-detector caches still get warmed for the surrogate-laden response text. Texts return to the calling client unchanged — surrogates persist in responses. Use for redaction-only deployments (PII-stripped logs, training-data sanitization, downstream tools that just want entities masked) where restoring originals would defeat the purpose. The cache prewarm continues to fire because the surrogate-laden response text IS what subsequent anonymize calls will see in this mode (the client receives surrogates and includes them in the next turn's history). See [operations → Surrogates persist in responses](operations.md#surrogates-persist-in-responses-deanonymize_substitutefalse) for the deployment-shape implications. |
 
 ## Detector cache (cross-cutting)
 

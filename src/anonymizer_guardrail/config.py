@@ -147,8 +147,8 @@ class Config(BaseSettings):
     # ── Deanonymize behaviour ─────────────────────────────────────────────────
     # When false, `pipeline.deanonymize` SKIPS the surrogate→original
     # substring substitution but otherwise runs the full deanonymize
-    # path: vault.pop still happens (drives the prewarm hook), and the
-    # pipeline + per-detector caches still get warmed for the
+    # path: vault.peek still happens (drives the prewarm hook), and
+    # the pipeline + per-detector caches still get warmed for the
     # surrogate-laden response text. The texts are returned unchanged.
     #
     # End-user effect: responses go back to the calling client
@@ -181,11 +181,16 @@ class Config(BaseSettings):
     # consumers of the same Redis instance.
     vault_redis_url: str = ""
     # Per-entry TTL. Applies to BOTH backends — MemoryVault checks it
-    # in `pop`; RedisVault sets it via `EXPIRE` so Redis evicts
-    # expired entries server-side. Drops mappings whose post_call
-    # never came (client errored out, timed out, etc.) so memory /
-    # Redis doesn't grow unbounded.
-    vault_ttl_s: int = 600
+    # in `peek` / `pop`; RedisVault sets it via `EXPIRE` so Redis
+    # evicts expired entries server-side. The vault's only eviction
+    # signal: with peek-based deanonymize, a successful round-trip's
+    # entry persists until TTL too (not just the request-errored-out
+    # case). Default 120s comfortably covers typical chat completions
+    # including the streaming sampled-chunk pattern (all peek calls
+    # happen within the response lifetime); operators with longer-
+    # running requests will see the ERROR-logged "Raise VAULT_TTL_S
+    # if requests legitimately take this long" line and bump it.
+    vault_ttl_s: int = 120
     # Hard cap on vault entries. Memory backend only — TTL-only
     # eviction fires lazily on put(), so a burst of unique call_ids
     # without matching post_calls (client crashes, timeouts, malicious

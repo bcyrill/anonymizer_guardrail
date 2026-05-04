@@ -188,10 +188,43 @@ class RedisVault:
                 f"Failed to store vault entry for call_id={call_id!r}: {exc}"
             ) from exc
 
+    async def peek(self, call_id: str) -> VaultEntry:
+        """Read-only GET. Returns an empty `VaultEntry()` if absent or
+        TTL-expired (Redis returns nil for both cases).
+
+        Used by `pipeline.deanonymize` on the hot path. Streaming
+        post_call invocations call this multiple times for the same
+        `call_id` with growing accumulated text; each call sees the
+        same surrogate map. Eviction is TTL-driven (Redis-side
+        EXPIRE), not call-driven.
+
+        TTL is preserved across `peek` — we don't touch it. If
+        operators need a "refresh on access" behaviour they can
+        wrap with `EXPIRE` explicitly; today the design intentionally
+        bounds vault entry lifetime by the original `put` time.
+        """
+        if not call_id:
+            return VaultEntry()
+        try:
+            payload = await self._client.get(self._key(call_id))
+        except Exception as exc:
+            raise RedisVaultError(
+                f"Failed to retrieve vault entry for call_id={call_id!r}: {exc}"
+            ) from exc
+
+        if payload is None:
+            return VaultEntry()
+        return self._decode_payload_or_empty(call_id, payload)
+
     async def pop(self, call_id: str) -> VaultEntry:
         """Atomic GETDEL. Returns an empty `VaultEntry()` if absent or
         already-popped / TTL-expired (Redis returns nil and the key
         is gone server-side).
+
+        Not used by the production deanonymize path (which uses
+        `peek` so streaming repeated invocations all see the same
+        entry). Kept on the surface for utility callers — test
+        cleanup between cases, manual force-eviction.
 
         GETDEL is a single round-trip and atomic; using GET + DEL would
         race with concurrent pops from another replica, where two
@@ -209,9 +242,20 @@ class RedisVault:
 
         if payload is None:
             return VaultEntry()
+        return self._decode_payload_or_empty(call_id, payload)
+
+    def _decode_payload_or_empty(
+        self, call_id: str, payload: str,
+    ) -> VaultEntry:
+        """Shared decode path for `peek` / `pop`. Either successfully
+        decodes the JSON payload into a `VaultEntry` or logs ERROR
+        and returns empty for the corrupted-data case. Keeping the
+        error-path identical across both methods means an operator
+        seeing the ERROR line gets the same severity regardless of
+        which call surfaced it."""
         try:
             data = json.loads(payload)
-        except json.JSONDecodeError as exc:
+        except json.JSONDecodeError:
             # Corrupted entry — log ERROR, return empty so the
             # post_call doesn't crash but the operator sees the
             # data-loss-ish severity. Same logging contract as

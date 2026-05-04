@@ -31,17 +31,6 @@ survives provided Redis stayed up. Install with
 `VAULT_REDIS_URL`; see [vault → Backends](vault.md#backends) for
 the wire format and failure modes.
 
-## No streaming responses
-
-LiteLLM's guardrail calls are pre/post; streaming responses are
-deanonymized after assembly, not chunk-by-chunk. If you need to
-anonymize partial chunks as they arrive, this isn't the right tool —
-the round-trip mapping shape doesn't fit a streaming protocol.
-Streaming-aware deanonymization is tracked in
-[`TASKS.md` → Streaming response support](../TASKS.md#streaming-response-support);
-gated on a streaming use case actually showing up, since LiteLLM's
-streaming-guardrail contract may still evolve.
-
 ## Hard cap on POST body size
 
 Request bodies above
