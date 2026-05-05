@@ -187,6 +187,146 @@ def test_round_trip_request_then_response(client: TestClient) -> None:
     asyncio.run(main_mod._pipeline.vault.pop(call_id))
 
 
+# ── Streaming action protocol (LiteLLM B3 / iterator_hook_mode=action) ───────
+
+
+def test_streaming_response_partial_surrogate_returns_wait(
+    client: TestClient,
+) -> None:
+    """When the streamed response trails off mid-surrogate (e.g. `[EMAI`),
+    the next upstream chunk is likely the rest of the token. Substituting
+    now would emit a partial surrogate to the client and then prevent the
+    post-substitution text from prefixing what was already emitted (the
+    LiteLLM action protocol's cursor-monotonic invariant). Return WAIT so
+    LiteLLM holds the trailing bytes until the next chunk lands."""
+    call_id = "streaming-wait-test"
+    # Pre-call to seed the vault — though we never get to substitute here
+    # because the suffix is a partial surrogate.
+    client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    )
+
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Sure, I'll contact [EMAIL_ADDR"],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": False,
+        },
+    ).json()
+    assert r["action"] == "WAIT", r
+    assert r.get("texts") is None  # WAIT must not include modified texts
+
+    # Cleanup
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
+def test_streaming_response_complete_surrogate_returns_intervened(
+    client: TestClient,
+) -> None:
+    """A streamed chunk that ends after a closed surrogate `]` is safe
+    to substitute. action=GUARDRAIL_INTERVENED with the deanonymized text."""
+    call_id = "streaming-complete-test"
+    pre = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    ).json()
+    surrogate = pre["texts"][0].split("Reach me at ")[1]
+
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": [f"Sure, I'll contact {surrogate} shortly."],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": False,
+        },
+    ).json()
+    assert r["action"] == "GUARDRAIL_INTERVENED", r
+    assert "alice@example.com" in r["texts"][0]
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
+def test_streaming_response_partial_surrogate_at_eos_does_not_wait(
+    client: TestClient,
+) -> None:
+    """At end-of-stream (is_final=True) WAIT is forbidden by the action
+    protocol. A trailing partial surrogate at EOS is a stray `[ABC`-shaped
+    fragment from the model and is left as-is by deanonymize."""
+    call_id = "streaming-eos-test"
+    client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    )
+
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Sure thing — talk soon. [INCOMPLETE"],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": True,
+        },
+    ).json()
+    # The trailing fragment isn't in the vault and won't deanonymize, so
+    # the text comes back unchanged → action is NONE. Either NONE or
+    # GUARDRAIL_INTERVENED is acceptable; WAIT must not appear.
+    assert r["action"] in ("NONE", "GUARDRAIL_INTERVENED"), r
+    assert r["action"] != "WAIT"
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
+def test_streaming_response_no_is_final_field_skips_wait(
+    client: TestClient,
+) -> None:
+    """Non-streaming requests don't include is_final. The WAIT path only
+    triggers on is_final=False; without it we substitute as today."""
+    call_id = "no-isfinal-test"
+    pre = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    ).json()
+    surrogate = pre["texts"][0].split("Reach me at ")[1]
+
+    # Mid-surrogate trailer but no is_final field — this is the legacy
+    # non-streaming shape, where we substitute whatever's present.
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": [f"Reply mentions {surrogate} and trails [EMAI"],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+        },
+    ).json()
+    assert r["action"] != "WAIT"
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
 def test_response_with_unknown_call_id_returns_none(client: TestClient) -> None:
     """A post-call without a matching pre-call (e.g. the request was
     served by a different replica, or pre-call never happened) → action

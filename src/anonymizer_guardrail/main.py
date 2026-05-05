@@ -9,6 +9,7 @@ Single endpoint: POST /beta/litellm_basic_guardrail_api
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Mapping
 
@@ -30,6 +31,27 @@ log = logging.getLogger("anonymizer")
 # Single Pipeline instance — its surrogate cache and vault are intentionally
 # process-wide so we get cross-call surrogate consistency for free.
 _pipeline = Pipeline()
+
+# Trailing partial-surrogate detector for the streaming action protocol.
+#
+# Surrogate tokens have shape `[PREFIX_DIGEST]` (see surrogate.py:134) where
+# PREFIX is the uppercase entity type and DIGEST is hex chars or a hex-like
+# id. Tokens always close with `]`. If the accumulated text ends with an
+# unclosed bracket and surrogate-charset content, the next upstream chunk
+# is likely the rest of the surrogate — emitting now would leak a partial
+# token to the client and prevent the post-substitution text from prefixing
+# what was already emitted (cursor-monotonic violation).
+#
+# The pattern is intentionally conservative: a literal `[` followed by zero
+# or more `[A-Z0-9_]` chars at end of string. This false-positives on
+# all-caps markdown like `[NOTE` until the next chunk arrives — acceptable,
+# we WAIT for one extra chunk and then either substitute (real surrogate)
+# or pass through (false alarm resolves once `]` or non-charset arrives).
+_PARTIAL_SURROGATE_SUFFIX = re.compile(r"\[[A-Z0-9_]*$")
+
+
+def _has_partial_surrogate_suffix(text: str) -> bool:
+    return bool(_PARTIAL_SURROGATE_SUFFIX.search(text))
 
 
 @asynccontextmanager
@@ -291,6 +313,17 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=modified)
         else:
             # input_type == "response"
+            # Streaming action protocol: if the accumulated text trails off
+            # mid-surrogate, defer substitution until the next chunk arrives.
+            # See _PARTIAL_SURROGATE_SUFFIX. The protocol forbids WAIT at
+            # is_final=True — at end-of-stream we substitute whatever we have
+            # (a stray unclosed `[ABC` is left as-is by deanonymize anyway).
+            if (
+                req.is_final is False
+                and any(_has_partial_surrogate_suffix(t) for t in req.texts)
+            ):
+                return GuardrailResponse(action="WAIT")
+
             restored = await _pipeline.deanonymize(req.texts, req.litellm_call_id)
             if restored == req.texts:
                 return GuardrailResponse(action="NONE")

@@ -43,12 +43,18 @@ class GuardrailRequest(BaseModel):
     litellm_call_id: str | None = None
     litellm_trace_id: str | None = None
     additional_provider_specific_params: dict[str, Any] = Field(default_factory=dict)
+    # Streaming action protocol (LiteLLM PR feat/streaming-guardrail-action-protocol):
+    # True iff this is the final guardrail call for the stream. WAIT must not
+    # be returned when is_final=True. None for non-streaming requests.
+    is_final: bool | None = None
 
 
 class GuardrailResponse(BaseModel):
     """Response body returned to LiteLLM."""
 
-    action: Literal["BLOCKED", "NONE", "GUARDRAIL_INTERVENED"]
+    # WAIT is only valid in the streaming action protocol and only when
+    # is_final=False on the corresponding request.
+    action: Literal["BLOCKED", "NONE", "GUARDRAIL_INTERVENED", "WAIT"]
     blocked_reason: str | None = None
     texts: list[str] | None = None
     images: list[str] | None = None
