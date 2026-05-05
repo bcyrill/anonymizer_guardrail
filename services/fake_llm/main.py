@@ -28,10 +28,11 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import yaml
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -89,6 +90,27 @@ class Rule:
         self.raw_content: str | None = raw.get("raw_content")
         self.status_code = int(raw.get("status_code", 200))
         self.delay_s = float(raw.get("delay_s", 0))
+        # When true, the rule responds with the user's last message verbatim.
+        # Useful for round-trip guardrail tests where we want to see how the
+        # streamed-back surrogate is restored on the deanonymize side without
+        # baking a fixed surrogate value into the rules file.
+        self.echo = bool(raw.get("echo", False))
+        # When set on a streaming response, override the default
+        # whitespace-boundary token splitting and emit fixed-size
+        # character chunks instead. Lets tests deliberately split a
+        # surrogate token across multiple upstream chunks so a
+        # chunk-aware downstream consumer (e.g. UnifiedLLMGuardrails
+        # transform-mode) gets exercised on the straddling case.
+        # Ignored for non-streaming responses.
+        chunk_chars_raw = raw.get("chunk_chars")
+        self.chunk_chars: int | None = (
+            int(chunk_chars_raw) if chunk_chars_raw is not None else None
+        )
+        if self.chunk_chars is not None and self.chunk_chars < 1:
+            raise ValueError(
+                f"rule {self.description!r}: chunk_chars must be >= 1 (got "
+                f"{self.chunk_chars})"
+            )
 
     def matches(self, text: str, model: str, system_prompt: str) -> bool:
         # Model matcher (when set) must succeed.
@@ -165,6 +187,89 @@ def _completion_envelope(content: str, model: str) -> dict[str, Any]:
     }
 
 
+def _split_for_streaming(content: str, chunk_chars: int | None = None) -> list[str]:
+    """Split a content string into chunks for SSE streaming.
+
+    Default mode: whitespace boundaries, with whitespace attached to
+    the preceding token so concatenation of all deltas reconstructs
+    the original content byte-for-byte. Long unbroken runs (e.g.
+    `[EMAIL_ADDRESS_AABBCCDD]`) stay as single chunks under this
+    mode — fine for the common token-aligned LLM streaming shape.
+
+    Fixed-size mode (`chunk_chars=N`): split into N-character chunks
+    regardless of word boundaries. Useful for tests that deliberately
+    split a surrogate token across chunk boundaries to exercise
+    chunk-straddling logic in downstream consumers.
+
+    Empty input → []; the caller treats that as "nothing to stream"
+    and emits only a terminal envelope.
+    """
+    if not content:
+        return []
+    if chunk_chars is not None and chunk_chars > 0:
+        return [content[i : i + chunk_chars] for i in range(0, len(content), chunk_chars)]
+    # Whitespace-boundary default. Match either a run of non-whitespace
+    # optionally followed by whitespace, OR a run of whitespace (covers
+    # leading whitespace in the response).
+    return re.findall(r"\S+\s*|\s+", content)
+
+
+async def _stream_completion(
+    content: str,
+    model: str,
+    chunk_delay_s: float = 0.0,
+    chunk_chars: int | None = None,
+) -> AsyncGenerator[bytes, None]:
+    """Yield OpenAI-style SSE chunks for the given content.
+
+    Emits one `data:` event per token-ish substring from
+    `_split_for_streaming` (so a multi-word response shows up as
+    multiple chunks the way a real model would stream), then a
+    finish-reason chunk, then `data: [DONE]`. Output bytes are UTF-8
+    encoded for `StreamingResponse`.
+
+    `chunk_chars` (>0) overrides the default whitespace-boundary split
+    with fixed-size character chunks. Useful for tests that need a
+    surrogate token to span chunk boundaries.
+
+    `chunk_delay_s` (>0) sleeps between chunks. Useful when a test
+    wants to exercise the proxy's sampling cadence with realistic
+    inter-chunk gaps; default 0 ships everything as fast as the
+    asyncio loop schedules.
+    """
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    def envelope(delta: dict[str, Any], finish_reason: str | None) -> str:
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    # Initial role chunk (matches OpenAI shape — first delta carries role,
+    # subsequent deltas carry content only).
+    yield envelope({"role": "assistant", "content": ""}, None).encode("utf-8")
+
+    for piece in _split_for_streaming(content, chunk_chars=chunk_chars):
+        if chunk_delay_s > 0:
+            await asyncio.sleep(chunk_delay_s)
+        yield envelope({"content": piece}, None).encode("utf-8")
+
+    # Terminal chunk + sentinel — same shape OpenAI emits.
+    yield envelope({}, "stop").encode("utf-8")
+    yield b"data: [DONE]\n\n"
+
+
 def _last_user_content(messages: list[dict[str, Any]]) -> str:
     """Pull the last user-role message; the guardrail sends one user
     message per detection call. We take the *last* so multi-turn
@@ -191,12 +296,18 @@ async def chat_completions(req: Request) -> Response:
     msgs = body.get("messages", [])
     user_msg = _last_user_content(msgs)
     system_msg = _first_system_content(msgs)
+    stream = bool(body.get("stream", False))
 
     rule = next((r for r in _RULES if r.matches(user_msg, model, system_msg)), None)
 
     if rule is None:
-        log.info("no-rule-match user=%r", user_msg[:120])
+        log.info("no-rule-match user=%r stream=%s", user_msg[:120], stream)
         content = json.dumps({"entities": _DEFAULT.get("entities", [])})
+        if stream:
+            return StreamingResponse(
+                _stream_completion(content, model),
+                media_type="text/event-stream",
+            )
         return Response(
             content=json.dumps(_completion_envelope(content, model)),
             status_code=200,
@@ -204,9 +315,10 @@ async def chat_completions(req: Request) -> Response:
         )
 
     log.info(
-        "matched rule=%r user=%r",
+        "matched rule=%r user=%r stream=%s",
         rule.description or "(unnamed)",
         user_msg[:120],
+        stream,
     )
 
     if rule.delay_s > 0:
@@ -219,11 +331,22 @@ async def chat_completions(req: Request) -> Response:
             media_type="application/json",
         )
 
-    if rule.raw_content is not None:
+    # Resolve response content: `echo` wins over `raw_content` wins over
+    # `entities` (default). `echo` returns the user's last message
+    # verbatim — useful for round-trip guardrail tests where the
+    # surrogate value isn't known ahead of time.
+    if rule.echo:
+        content = user_msg
+    elif rule.raw_content is not None:
         content = rule.raw_content
     else:
         content = json.dumps({"entities": rule.entities})
 
+    if stream:
+        return StreamingResponse(
+            _stream_completion(content, model, chunk_chars=rule.chunk_chars),
+            media_type="text/event-stream",
+        )
     return Response(
         content=json.dumps(_completion_envelope(content, model)),
         status_code=200,
