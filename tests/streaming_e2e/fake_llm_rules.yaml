@@ -1,0 +1,32 @@
+# Fake-LLM rules for the streaming-transform end-to-end test.
+#
+# A single echo rule. Anything the user sends comes back as the
+# assistant's reply, streamed token-by-token. That makes the test
+# self-contained: the guardrail anonymizes the user message into
+# `Tell me about [EMAIL_ADDRESS_xxx]`, fake-llm streams that exact
+# string back, and the post-call guardrail's deanonymize sees the
+# surrogate it just generated. No fixed surrogate value needs to be
+# baked into this rules file — the surrogate is determined at
+# request time.
+
+rules:
+  # Word-boundary echo. Selected when the user message does NOT
+  # contain "split:" — i.e. the default streaming path. Whitespace-
+  # boundary chunks: each word becomes one upstream chunk, so the
+  # surrogate stays intact within a single chunk.
+  - description: "Streaming echo (word-boundary chunks)"
+    match_regex: '^((?!split:).)*$'
+    echo: true
+
+  # Character-boundary echo. Triggered by prefixing the user message
+  # with "split:". Splits the response into 7-char chunks regardless
+  # of word boundaries — guaranteed to fragment a surrogate token
+  # like `[EMAIL_ADDRESS_AABBCCDD]` (24 chars) across multiple chunks.
+  # Used by the chunk-straddling arm of the streaming-transform test.
+  - description: "Streaming echo (7-char chunks — surrogate straddling)"
+    match: "split:"
+    echo: true
+    chunk_chars: 7
+
+default:
+  entities: []

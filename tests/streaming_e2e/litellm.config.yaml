@@ -1,0 +1,48 @@
+# LiteLLM proxy config — streaming action protocol (B3).
+#
+# Wires three containers on the test podman network:
+#   * fake-llm   — upstream OpenAI-compatible chat backend (echoes user input)
+#   * anonguard  — anonymizer guardrail HTTP service (regex detector only)
+#   * litellm    — proxy under test, built from feat/streaming-guardrail-action-protocol
+#
+# The post_call guardrail auto-enrolls into the streaming action
+# protocol because the anonymizer's GenericGuardrailAPI subclass
+# implements apply_guardrail_action. No explicit config flag — the
+# unified iterator hook detects the method and drives a wait/pass/
+# block/modify state machine over the stream. The anonymizer returns:
+#
+#   * GUARDRAIL_INTERVENED — when the accumulated text deanonymizes cleanly
+#   * WAIT                 — when the trailing edge looks like an open
+#                            surrogate token (e.g. `... [EMAIL_ADD`); next
+#                            chunk likely completes it
+#   * NONE / BLOCKED       — as appropriate
+#
+# WAIT is forbidden at is_final=True; the anonymizer enforces this on
+# its end and LiteLLM raises GuardrailRaisedException if violated.
+
+model_list:
+  - model_name: test_filter
+    litellm_params:
+      model: openai/fake-model
+      api_base: http://fake-llm:4000/v1
+      api_key: not-needed-but-required-by-sdk
+
+guardrails:
+  - guardrail_name: anonguard_pre
+    litellm_params:
+      guardrail: generic_guardrail_api
+      mode: pre_call
+      api_base: http://anonguard:8000/beta/litellm_basic_guardrail_api
+      unreachable_fallback: fail_closed
+      default_on: true
+
+  - guardrail_name: anonguard_post
+    litellm_params:
+      guardrail: generic_guardrail_api
+      mode: post_call
+      api_base: http://anonguard:8000/beta/litellm_basic_guardrail_api
+      unreachable_fallback: fail_closed
+      default_on: true
+
+general_settings:
+  master_key: sk-streaming-test
