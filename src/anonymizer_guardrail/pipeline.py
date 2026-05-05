@@ -1045,7 +1045,7 @@ class Pipeline:
                 for surrogate, vs in entry.surrogates.items()
             }
             replace = _build_replacer(flat_mapping)
-            restored = [replace(t) for t in texts]
+            outbound_text = [replace(t) for t in texts]
             log.info(
                 "deanonymize call_id=%s entities=%d texts=%d",
                 call_id, len(flat_mapping), len(texts),
@@ -1057,7 +1057,7 @@ class Pipeline:
             # invocations under the same call_id continue to see it.
             # Log at the same level so operators see the call shape
             # but with an explicit `substitute=skip` marker.
-            restored = list(texts)
+            outbound_text = list(texts)
             log.info(
                 "deanonymize call_id=%s entities=%d texts=%d "
                 "substitute=skip",
@@ -1067,7 +1067,7 @@ class Pipeline:
         # Dual-write prewarm: if the pipeline cache is enabled OR any
         # active cache-using detector has caching live, seed both
         # layers from the typed vault entry. The pipeline cache write
-        # uses `(restored_text, detector_mode, kwargs)` reconstructed
+        # uses `(outbound_text, detector_mode, kwargs)` reconstructed
         # from the entry; per-detector cache writes filter the
         # synthesised match list by `source_detectors` per surrogate
         # so each detector's cache slot only holds what THAT detector
@@ -1075,19 +1075,32 @@ class Pipeline:
         # docs/design-decisions.md). Best-effort: prewarm failures are
         # logged and swallowed.
         #
-        # The prewarm seeds based on `restored`. When substitute is
-        # on, that's the original-laden form (matches what the
-        # client's next turn will send through anonymize). When
-        # substitute is off, that's the surrogate-laden form (matches
-        # what the client's next turn will send because the client
-        # received surrogates). Either way, the cache key matches the
-        # text future requests will look up.
-        await self._prewarm_caches(restored, entry)
+        # The prewarm seeds the cache for whatever text we're sending
+        # back to the client (`outbound_text`):
+        #   * `substitute=on` — original-laden form. Per-text filter
+        #     (`m.text in text` where `m.text` is the original) finds
+        #     the match in the text → real synthesised matches land
+        #     in the slot. Client's next turn sends the originals
+        #     back through anonymize → cache hit, fast re-anonymize.
+        #   * `substitute=off` — surrogate-laden form. The same
+        #     per-text filter finds nothing (originals aren't present
+        #     in surrogate-laden text), so the slot is written with
+        #     an empty match list. That's load-bearing: when the
+        #     client's next turn sends `[PERSON_xyz]` back through
+        #     anonymize (which is what the client received), the
+        #     cache hit returns "no PII detected" — suppressing
+        #     re-detection of the surrogate that would otherwise
+        #     chain a fresh inner surrogate over it. See
+        #     docs/operations.md → DEANONYMIZE_SUBSTITUTE=false for
+        #     the deployment-shape implications.
+        # Either way, the cache key matches the text future requests
+        # will look up.
+        await self._prewarm_caches(outbound_text, entry)
 
-        return restored
+        return outbound_text
 
     async def _prewarm_caches(
-        self, restored: list[str], entry: VaultEntry,
+        self, outbound_text: list[str], entry: VaultEntry,
     ) -> None:
         """Dual-write prewarm hook called from `deanonymize`. Writes
         synthesised matches to:
@@ -1097,7 +1110,7 @@ class Pipeline:
              gets the subset of vault surrogates whose original
              actually appears in that text — matches what real
              detection on that text alone would produce. Future
-             identical-overrides requests for the same restored text
+             identical-overrides requests for the same outbound text
              hit in one shot.
           2. Each active cache-using detector's per-detector cache,
              filtered TWICE: by `source_detectors` per surrogate (only
@@ -1169,8 +1182,8 @@ class Pipeline:
             active_detectors.append((det.name, cache, cache_key_for, kwargs))
 
         tasks: list[asyncio.Task] = []
-        for text in restored:
-            # Empty / whitespace-only restored text doesn't need a
+        for text in outbound_text:
+            # Empty / whitespace-only outbound text doesn't need a
             # cache slot — `_detect_via_cache` short-circuits empty
             # text at detect time, so any slot keyed on empty input
             # would never be looked up. Skip cleanly.

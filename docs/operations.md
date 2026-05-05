@@ -484,12 +484,20 @@ thing to do:
   exactly as before, then returns `texts` unchanged (skipping the
   substring substitution). The vault entry is left in place; eviction
   is driven by `VAULT_TTL_S`, same as the streaming path.
-- The cache prewarm seeds the pipeline cache + per-detector caches
-  for the **surrogate-laden** response text. That's the right key
-  shape: the client receives the surrogate-laden form, includes it
-  in the next turn's chat history, and the future anonymize call
-  on that same text gets a cache hit (with empty matches — no
-  re-anonymization of already-anonymized text).
+- **Cache prewarm writes empty match lists** for the surrogate-laden
+  response text. This is load-bearing — not just incidental. The
+  per-text filter in `_prewarm_caches` (`m.text in text` where
+  `m.text` is the original) returns false for surrogate-laden text
+  (the original isn't substring-present in `[PERSON_xyz]`), so
+  `text_synth` is empty and the cache slot for that text is written
+  with `[]`. On the client's next turn, when the chat history
+  carries the surrogate-laden assistant reply through anonymize,
+  the cache hit returns "no PII detected" — which **suppresses
+  re-detection of the surrogate token itself**. Without that
+  suppression an LLM detector could plausibly flag `[PERSON_xyz]`
+  as suspicious-looking and chain a fresh inner surrogate over it,
+  ballooning the vault with surrogate→surrogate mappings across
+  turns. The empty cache slot closes that loop.
 - Log lines on deanonymize calls carry a `substitute=skip` marker
   so log shippers can grep for substitute-off requests.
 

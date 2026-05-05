@@ -56,6 +56,58 @@ streaming call sees the same surrogate map and produces the right
 deanonymized output. That output just doesn't make it to the
 client because LiteLLM yields the original chunk.
 
+### Secondary effect: cache mismatch across turns
+
+The deanonymize-side prewarm seeds the pipeline + per-detector
+caches keyed by the text we *return* to LiteLLM (originals
+substituted in, when `DEANONYMIZE_SUBSTITUTE=true`). In streaming
+mode, that text never reaches the client — Open WebUI and similar
+chat UIs render the surrogate-laden chunks they actually received.
+The next turn's chat history therefore carries the surrogate-laden
+assistant reply, not the original-laden one our prewarm assumed,
+and the cache misses.
+
+What that means in practice:
+
+- The prewarmed slot (keyed by original-laden text) sits unused
+  until LRU/TTL evicts it. Wasted cache capacity proportional to
+  streaming traffic.
+- Detection re-runs from scratch on the surrogate-laden history,
+  with no cache shortcut. Latency cost per turn.
+- An LLM detector seeing `[PERSON_xyz]` in the prior assistant
+  reply could plausibly flag it as suspicious and re-anonymize
+  it into a fresh inner surrogate (vault entry chains
+  surrogate→surrogate over turns; the original PII becomes
+  inaccessible after the first vault entry expires).
+
+The chained-surrogate risk depends on how aggressive your detector
+prompt is — regex-only deployments are unaffected; LLM detection
+with a strict prompt can trigger it. Either way the cache miss is
+real for any streaming + `substitute=true` deployment.
+
+**Why we haven't fixed this yet.** The clean fix is "in streaming
+mode, prewarm the surrogate-laden form instead of the original-
+laden form" (matching what the client actually has in history). To
+do that we need to know on each post_call whether the request is
+streaming — a flag that LiteLLM's `GenericGuardrailAPIRequest`
+wire payload doesn't carry today. Possible paths:
+
+1. **Upstream LiteLLM PR** — add `is_streaming: bool = False` to
+   `GenericGuardrailAPIRequest`, populated from the original
+   request body's `stream` field. Small change, gives us the flag
+   on every call. Tracked in
+   [`TASKS.md` → Streaming-aware prewarm](../TASKS.md#streaming-aware-prewarm).
+2. **The streaming plugin** in `TASKS.md` (the one that fixes the
+   primary client-visible problem above). When chunks are actually
+   rewritten on the wire, the client receives original-laden text,
+   the prewarm key matches what next-turn history will carry, and
+   this whole consequence disappears.
+
+We've ruled out heuristic streaming-detection (counting post_call
+invocations per call_id) because it's only correct from the second
+call onward — the first call would still prewarm the wrong form.
+Not worth the complexity.
+
 **Workarounds:**
 
 - **Disable streaming** on anonymizer-protected models. The

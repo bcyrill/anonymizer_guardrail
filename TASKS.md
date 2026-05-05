@@ -240,6 +240,104 @@ breaking deployments that opted in (the HTTP API stays unchanged).
 
 ---
 
+## Streaming-aware prewarm
+
+**What:** in streaming mode, prewarm the cache for the
+surrogate-laden form (what the client actually receives) instead
+of the original-laden form (what we'd return if LiteLLM honoured
+modified texts). This keeps the cache coherent with the assistant
+reply that lands in next-turn chat history and avoids the chained-
+surrogate risk described in
+[docs/limitations.md → Secondary effect: cache mismatch across
+turns](docs/limitations.md#secondary-effect-cache-mismatch-across-turns).
+
+**Why this is its own task** (not folded into the streaming plugin
+task above): different concern, different blocker, different
+shipping path. The plugin fixes the primary symptom (client sees
+surrogates) by rewriting chunks on the wire. This task fixes the
+secondary symptom (next-turn cache mismatch + potential chained
+surrogates) by changing how `_prewarm_caches` keys its writes.
+Either fix is useful on its own; both can ship independently.
+When the plugin lands and chunks get rewritten with originals, the
+client's history again carries originals — so this task either
+becomes unnecessary (we revert to original-laden prewarm) or stays
+as a no-op flag (always-prewarm-original-laden when the plugin is
+active).
+
+**Why deferred:** the substitute branch we'd want to take depends
+on knowing whether the request is streaming, and LiteLLM's
+`GenericGuardrailAPIRequest` wire payload doesn't carry that
+information today. We've considered and rejected a service-side
+heuristic (counting post_call invocations per `call_id`) — it
+detects streaming only from the second call onward, leaving the
+first call's prewarm wrong. Not worth the complexity. The clean
+prerequisite is an upstream change.
+
+**Wire-protocol prerequisite (upstream LiteLLM):**
+
+Add `is_streaming: bool = False` to `GenericGuardrailAPIRequest`,
+populated from the chat-completion request body's `stream` field
+during construction in `apply_guardrail()`. The change is mechanical:
+one Pydantic field, one read of `request_body.get("stream", False)`,
+one assignment in the request constructor. The receiving side
+(our service) ignores unknown fields by default, so the change is
+backwards-compatible for older anonymizer versions running against
+newer LiteLLM versions.
+
+PR plan against `BerriAI/litellm`:
+
+1. Field added to
+   `litellm/proxy/guardrails/guardrail_hooks/generic_guardrail_api/types.py`
+   (or wherever the request model lives — verify path at PR time).
+2. Population in `apply_guardrail()`'s `GenericGuardrailAPIRequest(...)`
+   call (`litellm/proxy/guardrails/guardrail_hooks/generic_guardrail_api/generic_guardrail_api.py`,
+   around line 436 in current main).
+3. One unit test asserting the flag round-trips for a stream/non-stream
+   pair.
+
+**Service-side implementation (once the flag is available):**
+
+1. Extend `GenericGuardrailAPIRequest` (our copy under
+   `src/anonymizer_guardrail/api.py`) to accept the new
+   `is_streaming` field.
+2. Pass it down to `Pipeline.deanonymize` via the request handler.
+3. In `pipeline.deanonymize`, when `is_streaming=True` AND
+   `config.deanonymize_substitute=true`:
+   - Build the substituted text the same way (return original-
+     laden text upstream so LiteLLM's compliance scan sees it).
+   - Pass the *unsubstituted* (surrogate-laden) text to
+     `_prewarm_caches` instead of the substituted form. Effect
+     mirrors `substitute=false` mode for cache purposes only —
+     the response still goes back substituted.
+4. Log the streaming-aware path at the same level so operators
+   can grep for it.
+
+**Tests:**
+
+- Unit test: simulated streaming pre/post with `is_streaming=true`
+  produces empty cache slots keyed by surrogate-laden text;
+  non-streaming with the same payload keys by original-laden text.
+- Integration test: turn 1 streaming + turn 2 non-streaming with
+  the surrogate-laden assistant reply in history hits the cache
+  with `[]` matches (no re-detection, no chained surrogate).
+- Backwards-compat: requests without the `is_streaming` field
+  default to `False` and behave exactly as today.
+
+**Non-goals:**
+
+- **Not a replacement for the streaming plugin task above.** This
+  fixes the cache-coherence consequence; the plugin fixes the
+  client-visible chunk-content consequence. They're independent.
+- **No service-side heuristic detection.** First-call wrongness
+  is unavoidable without the upstream flag, and we'd rather wait
+  for the clean fix than ship the lagging-by-one-call detection.
+- **No new behavior for `substitute=false`.** That mode already
+  prewarms surrogate-laden text by accident-of-construction (per-
+  text filter rejects originals not present in the text). The
+  streaming-aware change only affects `substitute=true` calls.
+
+---
+
 ## Optional structured (JSON) logging
 
 **What:** add a `LOG_FORMAT=text|json` env var (default `text`). When
