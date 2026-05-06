@@ -327,6 +327,173 @@ def test_streaming_response_no_is_final_field_skips_wait(
     asyncio.run(main_mod._pipeline.vault.pop(call_id))
 
 
+# ── Streaming Faker buffer mode (STREAMING_FAKER_MODE=buffer) ────────────────
+
+
+def test_streaming_faker_buffer_waits_on_non_final_when_enabled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under USE_FAKER=true + STREAMING_FAKER_MODE=buffer, every
+    non-final response chunk returns WAIT — Faker surrogates have no
+    detectable shape mid-chunk, so we defer all substitution to the
+    end-of-stream call against the full assembled text."""
+    patched = main_mod.config.model_copy(update={
+        "use_faker": True,
+        "streaming_faker_mode": "buffer",
+    })
+    monkeypatch.setattr(main_mod, "config", patched)
+
+    call_id = "faker-buffer-mid"
+    client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    )
+
+    # Mid-stream chunk that wouldn't normally trip the opaque-suffix
+    # WAIT predicate (no `[PREFIX_…` trailing edge). Buffer mode WAITs
+    # anyway because the surrogate set is Faker-shaped.
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Sure, contacting them now."],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": False,
+        },
+    ).json()
+    assert r["action"] == "WAIT", r
+    assert r.get("texts") is None  # WAIT must not include modified texts
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
+def test_streaming_faker_buffer_substitutes_on_final(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffer mode defers, but the protocol forbids WAIT at
+    is_final=True. The final chunk receives the full assembled text and
+    runs deanonymize against it — substitutions land in one shot."""
+    patched = main_mod.config.model_copy(update={
+        "use_faker": True,
+        "streaming_faker_mode": "buffer",
+    })
+    monkeypatch.setattr(main_mod, "config", patched)
+
+    call_id = "faker-buffer-final"
+    pre = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    ).json()
+    surrogate = pre["texts"][0].split("Reach me at ")[1]
+
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": [f"Confirmed — contacting {surrogate} now."],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": True,
+        },
+    ).json()
+    assert r["action"] == "GUARDRAIL_INTERVENED", r
+    assert "alice@example.com" in r["texts"][0]
+    assert r["action"] != "WAIT"
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
+def test_streaming_faker_buffer_is_noop_when_use_faker_false(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffer mode is gated on `use_faker` being true — under
+    USE_FAKER=false (opaque tokens) the existing partial-surrogate
+    WAIT predicate is sufficient and buffer-mode is a no-op so we
+    don't lose streaming UX in opaque deployments."""
+    patched = main_mod.config.model_copy(update={
+        "use_faker": False,
+        "streaming_faker_mode": "buffer",
+    })
+    monkeypatch.setattr(main_mod, "config", patched)
+
+    call_id = "faker-buffer-opaque-noop"
+    pre = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    ).json()
+    surrogate = pre["texts"][0].split("Reach me at ")[1]
+
+    # Mid-stream chunk with a fully-closed surrogate and no partial-
+    # surrogate trailing edge — under buffer mode the opaque path
+    # would still fire (gate fails on use_faker=false), so we substitute.
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": [f"Sure, I'll contact {surrogate} shortly."],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": False,
+        },
+    ).json()
+    assert r["action"] == "GUARDRAIL_INTERVENED", r
+    assert "alice@example.com" in r["texts"][0]
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
+def test_streaming_faker_default_disabled_does_not_wait(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the opt-in flag (STREAMING_FAKER_MODE=disabled, the
+    default), USE_FAKER=true streaming behaves as today — no extra
+    WAITs. Pins that buffer mode is strictly opt-in so existing
+    Faker-streaming deployments don't silently lose the typing
+    animation when this code lands."""
+    patched = main_mod.config.model_copy(update={
+        "use_faker": True,
+        "streaming_faker_mode": "disabled",
+    })
+    monkeypatch.setattr(main_mod, "config", patched)
+
+    call_id = "faker-default-disabled"
+    client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Reach me at alice@example.com"],
+            "input_type": "request",
+            "litellm_call_id": call_id,
+        },
+    )
+
+    r = client.post(
+        "/beta/litellm_basic_guardrail_api",
+        json={
+            "texts": ["Sure, contacting them now."],
+            "input_type": "response",
+            "litellm_call_id": call_id,
+            "is_final": False,
+        },
+    ).json()
+    assert r["action"] != "WAIT"
+
+    import asyncio
+    asyncio.run(main_mod._pipeline.vault.pop(call_id))
+
+
 def test_response_with_unknown_call_id_returns_none(client: TestClient) -> None:
     """A post-call without a matching pre-call (e.g. the request was
     served by a different replica, or pre-call never happened) → action

@@ -1011,6 +1011,8 @@ class Pipeline:
 
     async def deanonymize(
         self, texts: list[str], call_id: str | None,
+        *,
+        is_final: bool | None = None,
     ) -> list[str]:
         """Reverse the substitution using the stored vault entry for
         this call_id. Optionally pre-warms both cache layers from the
@@ -1024,6 +1026,16 @@ class Pipeline:
         anonymize calls will see in this mode). Use for
         redaction-only deployments where restoring originals would
         undermine the purpose.
+
+        `is_final` carries the streaming action protocol's flag:
+        `None` for non-streaming, `True` for the end-of-stream call,
+        `False` for mid-stream. We skip the prewarm step when
+        `is_final is False` because the accumulated-so-far text on a
+        mid-stream call is a partial assistant reply that no future
+        request will look up — caching it would only evict useful
+        entries under LRU pressure. The end-of-stream call (and every
+        non-streaming call) carries the text the client actually
+        receives, which IS what next-turn anonymize will key on.
 
         Read-only on the vault (`peek`, not `pop`). LiteLLM's
         `UnifiedLLMGuardrails` invokes us multiple times for a single
@@ -1095,7 +1107,16 @@ class Pipeline:
         #     the deployment-shape implications.
         # Either way, the cache key matches the text future requests
         # will look up.
-        await self._prewarm_caches(outbound_text, entry)
+        #
+        # Skip prewarm on mid-stream calls (`is_final is False`):
+        # the outbound text is a partial accumulated reply that no
+        # future request will key on, so the slot would only burn
+        # LRU capacity. `is_final is None` (non-streaming) and
+        # `is_final is True` (end-of-stream) both run prewarm — the
+        # `is None` branch keeps stock-LiteLLM behaviour identical
+        # to before this gate (stock never populates `is_final`).
+        if is_final is not False:
+            await self._prewarm_caches(outbound_text, entry)
 
         return outbound_text
 

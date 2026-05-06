@@ -108,7 +108,7 @@ where realism would mislead. See [surrogates](docs/surrogates.md).
 | Cache effectiveness benchmark — script | [docs/cache-bench.md](docs/cache-bench.md) |
 | Cache effectiveness benchmark — committed results | [docs/benchmark/cache-bench/](docs/benchmark/cache-bench/report.md) |
 | Detector-service latency benchmark (CPU + GPU) | [docs/service-bench.md](docs/service-bench.md) |
-| Limitations — single replica, no streaming deanonymization | [docs/limitations.md](docs/limitations.md) |
+| Limitations — single replica, streaming pending upstream merge | [docs/limitations.md](docs/limitations.md) |
 | Contributor guide | [docs/development.md](docs/development.md) |
 | Design decisions — paths considered and declined | [docs/design-decisions.md](docs/design-decisions.md) |
 

@@ -429,7 +429,7 @@ Wire-up summary:
   vault entries are short-lived (`VAULT_TTL_S` seconds, default
   120) and the size is dominated by the per-text mapping anyway.
 
-## Prewarm fires on every deanonymize call (no chunk-tracking)
+## Prewarm gates on `is_final` for streaming, fires unconditionally otherwise
 
 When LiteLLM streams a chat completion, its `UnifiedLLMGuardrails`
 layer invokes our `apply_guardrail` HTTP endpoint multiple times
@@ -437,60 +437,129 @@ under the same `litellm_call_id` — every Nth chunk it forwards the
 *full accumulated assistant text so far*, plus a final
 assembled-response call after the stream ends. With the peek-based
 deanonymize path (see [vault.md](vault.md) for why peek), each of
-those calls runs `_prewarm_caches` against whatever text it was
-given.
+those calls runs the deanonymize substitution; what differs by
+caller is whether the resulting text is also seeded into the
+prewarm caches.
 
-That means a 37-chunk response can write 7–8 cache entries — one
-per accumulated-text key — instead of the one entry a non-streaming
-response writes. Two paths considered:
+The streaming action protocol added in
+[BerriAI/litellm#27228](https://github.com/BerriAI/litellm/pull/27228)
+populates `is_final` on every response-side request — `False` for
+mid-stream samples, `True` for the end-of-stream call. Stock
+LiteLLM (without the PR) leaves the field unset (`None` on the
+wire). We use this:
 
-**Adopted: fire prewarm on every call, let LRU + TTL handle the
-rest.** No bookkeeping, no protocol changes. Each prewarm output
-is *correct* for its text — `_prewarm_caches` per-text-filters by
-`m.text in text`, so a slot for the partial text "I do not have"
-stores `[]` (no PII original substring-present); a slot for
-"…identified as \"Christoph Blocher\"…" stores the matching
-`Match`. Both match what real detection on those exact texts would
-return; nothing poisons future hits. The cost is bounded LRU slots
-(≈ N detectors × M restored texts × ~7 intermediate chunks per
-streaming response — typically 7–28 entries per stream) which the
-LRU evicts naturally as fresh requests come in.
+- **`is_final is False`** (mid-stream under PR 27228): skip
+  prewarm. The accumulated-so-far text is a partial assistant
+  reply that no future request will key on — chunks get rewritten
+  on the wire, so the client's history carries the *final*
+  assembled text, not any intermediate snapshot.
+- **`is_final is True` or `None`**: run prewarm. End-of-stream
+  (PR 27228) and non-streaming (any LiteLLM) both carry the text
+  the client actually receives, which IS what next-turn anonymize
+  will look up. `None` also covers stock-LiteLLM streaming, where
+  we can't distinguish samples from final calls — we keep the
+  legacy fire-on-every-call behaviour so stock deployments behave
+  exactly as they did before this gate.
 
-**Rejected: track `last_prewarm_text` per call_id, supersede on
-each call.** The cleaner end state — only the final-call prewarm
-survives — but at substantial code cost: a new field on
-`VaultEntry`, a vault-update path (current `put` + `peek` aren't
-enough — we'd need a "rewrite the entry" operation that doesn't
-race with concurrent reads), and `evict(key)` plumbing on both the
-`PipelineResultCache` Protocol and `DetectorResultCache` Protocol
-plus their three implementations each (memory, redis, disabled
-stub). The correctness story (each prewarm is exact for its text)
-made the bookkeeping unjustified at the time of the decision; the
-trade-off is real cache-displacement cost when both
-`PIPELINE_CACHE_BACKEND` is enabled and traffic is streaming-heavy.
+The predicate is intentionally `is_final is False` (not `not
+is_final`): future LiteLLM versions that introduce a new
+streaming state would arrive as something other than `False` and
+fall into the prewarm path — the safe default — until we
+explicitly extend the gate.
 
-If telemetry shows streaming-driven cache displacement hurting
-hit rate at production volumes with `PIPELINE_CACHE_BACKEND`
-enabled, the supersede design is the obvious upgrade path — and
-because the wire format and `VaultEntry` shape both already
-tolerate additive change, it can land without breaking
-backwards compatibility on either.
+**Considered and rejected: track `last_prewarm_text` per call_id
+and supersede on each call.** The cleanest end state — only the
+final-call prewarm survives, even on stock LiteLLM — but at
+substantial code cost: a new field on `VaultEntry`, a vault-update
+path (current `put` + `peek` aren't enough — we'd need a "rewrite
+the entry" operation that doesn't race with concurrent reads),
+and `evict(key)` plumbing on both the `PipelineResultCache`
+Protocol and `DetectorResultCache` Protocol plus their three
+implementations each (memory, redis, disabled stub). With the
+`is_final` gate carrying the load on PR 27228 deployments, the
+supersede machinery is justified only if telemetry shows
+stock-streaming cache displacement hurting production hit rate
+with `PIPELINE_CACHE_BACKEND` enabled — and because the wire
+format and `VaultEntry` shape both already tolerate additive
+change, it can land later without breaking compatibility on either.
 
 ### Trade-offs accepted
 
-- **Cache slot displacement scales with streaming sample
-  frequency.** A long streaming response writes one
-  pipeline-cache slot per sampled chunk × per restored text, plus
-  one per-detector cache slot per active cache-using detector
-  × text × chunk. With `PIPELINE_CACHE_BACKEND=memory` this
-  competes with same-cap fresh entries from concurrent
-  non-streaming requests; on busy gateways with the cache
-  enabled, raising `PIPELINE_CACHE_MAX_SIZE` (and the per-detector
-  caps) ahead of streaming traffic is operationally cheaper than
-  the supersede machinery would be. Same-cap reasoning applies
-  to Redis backends — `maxmemory` policy on Redis evicts LRU at
-  the server side.
-- **Streaming workloads benefit from a larger cache cap than
-  non-streaming workloads of the same request rate.** ~7×
-  multiplier per streaming response is the rule-of-thumb when
-  sizing.
+- **Stock LiteLLM streaming still writes one pipeline-cache slot
+  per sampled chunk × per restored text**, plus one per-detector
+  cache slot per active cache-using detector × text × chunk.
+  PR 27228 deployments collapse that to one slot per stream (the
+  final call). With `PIPELINE_CACHE_BACKEND=memory` on stock
+  LiteLLM the streaming chunk samples compete with same-cap
+  fresh entries from concurrent non-streaming requests; raising
+  `PIPELINE_CACHE_MAX_SIZE` (and the per-detector caps) ahead of
+  streaming traffic is operationally cheaper than the supersede
+  machinery. Same-cap reasoning applies to Redis backends —
+  `maxmemory` policy on Redis evicts LRU at the server side.
+- **Streaming workloads on stock LiteLLM benefit from a larger
+  cache cap than non-streaming workloads of the same request
+  rate.** ~7× multiplier per streaming response is the
+  rule-of-thumb when sizing. PR 27228 deployments don't need the
+  uplift — the gate keeps streaming-vs-non-streaming
+  cache-pressure parity.
+
+## Faker streaming buffers to end-of-stream behind an opt-in flag
+
+Opaque-mode surrogates (`USE_FAKER=false`) stream correctly under
+the action protocol because their token shape (`[PREFIX_DIGEST]`)
+gives the response handler a regex to detect a partial trailing
+surrogate at a chunk boundary and return `WAIT`. Faker surrogates
+(`John Smith`, `quasarware.local`) are natural-language strings
+with no detectable boundary — there's no shape-based way to know
+mid-stream whether the trailing characters are part of a Faker
+surrogate or normal text.
+
+`STREAMING_FAKER_MODE` (default `disabled`, opt-in `buffer`)
+controls the response handler's behaviour for streaming Faker
+traffic:
+
+- **`disabled`**: the response handler runs the opaque-shape WAIT
+  predicate only. Partial Faker surrogates that straddle chunk
+  boundaries leak to the client (the pre-existing limitation).
+  Streaming UX is preserved for any traffic that doesn't actually
+  produce Faker surrogates mid-chunk.
+- **`buffer`**: every non-final response chunk returns `WAIT` when
+  `use_faker` is active. Substitution is deferred to the
+  `is_final=True` call, which sees the full assembled text and
+  runs the standard non-streaming deanonymize path.
+
+**Why `buffer` is opt-in, not the default.** The cost is the
+streaming UX itself — time-to-first-token becomes time-to-last-
+token because the client receives nothing until end-of-stream. For
+chat UIs that depend on per-token rendering this is a regression
+from "broken streaming with leaks" to "no streaming at all," which
+some operators would prefer to flip themselves rather than accept
+silently. The gate fires only on `config.use_faker is True`, so
+opaque-mode deployments that happen to set the flag don't lose
+streaming UX.
+
+### Considered and rejected — vault-trie suffix-prefix matching
+
+The cleaner end state would preserve streaming UX in Faker mode by
+checking, per non-final chunk, whether the accumulated text's
+suffix is a non-empty prefix of any surrogate in the call's vault
+entry. WAIT iff yes; otherwise substitute and emit. Tracked as a
+follow-up task; not shipped today because:
+
+1. **Complexity.** A per-call surrogate prefix-trie cached on the
+   vault entry, plus longest-suffix-prefix-match logic, plus
+   per-call lifecycle. The minimum viable shape is ~150 LOC; the
+   buffer approach is ~30.
+2. **Correctness ceiling.** Even with the trie, Faker mode's
+   pre-existing substring-collision risk (surrogate `Sara`
+   matching inside unrelated word `Sarah`) is unaffected — the
+   trie tells us *when* to defer, not *whether to substitute*.
+   The trie doesn't make Faker mode more correct; it just
+   preserves the streaming cadence at the cost of more `WAIT`s
+   than opaque mode (Faker surrogates are short and overlap with
+   natural-language prefixes).
+3. **Signal threshold.** Faker streaming has no production
+   reproducer today. Building the trie now would be optimising
+   without measurement; the buffer mode delivers correctness
+   immediately and the trie remains available as the upgrade
+   path if a real deployment surfaces buffering as a UX blocker.

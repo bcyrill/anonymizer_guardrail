@@ -166,6 +166,27 @@ class Config(BaseSettings):
     # Default true preserves today's full round-trip behaviour.
     deanonymize_substitute: bool = True
 
+    # Streaming-mode behaviour under USE_FAKER=true. The default
+    # opaque-token WAIT heuristic in `main.py` keys on the
+    # `[PREFIX_DIGEST]` shape; Faker surrogates are natural-language
+    # strings (`John Smith`, `quasarware.local`) with no detectable
+    # boundary, so a partial Faker surrogate that straddles a chunk
+    # boundary slips past the gate and reaches the client unchanged.
+    #
+    #   * "disabled" (default): no opt-in protection. Faker streaming
+    #     leaks partial surrogates as in stock behaviour. Operators
+    #     who don't stream Faker traffic don't pay anything.
+    #   * "buffer": always return WAIT for non-final response chunks
+    #     when `use_faker` is active, deferring all substitution to
+    #     the end-of-stream call. Correct (end-of-stream sees the
+    #     full assembled text, same as non-streaming) but eliminates
+    #     streaming UX — time-to-first-token becomes time-to-last-
+    #     token. Ship behind this flag so the trade-off is opt-in.
+    #
+    # Has no effect when `use_faker` is False (opaque mode streams
+    # correctly via the existing partial-surrogate WAIT predicate).
+    streaming_faker_mode: Literal["disabled", "buffer"] = "disabled"
+
     # ── Vault (call_id → mapping) ──────────────────────────────────────────────
     # Backend selection. "memory" (default) is process-local — fine
     # for single-replica deployments. "redis" routes the vault through

@@ -108,6 +108,15 @@ it. Useful when:
 - You want a hard guarantee that the model never sees plausibly-real PII.
 - Faker-related behaviour is causing trouble and you want to take it out
   of the loop entirely (Faker isn't even instantiated in this mode).
+- You need streaming responses to deanonymize correctly without
+  trading off streaming UX. The partial-surrogate `WAIT` heuristic
+  relies on the opaque-token shape (`[PREFIX_DIGEST]`); Faker
+  surrogates have no detectable boundary, so under `USE_FAKER=true`
+  the choice is leak-on-boundaries (default) or buffer-until-final
+  via `STREAMING_FAKER_MODE=buffer`. Opaque mode streams correctly
+  at full incremental cadence with no opt-in flag. See [limitations
+  → Faker mode trades streaming UX for
+  correctness](limitations.md#faker-mode-trades-streaming-ux-for-correctness-opt-in-flag).
 
 The opaque tokens are still deterministic, so the same input always maps
 to the same surrogate within a process — round-trip restoration works

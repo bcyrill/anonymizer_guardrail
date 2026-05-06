@@ -475,3 +475,57 @@ async def test_prewarm_skips_detectors_missing_from_vault_kwargs(
         for r in caplog.records
     ), f"expected drift-skip log; got: {[r.message for r in caplog.records]}"
     await p.aclose()
+
+
+# ── Streaming-action-protocol prewarm gate ─────────────────────────────
+
+
+async def test_deanonymize_skips_prewarm_on_mid_stream_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`is_final=False` (mid-stream chunk under PR #27228) must NOT
+    write a pipeline-cache slot — the accumulated-so-far text is a
+    partial assistant reply that no future request will key on, so
+    caching it just evicts useful entries.
+
+    `is_final=None` (non-streaming, also stock-LiteLLM streaming
+    samples) and `is_final=True` (end-of-stream) must keep prewarming
+    — they carry the text the client actually receives, which is
+    what next-turn anonymize will look up."""
+    p, _ = _setup(monkeypatch, llm_cache_max_size=0)
+
+    # Seed a vault entry once; reuse for all three deanonymize calls.
+    text = "Reach alice@corp.example for support."
+    _, mapping = await p.anonymize([text], call_id="stream-1")
+    surrogate = next(iter(mapping))
+
+    response = f"OK, contacting {surrogate} now."
+    baseline_size = p.stats()["pipeline_cache_size"]
+
+    # Mid-stream (is_final=False): prewarm must be skipped.
+    await p.deanonymize([response], call_id="stream-1", is_final=False)
+    assert p.stats()["pipeline_cache_size"] == baseline_size, (
+        "mid-stream deanonymize wrote a pipeline-cache slot — prewarm "
+        "should have been skipped under is_final=False"
+    )
+
+    # End-of-stream (is_final=True): prewarm runs, slot gets written.
+    await p.deanonymize([response], call_id="stream-1", is_final=True)
+    after_final_size = p.stats()["pipeline_cache_size"]
+    assert after_final_size > baseline_size, (
+        "end-of-stream deanonymize did NOT write a pipeline-cache slot "
+        "— prewarm should have run under is_final=True"
+    )
+
+    # Non-streaming (is_final=None, the legacy default): prewarm runs.
+    # Same response text → no new slot (already cached on the True
+    # call), but probe via a distinct text so the size delta is
+    # observable.
+    response_2 = f"Sent — also CC'd {surrogate}."
+    pre_legacy = p.stats()["pipeline_cache_size"]
+    await p.deanonymize([response_2], call_id="stream-1")
+    assert p.stats()["pipeline_cache_size"] > pre_legacy, (
+        "non-streaming deanonymize (is_final=None) did NOT prewarm — "
+        "the gate must only skip on is_final=False, not on None"
+    )
+    await p.aclose()

@@ -178,13 +178,22 @@ log "starting anonymizer guardrail (regex detector only, USE_FAKER=false)…"
 # USE_FAKER=false forces opaque-token surrogates ([EMAIL_ADDRESS_…])
 # instead of realistic-name Faker output. The chunk_straddle assertion
 # checks the surrogate-shape regex; opaque tokens are deterministic.
+#
+# LOG_LEVEL is bumped to debug when --trace is set so the
+# `guardrail-trace` per-call lines (DEBUG-level, payload-bearing) are
+# emitted; default INFO keeps the container output tight for the
+# non-trace runs.
+ANON_LOG_LEVEL="info"
+if [[ "${TRACE}" == "true" ]]; then
+  ANON_LOG_LEVEL="debug"
+fi
 podman run -d --rm \
   --name "${ANON_NAME}" \
   --network "${NETWORK_NAME}" \
   --network-alias "anonguard" \
   -e DETECTOR_MODE=regex \
   -e USE_FAKER=false \
-  -e LOG_LEVEL=info \
+  -e LOG_LEVEL="${ANON_LOG_LEVEL}" \
   "${ANON_IMAGE}" >/dev/null
 
 # ── Test driver ──────────────────────────────────────────────────────

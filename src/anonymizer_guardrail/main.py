@@ -247,11 +247,20 @@ async def health() -> dict[str, object]:
 
 
 def _trace_call(req: GuardrailRequest, resp: GuardrailResponse) -> GuardrailResponse:
-    """One INFO line per guardrail call so operators (and the e2e test
-    harness's --trace flag) can see input/output/decision without
-    flipping log level. Snippets cap at 160 chars to keep grep-friendly
-    fixed-width log lines while still showing the trailing edge that
-    drives WAIT decisions."""
+    """One DEBUG line per guardrail call carrying input/output/decision
+    snippets — payload-bearing detail for diagnosing WAIT cadence and
+    chunk-boundary substitution. The payload-free per-call summary
+    (`anonymize call_id=… entities=…` from `pipeline.py`) stays at INFO
+    so operators get a per-call signal without flipping log level.
+    Snippets cap at 160 chars to keep grep-friendly fixed-width lines
+    while still showing the trailing edge that drives WAIT decisions.
+
+    The log line's `guardrail-trace ` prefix is the harness contract —
+    `scripts/test-streaming-action-protocol.sh --trace` greps for it,
+    and bumps `LOG_LEVEL=debug` automatically when the flag is set."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return resp
+
     def _snip(parts: list[str] | None, cap: int = 160) -> str:
         if not parts:
             return ""
@@ -260,7 +269,7 @@ def _trace_call(req: GuardrailRequest, resp: GuardrailResponse) -> GuardrailResp
             return f"{s[:cap]}…"
         return s
 
-    log.info(
+    log.debug(
         "guardrail-trace call_id=%s type=%s is_final=%s action=%s in=%r out=%r",
         req.litellm_call_id,
         req.input_type,
@@ -342,18 +351,34 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             )
         else:
             # input_type == "response"
-            # Streaming action protocol: if the accumulated text trails off
-            # mid-surrogate, defer substitution until the next chunk arrives.
-            # See _PARTIAL_SURROGATE_SUFFIX. The protocol forbids WAIT at
-            # is_final=True — at end-of-stream we substitute whatever we have
-            # (a stray unclosed `[ABC` is left as-is by deanonymize anyway).
-            if (
-                req.is_final is False
-                and any(_has_partial_surrogate_suffix(t) for t in req.texts)
-            ):
-                return _trace_call(req, GuardrailResponse(action="WAIT"))
+            # Streaming action protocol: WAIT at chunk boundaries when
+            # substituting now would emit something that won't prefix the
+            # post-substitution text on the next chunk (LiteLLM's cursor-
+            # monotonic invariant). The protocol forbids WAIT at
+            # is_final=True — at end-of-stream we substitute whatever we
+            # have, since there's no next chunk to defer for.
+            if req.is_final is False:
+                # Faker buffer mode: surrogates are natural-language
+                # strings with no shape we can detect mid-chunk, so
+                # always defer. Substitution lands in the final chunk
+                # against the full assembled text. See
+                # `docs/design-decisions.md` → Faker streaming.
+                if (
+                    config.use_faker
+                    and config.streaming_faker_mode == "buffer"
+                ):
+                    return _trace_call(req, GuardrailResponse(action="WAIT"))
+                # Opaque mode: defer when the accumulated text trails
+                # off mid-surrogate (`[PERSON_…` unclosed). A stray
+                # unclosed `[ABC` is left as-is by deanonymize anyway,
+                # so this only matters for real surrogates that span
+                # chunk boundaries.
+                if any(_has_partial_surrogate_suffix(t) for t in req.texts):
+                    return _trace_call(req, GuardrailResponse(action="WAIT"))
 
-            restored = await _pipeline.deanonymize(req.texts, req.litellm_call_id)
+            restored = await _pipeline.deanonymize(
+                req.texts, req.litellm_call_id, is_final=req.is_final,
+            )
             if restored == req.texts:
                 return _trace_call(req, GuardrailResponse(action="NONE"))
             return _trace_call(

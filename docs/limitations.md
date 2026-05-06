@@ -31,43 +31,70 @@ survives provided Redis stayed up. Install with
 `VAULT_REDIS_URL`; see [vault → Backends](vault.md#backends) for
 the wire format and failure modes.
 
-## Streaming responses are not deanonymized
+## Streaming responses (pending upstream LiteLLM merge)
 
-When a client requests `stream: true`, the assistant's response
-chunks reach the client with surrogates intact (`[PERSON_…]`,
-`[EMAIL_ADDRESS_…]`, etc.). The pre-call (anonymize) side still
-works — the upstream LLM only ever sees anonymized text — but the
-client sees surrogates in the streamed reply.
+Service-side, the response handler implements the
+[LiteLLM streaming action protocol](https://github.com/BerriAI/litellm/pull/27228):
+the request carries `is_final`, the response returns one of
+`NONE` / `GUARDRAIL_INTERVENED` / `WAIT` / `BLOCKED`, and a `WAIT`
+defers substitution when the accumulated text trails off
+mid-surrogate (`[PERSON_…` unclosed at a chunk boundary). With
+opaque-token surrogates (`USE_FAKER=false`) this delivers per-chunk
+deanonymization end-to-end including correct boundary handling —
+see `scripts/test-streaming-action-protocol.sh` for the e2e
+harness exercising both the plain-chunk and chunk-straddle arms.
 
-**Root cause is in LiteLLM, not this service.** LiteLLM's
-`UnifiedLLMGuardrails` integration calls our
-`apply_guardrail` endpoint repeatedly during streaming (every Nth
-chunk plus a final assembled-response call), but its iterator-hook
-implementation is **moderation-only**: it computes the guardrail
-output for compliance scanning and `BLOCKED` decisions, then yields
-the *original* upstream chunk to the client regardless of any
-modified text the guardrail returned. See
-[`unified_guardrail.py` line 417 `original_item = copy.deepcopy(item)`
-and line 465 `yield original_item`](https://github.com/BerriAI/litellm/blob/main/litellm/proxy/guardrails/guardrail_hooks/unified_guardrail/unified_guardrail.py).
+**Upstream status: PR open, not yet merged.**
+[BerriAI/litellm#27228](https://github.com/BerriAI/litellm/pull/27228)
+adds the iterator-side state machine that consumes the action
+protocol and rewrites chunks on the wire. Stock LiteLLM still
+samples guardrail output for moderation only and yields the
+*original* (surrogate-laden) chunks regardless of what we return —
+so until that PR lands, operators who want streaming end-to-end
+must build a derived LiteLLM image off the PR branch (the harness
+script tags it `litellm:streaming-action-protocol`).
 
-Service-side, the deanonymize path is already correct under this
-load — `pipeline.deanonymize` uses `vault.peek` so every sampled
-streaming call sees the same surrogate map and produces the right
-deanonymized output. That output just doesn't make it to the
-client because LiteLLM yields the original chunk.
+### Faker mode trades streaming UX for correctness (opt-in flag)
 
-### Secondary effect: cache mismatch across turns
+The `WAIT` heuristic relies on the opaque-token shape
+(`[PREFIX_DIGEST]`): a literal `[` followed by uppercase/digit/`_`
+content closing on `]`. Faker surrogates are natural-language
+strings (`John Smith`, `quasarware.local`) with no detectable
+boundary, so we can't distinguish a partial surrogate from real
+text mid-stream. Two operator-selectable behaviours via
+`STREAMING_FAKER_MODE`:
 
-The deanonymize-side prewarm seeds the pipeline + per-detector
-caches keyed by the text we *return* to LiteLLM (originals
-substituted in, when `DEANONYMIZE_SUBSTITUTE=true`). In streaming
-mode, that text never reaches the client — Open WebUI and similar
-chat UIs render the surrogate-laden chunks they actually received.
-The next turn's chat history therefore carries the surrogate-laden
+- **`disabled`** (default): no protection. Faker surrogates that
+  straddle chunk boundaries leak to the client. Streaming UX is
+  preserved.
+- **`buffer`**: every non-final response chunk returns `WAIT`,
+  deferring substitution to the `is_final=True` call which sees
+  the full assembled text. Correct end-to-end (same code path as
+  non-streaming), but the client receives nothing until
+  end-of-stream — time-to-first-token becomes time-to-last-token.
+
+The flag is opt-in because turning it on silently would regress
+streaming UX in deployments that already accepted the leak risk.
+The boundary-aware streaming path (suffix-prefix matching against
+the vault's surrogate set) is tracked as the follow-up upgrade in
+[`TASKS.md` → Faker streaming with boundary-aware
+substitution](../TASKS.md#faker-streaming-with-boundary-aware-substitution).
+See [design-decisions → Faker streaming buffers to
+end-of-stream](design-decisions.md#faker-streaming-buffers-to-end-of-stream-behind-an-opt-in-flag)
+for the full reasoning.
+
+### Secondary effect: cache mismatch across turns (resolved by PR 27228)
+
+On stock LiteLLM, the deanonymize-side prewarm seeds the pipeline +
+per-detector caches keyed by the text we *return* to LiteLLM
+(originals substituted in, when `DEANONYMIZE_SUBSTITUTE=true`).
+That text never reaches the client — Open WebUI and similar chat
+UIs render the surrogate-laden chunks they actually received. The
+next turn's chat history therefore carries the surrogate-laden
 assistant reply, not the original-laden one our prewarm assumed,
 and the cache misses.
 
-What that means in practice:
+What that means in practice on stock LiteLLM:
 
 - The prewarmed slot (keyed by original-laden text) sits unused
   until LRU/TTL evicts it. Wasted cache capacity proportional to
@@ -80,56 +107,17 @@ What that means in practice:
   surrogate→surrogate over turns; the original PII becomes
   inaccessible after the first vault entry expires).
 
-The chained-surrogate risk depends on how aggressive your detector
-prompt is — regex-only deployments are unaffected; LLM detection
-with a strict prompt can trigger it. Either way the cache miss is
-real for any streaming + `substitute=true` deployment.
-
-**Why we haven't fixed this yet.** The clean fix is "in streaming
-mode, prewarm the surrogate-laden form instead of the original-
-laden form" (matching what the client actually has in history). To
-do that we need to know on each post_call whether the request is
-streaming — a flag that LiteLLM's `GenericGuardrailAPIRequest`
-wire payload doesn't carry today. Possible paths:
-
-1. **Upstream LiteLLM PR** — add `is_streaming: bool = False` to
-   `GenericGuardrailAPIRequest`, populated from the original
-   request body's `stream` field. Small change, gives us the flag
-   on every call. Tracked in
-   [`TASKS.md` → Streaming-aware prewarm](../TASKS.md#streaming-aware-prewarm).
-2. **The streaming plugin** in `TASKS.md` (the one that fixes the
-   primary client-visible problem above). When chunks are actually
-   rewritten on the wire, the client receives original-laden text,
-   the prewarm key matches what next-turn history will carry, and
-   this whole consequence disappears.
-
-We've ruled out heuristic streaming-detection (counting post_call
-invocations per call_id) because it's only correct from the second
-call onward — the first call would still prewarm the wrong form.
-Not worth the complexity.
-
-**Workarounds:**
-
-- **Disable streaming** on anonymizer-protected models. The
-  anonymizer protects the upstream LLM unconditionally; the only
-  thing streaming breaks is the client-side restoration. For chat
-  UIs that rely on token-by-token rendering this is a UX downgrade
-  but not a correctness regression — the client gets the same
-  final text in one response, just without the typing animation.
-- **Track upstream.** Comment / +1 on a feature request to make
-  `UnifiedLLMGuardrails` apply guardrail-modified texts to yielded
-  chunks (gated by a config flag so existing moderation-only
-  consumers aren't surprised).
-
-**Long-term fix tracked here.** A LiteLLM-side `CustomGuardrail`
-Python plugin that implements `async_post_call_streaming_iterator_hook`
-as a true generator transformer (yielding modified chunks rather
-than originals) would close the loop end-to-end. Tracked in
-[`TASKS.md` → Streaming response support](../TASKS.md#streaming-response-support);
-deferred because (a) the plugin requires a thin derived LiteLLM
-image rather than the official one, which is a meaningful
-deployment-shape change, and (b) the upstream fix may land first
-and obviate the plugin entirely.
+Once PR 27228 merges, chunks are rewritten on the wire — the
+client's history carries originals, the prewarm key matches, and
+this consequence dissolves. We've also wired the response handler
+to gate `_prewarm_caches` on `is_final` so a PR-27228 stream writes
+exactly one cache slot at end-of-stream (instead of one per
+sampled chunk); see
+[design-decisions → Prewarm gates on `is_final`](design-decisions.md#prewarm-gates-on-is_final-for-streaming-fires-unconditionally-otherwise).
+Until the upstream PR ships, the workaround for stock LiteLLM is
+to **disable streaming** on anonymizer-protected models: the
+client gets the same final text in one response, just without the
+typing animation.
 
 ## Hard cap on POST body size
 
