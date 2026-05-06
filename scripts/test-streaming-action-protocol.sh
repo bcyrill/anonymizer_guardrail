@@ -31,11 +31,15 @@
 #                        must see the deanonymized email at the end.
 #
 # Usage:
-#   scripts/test-streaming-action-protocol.sh [--mode {action|chunk_straddle|all}] [--keep]
+#   scripts/test-streaming-action-protocol.sh [--mode {action|chunk_straddle|all}] [--keep] [--trace]
 #
 # Options:
-#   --mode  Which arm to run. `all` (default) runs both.
-#   --keep  Don't tear down on exit. Useful for `podman logs litellm-act`.
+#   --mode   Which arm to run. `all` (default) runs both.
+#   --keep   Don't tear down on exit. Useful for `podman logs litellm-act`.
+#   --trace  After each arm, dump the per-call anonymizer guardrail trace
+#            (input texts, is_final, action, output texts) — useful for
+#            confirming WAIT-on-partial-surrogate fires and seeing the
+#            chunk-straddling progression call by call.
 #
 # Dev iteration:
 #   Set LITELLM_SRC=~/litellm to bind-mount the local litellm files over
@@ -79,6 +83,7 @@ TEST_PROMPT="Please summarise everything you know about ${TEST_EMAIL} including 
 
 MODE="all"
 KEEP=false
+TRACE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
@@ -90,6 +95,7 @@ while [[ $# -gt 0 ]]; do
       esac
       ;;
     --keep) KEEP=true ;;
+    --trace) TRACE=true ;;
     -h|--help)
       sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
       exit 0
@@ -371,6 +377,37 @@ print(n)
       fi
       ;;
   esac
+
+  if [[ "${TRACE}" == "true" ]]; then
+    log "guardrail-trace (one line per anonymizer call):"
+    # Filter for the structured log line emitted by main.py's _trace_call.
+    # `--since 30s` keeps the dump scoped to this arm — backing services
+    # are persistent across arms so without it we'd repeat earlier arms.
+    # The Python decoder is wrapped in a quoted heredoc so we can use
+    # single-quoted dict keys without bash chewing them up.
+    podman logs --since 30s "${ANON_NAME}" 2>&1 \
+      | grep -F "guardrail-trace" \
+      | python3 -c "$(cat <<'PY'
+import re, sys
+# Decompose the flat key=value… repr=… line into a per-call block so the
+# trailing-edge text and the action are easy to scan.
+pat = re.compile(
+    r"guardrail-trace call_id=(?P<id>\S+) type=(?P<type>\S+) "
+    r"is_final=(?P<final>\S+) action=(?P<action>\S+) "
+    r"in=(?P<in>.*?) out=(?P<out>.*)$"
+)
+for n, line in enumerate(sys.stdin, 1):
+    m = pat.search(line)
+    if not m:
+        continue
+    g = m.groupdict()
+    print(f"  [{n:2d}] type={g['type']:8s} is_final={g['final']:5s} action={g['action']}")
+    print(f"        in:  {g['in']}")
+    if g['out'] != "''":
+        print(f"        out: {g['out']}")
+PY
+)" >&2
+  fi
 
   rm -f "${RESPONSE_FILE}"
   RESPONSE_FILE=""

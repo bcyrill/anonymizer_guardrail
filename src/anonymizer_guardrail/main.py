@@ -246,6 +246,32 @@ async def health() -> dict[str, object]:
     }
 
 
+def _trace_call(req: GuardrailRequest, resp: GuardrailResponse) -> GuardrailResponse:
+    """One INFO line per guardrail call so operators (and the e2e test
+    harness's --trace flag) can see input/output/decision without
+    flipping log level. Snippets cap at 160 chars to keep grep-friendly
+    fixed-width log lines while still showing the trailing edge that
+    drives WAIT decisions."""
+    def _snip(parts: list[str] | None, cap: int = 160) -> str:
+        if not parts:
+            return ""
+        s = parts[0] if len(parts) == 1 else " | ".join(parts)
+        if len(s) > cap:
+            return f"{s[:cap]}…"
+        return s
+
+    log.info(
+        "guardrail-trace call_id=%s type=%s is_final=%s action=%s in=%r out=%r",
+        req.litellm_call_id,
+        req.input_type,
+        req.is_final,
+        resp.action,
+        _snip(req.texts),
+        _snip(resp.texts),
+    )
+    return resp
+
+
 @app.post("/beta/litellm_basic_guardrail_api", response_model=GuardrailResponse)
 async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
     # Full request body contains the very text we're meant to anonymize, so
@@ -256,7 +282,7 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
 
     if not req.texts:
         # Nothing for us to do — let the request through unchanged.
-        return GuardrailResponse(action="NONE")
+        return _trace_call(req, GuardrailResponse(action="NONE"))
 
     forwarded_key: str | None = None
     if llm_mod.CONFIG.use_forwarded_key and req.input_type == "request":
@@ -309,8 +335,11 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
                 overrides=overrides,
             )
             if not mapping:
-                return GuardrailResponse(action="NONE")
-            return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=modified)
+                return _trace_call(req, GuardrailResponse(action="NONE"))
+            return _trace_call(
+                req,
+                GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=modified),
+            )
         else:
             # input_type == "response"
             # Streaming action protocol: if the accumulated text trails off
@@ -322,12 +351,15 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
                 req.is_final is False
                 and any(_has_partial_surrogate_suffix(t) for t in req.texts)
             ):
-                return GuardrailResponse(action="WAIT")
+                return _trace_call(req, GuardrailResponse(action="WAIT"))
 
             restored = await _pipeline.deanonymize(req.texts, req.litellm_call_id)
             if restored == req.texts:
-                return GuardrailResponse(action="NONE")
-            return GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=restored)
+                return _trace_call(req, GuardrailResponse(action="NONE"))
+            return _trace_call(
+                req,
+                GuardrailResponse(action="GUARDRAIL_INTERVENED", texts=restored),
+            )
 
     except TYPED_UNAVAILABLE_ERRORS as exc:
         # Reached only when the matching detector's fail_closed flag is
@@ -343,9 +375,12 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
             "Blocking request — %s detector unavailable: %s",
             spec.name, exc,
         )
-        return GuardrailResponse(
-            action="BLOCKED",
-            blocked_reason=spec.blocked_reason,
+        return _trace_call(
+            req,
+            GuardrailResponse(
+                action="BLOCKED",
+                blocked_reason=spec.blocked_reason,
+            ),
         )
     except RedisVaultError as exc:
         # Vault-backend availability failure (Redis unreachable / wrong
@@ -361,12 +396,15 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
         # also doesn't apply here — that's for "guardrail endpoint
         # unreachable," not internal-state errors.
         log.error("Blocking request — vault backend unavailable: %s", exc)
-        return GuardrailResponse(
-            action="BLOCKED",
-            blocked_reason=(
-                "Vault backend unavailable; request blocked to prevent "
-                "the response from shipping with un-restorable surrogates "
-                "(or failing to deanonymize the response)."
+        return _trace_call(
+            req,
+            GuardrailResponse(
+                action="BLOCKED",
+                blocked_reason=(
+                    "Vault backend unavailable; request blocked to prevent "
+                    "the response from shipping with un-restorable surrogates "
+                    "(or failing to deanonymize the response)."
+                ),
             ),
         )
     except Exception as exc:
@@ -374,7 +412,10 @@ async def guardrail(req: GuardrailRequest) -> GuardrailResponse:
         # only triggers on network/HTTP errors talking to us; logical errors
         # surface as a BLOCKED action.
         log.exception("Guardrail call failed unexpectedly: %s", exc)
-        return GuardrailResponse(
-            action="BLOCKED",
-            blocked_reason=f"Guardrail internal error: {type(exc).__name__}",
+        return _trace_call(
+            req,
+            GuardrailResponse(
+                action="BLOCKED",
+                blocked_reason=f"Guardrail internal error: {type(exc).__name__}",
+            ),
         )

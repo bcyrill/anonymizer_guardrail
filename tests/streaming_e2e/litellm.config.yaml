@@ -42,6 +42,12 @@ guardrails:
       mode: post_call
       api_base: http://anonguard:8000/beta/litellm_basic_guardrail_api
       unreachable_fallback: fail_closed
+      # Tell LiteLLM that the backing HTTP service understands `is_final`
+      # and may return action=WAIT. Required to enrol this Generic
+      # Guardrail API guardrail into the streaming action protocol; without
+      # the flag, LiteLLM treats the wrapper as moderation-only (since
+      # the wrapper class itself is service-agnostic).
+      supports_streaming_action_protocol: true
       default_on: true
 
 general_settings:
